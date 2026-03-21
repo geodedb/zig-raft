@@ -1,0 +1,405 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2024-2025 CodePros
+
+const std = @import("std");
+const state = @import("state.zig");
+const rpc = @import("rpc.zig");
+
+pub const StorageError = error{ Compacted, Unavailable };
+
+pub const Storage = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        saveHardState: *const fn (*anyopaque, state.HardState) anyerror!void,
+        appendEntries: *const fn (*anyopaque, []const rpc.Entry) anyerror!void,
+        entries: *const fn (*anyopaque, lo: u64, hi: u64) anyerror![]rpc.Entry,
+        term: *const fn (*anyopaque, index: u64) anyerror!u64,
+        lastIndex: *const fn (*anyopaque) anyerror!u64,
+        saveSnapshot: *const fn (*anyopaque, rpc.Snapshot) anyerror!void,
+        loadSnapshot: *const fn (*anyopaque) anyerror!?rpc.Snapshot,
+        compact: *const fn (*anyopaque, index: u64) anyerror!void,
+    };
+
+    pub fn saveHardState(self: Storage, hs: state.HardState) anyerror!void {
+        return self.vtable.saveHardState(self.ptr, hs);
+    }
+
+    pub fn appendEntries(self: Storage, ents: []const rpc.Entry) anyerror!void {
+        return self.vtable.appendEntries(self.ptr, ents);
+    }
+
+    pub fn entries(self: Storage, lo: u64, hi: u64) anyerror![]rpc.Entry {
+        return self.vtable.entries(self.ptr, lo, hi);
+    }
+
+    pub fn term(self: Storage, index: u64) anyerror!u64 {
+        return self.vtable.term(self.ptr, index);
+    }
+
+    pub fn lastIndex(self: Storage) anyerror!u64 {
+        return self.vtable.lastIndex(self.ptr);
+    }
+
+    pub fn saveSnapshot(self: Storage, snap: rpc.Snapshot) anyerror!void {
+        return self.vtable.saveSnapshot(self.ptr, snap);
+    }
+
+    pub fn loadSnapshot(self: Storage) anyerror!?rpc.Snapshot {
+        return self.vtable.loadSnapshot(self.ptr);
+    }
+
+    pub fn compact(self: Storage, index: u64) anyerror!void {
+        return self.vtable.compact(self.ptr, index);
+    }
+};
+
+pub const InMemoryStorage = struct {
+    log: std.ArrayList(rpc.Entry) = .{},
+    hard_state: state.HardState = state.HardState.initial,
+    snapshot_data: ?rpc.Snapshot = null,
+    snapshot_index: u64 = 0,
+    snapshot_term: u64 = 0,
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) InMemoryStorage {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *InMemoryStorage) void {
+        for (self.log.items) |entry| {
+            if (entry.data.len > 0) {
+                self.allocator.free(entry.data);
+            }
+        }
+        self.log.deinit(self.allocator);
+    }
+
+    pub fn storage(self: *InMemoryStorage) Storage {
+        return .{
+            .ptr = @ptrCast(self),
+            .vtable = &.{
+                .saveHardState = typeErasedSaveHardState,
+                .appendEntries = typeErasedAppendEntries,
+                .entries = typeErasedEntries,
+                .term = typeErasedTerm,
+                .lastIndex = typeErasedLastIndex,
+                .saveSnapshot = typeErasedSaveSnapshot,
+                .loadSnapshot = typeErasedLoadSnapshot,
+                .compact = typeErasedCompact,
+            },
+        };
+    }
+
+    pub fn appendEntriesImpl(self: *InMemoryStorage, ents: []const rpc.Entry) anyerror!void {
+        if (ents.len == 0) return;
+
+        const first_new_index = ents[0].index;
+        const first_stored_index = self.snapshot_index + 1;
+
+        // Truncate any existing entries from first_new_index onward.
+        if (self.log.items.len > 0 and first_new_index >= first_stored_index) {
+            const keep = first_new_index - first_stored_index;
+            if (keep < self.log.items.len) {
+                for (self.log.items[keep..]) |entry| {
+                    if (entry.data.len > 0) {
+                        self.allocator.free(entry.data);
+                    }
+                }
+                self.log.shrinkRetainingCapacity(keep);
+            }
+        }
+
+        for (ents) |entry| {
+            const data_copy = if (entry.data.len > 0)
+                try self.allocator.dupe(u8, entry.data)
+            else
+                entry.data;
+
+            try self.log.append(self.allocator, .{
+                .index = entry.index,
+                .term = entry.term,
+                .kind = entry.kind,
+                .data = data_copy,
+            });
+        }
+    }
+
+    pub fn entriesImpl(self: *InMemoryStorage, lo: u64, hi: u64) anyerror![]rpc.Entry {
+        if (lo <= self.snapshot_index) return StorageError.Compacted;
+        if (lo == hi) return &[_]rpc.Entry{};
+
+        const start = lo - self.snapshot_index - 1;
+        const end = hi - self.snapshot_index - 1;
+
+        const slice = self.log.items[start..end];
+        const result = try self.allocator.alloc(rpc.Entry, slice.len);
+        @memcpy(result, slice);
+        return result;
+    }
+
+    pub fn termImpl(self: *InMemoryStorage, index: u64) anyerror!u64 {
+        if (index < self.snapshot_index) return StorageError.Compacted;
+        if (index == self.snapshot_index) return self.snapshot_term;
+
+        const pos = index - self.snapshot_index - 1;
+        return self.log.items[pos].term;
+    }
+
+    pub fn lastIndexImpl(self: *InMemoryStorage) anyerror!u64 {
+        if (self.log.items.len == 0) return self.snapshot_index;
+        return self.log.items[self.log.items.len - 1].index;
+    }
+
+    pub fn compactImpl(self: *InMemoryStorage, index: u64) anyerror!void {
+        if (index <= self.snapshot_index) return;
+
+        const pos = index - self.snapshot_index - 1;
+        const remove_count = pos + 1;
+
+        // Update snapshot_term from the entry being compacted to.
+        self.snapshot_term = self.log.items[pos].term;
+
+        // Free data for removed entries.
+        for (self.log.items[0..remove_count]) |entry| {
+            if (entry.data.len > 0) {
+                self.allocator.free(entry.data);
+            }
+        }
+
+        // Shift remaining entries forward.
+        const remaining = self.log.items.len - remove_count;
+        std.mem.copyForwards(rpc.Entry, self.log.items[0..remaining], self.log.items[remove_count..]);
+        self.log.shrinkRetainingCapacity(remaining);
+
+        self.snapshot_index = index;
+    }
+
+    pub fn saveSnapshotImpl(self: *InMemoryStorage, snap: rpc.Snapshot) anyerror!void {
+        self.snapshot_data = snap;
+        self.snapshot_index = snap.metadata.index;
+        self.snapshot_term = snap.metadata.term;
+    }
+
+    pub fn loadSnapshotImpl(self: *InMemoryStorage) anyerror!?rpc.Snapshot {
+        return self.snapshot_data;
+    }
+
+    pub fn saveHardStateImpl(self: *InMemoryStorage, hs: state.HardState) anyerror!void {
+        self.hard_state = hs;
+    }
+
+    pub fn loadHardState(self: *InMemoryStorage) state.HardState {
+        return self.hard_state;
+    }
+
+    // --- Type-erased wrappers for vtable ---
+
+    fn typeErasedSaveHardState(ptr: *anyopaque, hs: state.HardState) anyerror!void {
+        const self: *InMemoryStorage = @ptrCast(@alignCast(ptr));
+        return self.saveHardStateImpl(hs);
+    }
+
+    fn typeErasedAppendEntries(ptr: *anyopaque, ents: []const rpc.Entry) anyerror!void {
+        const self: *InMemoryStorage = @ptrCast(@alignCast(ptr));
+        return self.appendEntriesImpl(ents);
+    }
+
+    fn typeErasedEntries(ptr: *anyopaque, lo: u64, hi: u64) anyerror![]rpc.Entry {
+        const self: *InMemoryStorage = @ptrCast(@alignCast(ptr));
+        return self.entriesImpl(lo, hi);
+    }
+
+    fn typeErasedTerm(ptr: *anyopaque, index: u64) anyerror!u64 {
+        const self: *InMemoryStorage = @ptrCast(@alignCast(ptr));
+        return self.termImpl(index);
+    }
+
+    fn typeErasedLastIndex(ptr: *anyopaque) anyerror!u64 {
+        const self: *InMemoryStorage = @ptrCast(@alignCast(ptr));
+        return self.lastIndexImpl();
+    }
+
+    fn typeErasedSaveSnapshot(ptr: *anyopaque, snap: rpc.Snapshot) anyerror!void {
+        const self: *InMemoryStorage = @ptrCast(@alignCast(ptr));
+        return self.saveSnapshotImpl(snap);
+    }
+
+    fn typeErasedLoadSnapshot(ptr: *anyopaque) anyerror!?rpc.Snapshot {
+        const self: *InMemoryStorage = @ptrCast(@alignCast(ptr));
+        return self.loadSnapshotImpl();
+    }
+
+    fn typeErasedCompact(ptr: *anyopaque, index: u64) anyerror!void {
+        const self: *InMemoryStorage = @ptrCast(@alignCast(ptr));
+        return self.compactImpl(index);
+    }
+};
+
+// --- Tests ---
+
+test "append entries then retrieve" {
+    var store = InMemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+
+    const entries_in = [_]rpc.Entry{
+        .{ .index = 1, .term = 1, .kind = .normal, .data = "hello" },
+        .{ .index = 2, .term = 1, .kind = .normal, .data = "world" },
+        .{ .index = 3, .term = 2, .kind = .noop, .data = &.{} },
+    };
+    try store.appendEntriesImpl(&entries_in);
+
+    const result = try store.entriesImpl(1, 4);
+    defer std.testing.allocator.free(result);
+
+    try std.testing.expectEqual(@as(usize, 3), result.len);
+    try std.testing.expectEqual(@as(u64, 1), result[0].index);
+    try std.testing.expectEqual(@as(u64, 2), result[1].index);
+    try std.testing.expectEqual(@as(u64, 3), result[2].index);
+    try std.testing.expectEqualStrings("hello", result[0].data);
+    try std.testing.expectEqualStrings("world", result[1].data);
+}
+
+test "term at various indices" {
+    var store = InMemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+
+    const entries_in = [_]rpc.Entry{
+        .{ .index = 1, .term = 1, .kind = .normal, .data = "a" },
+        .{ .index = 2, .term = 1, .kind = .normal, .data = "b" },
+        .{ .index = 3, .term = 2, .kind = .normal, .data = "c" },
+    };
+    try store.appendEntriesImpl(&entries_in);
+
+    try std.testing.expectEqual(@as(u64, 1), try store.termImpl(1));
+    try std.testing.expectEqual(@as(u64, 1), try store.termImpl(2));
+    try std.testing.expectEqual(@as(u64, 2), try store.termImpl(3));
+
+    // Term at snapshot_index (0) should return snapshot_term (0).
+    try std.testing.expectEqual(@as(u64, 0), try store.termImpl(0));
+}
+
+test "lastIndex empty and non-empty" {
+    var store = InMemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+
+    // Empty log returns snapshot_index (0).
+    try std.testing.expectEqual(@as(u64, 0), try store.lastIndexImpl());
+
+    const entries_in = [_]rpc.Entry{
+        .{ .index = 1, .term = 1, .kind = .normal, .data = &.{} },
+        .{ .index = 2, .term = 1, .kind = .normal, .data = &.{} },
+    };
+    try store.appendEntriesImpl(&entries_in);
+
+    try std.testing.expectEqual(@as(u64, 2), try store.lastIndexImpl());
+}
+
+test "compact removes old entries" {
+    var store = InMemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+
+    const entries_in = [_]rpc.Entry{
+        .{ .index = 1, .term = 1, .kind = .normal, .data = "a" },
+        .{ .index = 2, .term = 1, .kind = .normal, .data = "b" },
+        .{ .index = 3, .term = 2, .kind = .normal, .data = "c" },
+        .{ .index = 4, .term = 2, .kind = .normal, .data = "d" },
+    };
+    try store.appendEntriesImpl(&entries_in);
+
+    try store.compactImpl(2);
+
+    try std.testing.expectEqual(@as(u64, 2), store.snapshot_index);
+    try std.testing.expectEqual(@as(u64, 1), store.snapshot_term);
+    try std.testing.expectEqual(@as(usize, 2), store.log.items.len);
+
+    // Remaining entries are indices 3 and 4.
+    const result = try store.entriesImpl(3, 5);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqual(@as(u64, 3), result[0].index);
+    try std.testing.expectEqual(@as(u64, 4), result[1].index);
+}
+
+test "saveHardState and loadHardState round-trip" {
+    var store = InMemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+
+    const hs = state.HardState{ .current_term = 5, .voted_for = 3 };
+    try store.saveHardStateImpl(hs);
+
+    const loaded = store.loadHardState();
+    try std.testing.expect(hs.eql(loaded));
+}
+
+test "saveSnapshot and loadSnapshot round-trip" {
+    var store = InMemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+
+    const snap = rpc.Snapshot{
+        .metadata = .{
+            .index = 10,
+            .term = 3,
+            .config = .{
+                .voters = &[_]u64{ 1, 2, 3 },
+                .voters_outgoing = &.{},
+                .is_joint = false,
+            },
+        },
+        .data = "snapshot-data",
+    };
+
+    try store.saveSnapshotImpl(snap);
+
+    try std.testing.expectEqual(@as(u64, 10), store.snapshot_index);
+    try std.testing.expectEqual(@as(u64, 3), store.snapshot_term);
+
+    const loaded = try store.loadSnapshotImpl();
+    try std.testing.expect(loaded != null);
+    try std.testing.expectEqual(@as(u64, 10), loaded.?.metadata.index);
+    try std.testing.expectEqual(@as(u64, 3), loaded.?.metadata.term);
+    try std.testing.expectEqualStrings("snapshot-data", loaded.?.data);
+}
+
+test "entries returns Compacted when lo <= snapshot_index" {
+    var store = InMemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+
+    const entries_in = [_]rpc.Entry{
+        .{ .index = 1, .term = 1, .kind = .normal, .data = "a" },
+        .{ .index = 2, .term = 1, .kind = .normal, .data = "b" },
+        .{ .index = 3, .term = 2, .kind = .normal, .data = "c" },
+    };
+    try store.appendEntriesImpl(&entries_in);
+    try store.compactImpl(2);
+
+    // Requesting entries at or before snapshot_index should fail.
+    try std.testing.expectError(StorageError.Compacted, store.entriesImpl(1, 3));
+    try std.testing.expectError(StorageError.Compacted, store.entriesImpl(2, 3));
+
+    // Requesting entries after snapshot_index should succeed.
+    const result = try store.entriesImpl(3, 4);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqual(@as(usize, 1), result.len);
+    try std.testing.expectEqual(@as(u64, 3), result[0].index);
+}
+
+test "vtable dispatch works" {
+    var store = InMemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+
+    const s = store.storage();
+
+    const entries_in = [_]rpc.Entry{
+        .{ .index = 1, .term = 1, .kind = .normal, .data = "x" },
+    };
+    try s.appendEntries(&entries_in);
+
+    try std.testing.expectEqual(@as(u64, 1), try s.lastIndex());
+    try std.testing.expectEqual(@as(u64, 1), try s.term(1));
+
+    const result = try s.entries(1, 2);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqual(@as(usize, 1), result.len);
+    try std.testing.expectEqualStrings("x", result[0].data);
+}

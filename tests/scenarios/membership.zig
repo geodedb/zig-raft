@@ -1,0 +1,201 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2024-2025 CodePros
+
+//! Membership change scenario tests.
+//!
+//! Validates joint consensus mechanics: adding/removing servers,
+//! leader step-down, concurrent config change rejection, and
+//! automatic phase-2 finalization.
+
+const std = @import("std");
+const raft = @import("raft");
+const harness = @import("harness");
+
+const Network = harness.Network;
+
+/// Helper: check whether `target` is present in `items`.
+fn containsId(items: []const u64, target: u64) bool {
+    for (items) |v| {
+        if (v == target) return true;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// 1. add_server_joint_consensus
+// ---------------------------------------------------------------------------
+test "membership: add server via joint consensus" {
+    var net = try Network.init(std.testing.allocator, 3);
+    defer net.deinit();
+
+    const leader_id = try net.waitForLeader(50);
+    const leader = net.nodes.get(leader_id).?;
+
+    // Initial config: 3 voters.
+    try std.testing.expectEqual(@as(usize, 3), leader.membership_state.voters.items.len);
+    try std.testing.expect(!leader.membership_state.is_joint);
+
+    // Propose adding node 4 (node 4 doesn't exist in the network -- that's OK,
+    // we're testing the consensus protocol mechanics).
+    try leader.proposeConfigChange(&.{ 1, 2, 3, 4 });
+
+    // After proposal, leader enters joint consensus immediately.
+    try std.testing.expect(leader.membership_state.is_joint);
+
+    // Tick until the joint config commits and phase-2 auto-finalizes.
+    var ticks: u32 = 0;
+    while (ticks < 100) : (ticks += 1) {
+        try net.tickAll();
+        if (!leader.membership_state.is_joint) break;
+    }
+
+    // Joint consensus should have resolved.
+    try std.testing.expect(!leader.membership_state.is_joint);
+
+    // Final voter set should contain node 4.
+    try std.testing.expectEqual(@as(usize, 4), leader.membership_state.voters.items.len);
+    try std.testing.expect(containsId(leader.membership_state.voters.items, 4));
+}
+
+// ---------------------------------------------------------------------------
+// 2. remove_server_joint_consensus
+// ---------------------------------------------------------------------------
+test "membership: remove server via joint consensus" {
+    var net = try Network.init(std.testing.allocator, 3);
+    defer net.deinit();
+
+    const leader_id = try net.waitForLeader(50);
+    const leader = net.nodes.get(leader_id).?;
+
+    // Remove one node (keep only two voters).
+    // Build the new voter set excluding one non-leader node.
+    var new_voters: [2]u64 = undefined;
+    var idx: usize = 0;
+    for (net.node_ids.items) |nid| {
+        if (idx >= 2) break;
+        // Keep the leader and one other node.
+        if (nid == leader_id or idx == 0) {
+            new_voters[idx] = nid;
+            idx += 1;
+        }
+    }
+    // If the leader was the first entry, fill the second slot with the next id.
+    if (idx < 2) {
+        for (net.node_ids.items) |nid| {
+            if (nid != new_voters[0]) {
+                new_voters[idx] = nid;
+                idx += 1;
+                break;
+            }
+        }
+    }
+
+    try leader.proposeConfigChange(&new_voters);
+
+    // Tick until stable.
+    var ticks: u32 = 0;
+    while (ticks < 100) : (ticks += 1) {
+        try net.tickAll();
+        if (!leader.membership_state.is_joint) break;
+    }
+
+    try std.testing.expect(!leader.membership_state.is_joint);
+    try std.testing.expectEqual(@as(usize, 2), leader.membership_state.voters.items.len);
+}
+
+// ---------------------------------------------------------------------------
+// 3. leader_removed_steps_down
+// ---------------------------------------------------------------------------
+test "membership: leader removed from config steps down" {
+    var net = try Network.init(std.testing.allocator, 3);
+    defer net.deinit();
+
+    const leader_id = try net.waitForLeader(50);
+    const leader = net.nodes.get(leader_id).?;
+
+    // Build a new voter set that excludes the current leader.
+    var new_voters: [2]u64 = undefined;
+    var idx: usize = 0;
+    for (net.node_ids.items) |nid| {
+        if (nid != leader_id) {
+            new_voters[idx] = nid;
+            idx += 1;
+            if (idx == 2) break;
+        }
+    }
+
+    try leader.proposeConfigChange(&new_voters);
+
+    // Tick until the old leader is no longer leader.
+    var ticks: u32 = 0;
+    while (ticks < 200) : (ticks += 1) {
+        try net.tickAll();
+        if (leader.role != .leader) break;
+    }
+
+    // The old leader should have stepped down to follower.
+    try std.testing.expectEqual(raft.Role.follower, leader.role);
+
+    // A new leader should eventually be elected among the remaining nodes.
+    const new_leader_id = try net.waitForLeader(100);
+    try std.testing.expect(new_leader_id != leader_id);
+    try std.testing.expect(containsId(&new_voters, new_leader_id));
+}
+
+// ---------------------------------------------------------------------------
+// 4. config_change_pending_error
+// ---------------------------------------------------------------------------
+test "membership: concurrent config change returns error" {
+    var net = try Network.init(std.testing.allocator, 3);
+    defer net.deinit();
+
+    const leader_id = try net.waitForLeader(50);
+    const leader = net.nodes.get(leader_id).?;
+
+    // Start a config change.
+    try leader.proposeConfigChange(&.{ 1, 2, 3, 4 });
+
+    // Immediately try another config change -- should fail.
+    const result = leader.proposeConfigChange(&.{ 1, 2, 3, 5 });
+    try std.testing.expectError(error.ConfigChangePending, result);
+}
+
+// ---------------------------------------------------------------------------
+// 5. joint_phase2_automatic
+// ---------------------------------------------------------------------------
+test "membership: joint phase-2 finalizes automatically" {
+    var net = try Network.init(std.testing.allocator, 3);
+    defer net.deinit();
+
+    const leader_id = try net.waitForLeader(50);
+    const leader = net.nodes.get(leader_id).?;
+
+    try std.testing.expect(!leader.membership_state.is_joint);
+
+    // Propose a config change.
+    try leader.proposeConfigChange(&.{ 1, 2, 3, 4 });
+
+    // Verify joint consensus is active.
+    try std.testing.expect(leader.membership_state.is_joint);
+
+    // Tick until phase-2 auto-finalizes (no consumer action needed).
+    var saw_joint = false;
+    var ticks: u32 = 0;
+    while (ticks < 100) : (ticks += 1) {
+        if (leader.membership_state.is_joint) saw_joint = true;
+        try net.tickAll();
+        // Once is_joint becomes false, phase-2 has completed.
+        if (saw_joint and !leader.membership_state.is_joint) break;
+    }
+
+    // Confirm we observed the joint state and it resolved.
+    try std.testing.expect(saw_joint);
+    try std.testing.expect(!leader.membership_state.is_joint);
+
+    // No pending change remains.
+    try std.testing.expect(!leader.membership_state.pending_config_change);
+
+    // Voters should reflect the new config.
+    try std.testing.expectEqual(@as(usize, 4), leader.membership_state.voters.items.len);
+    try std.testing.expect(containsId(leader.membership_state.voters.items, 4));
+}

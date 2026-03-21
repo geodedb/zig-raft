@@ -3,78 +3,47 @@
 
 //! # raft
 //!
-//! A Zig library for raft
-//!
-//! ## Features
-//!
-//! - Feature 1
-//! - Feature 2
-//! - Feature 3
-//!
-//! ## Quick Start
-//!
-//! ```zig
-//! const raft = @import("raft");
-//!
-//! pub fn main() !void {
-//!     // Your code here
-//! }
-//! ```
-//!
-//! ## License
-//!
-//! Apache-2.0
+//! A generalized, standalone Raft consensus library. Written in Zig 0.15.1+.
+//! Implements the full Raft paper (Ongaro & Ousterhout, 2014) plus pre-vote,
+//! joint consensus membership changes, snapshotting, and chunked snapshot transfer.
 
 const std = @import("std");
 
-/// Library version
-pub const version = "0.1.0";
+// All modules
+pub const state = @import("state.zig");
+pub const rpc = @import("rpc.zig");
+pub const quorum = @import("quorum.zig");
+pub const storage = @import("storage.zig");
+pub const file_storage = @import("file_storage.zig");
+pub const transport = @import("transport.zig");
+pub const log = @import("log.zig");
+pub const election = @import("election.zig");
+pub const replication = @import("replication.zig");
+pub const membership = @import("membership.zig");
+pub const snapshot_mod = @import("snapshot.zig");
+pub const ready = @import("ready.zig");
+pub const node = @import("node.zig");
 
-// Re-export submodules here as the library grows:
-// pub const submodule = @import("submodule.zig");
-
-// ============================================================================
-// Public Types
-// ============================================================================
-
-/// Example configuration structure
-pub const Config = struct {
-    /// Enable debug output
-    debug: bool = false,
-    /// Maximum retry attempts
-    max_retries: u32 = 3,
-    /// Timeout in milliseconds
-    timeout_ms: u64 = 30_000,
-};
-
-// ============================================================================
-// Public Functions
-// ============================================================================
-
-/// Initialize the library with the given configuration.
-///
-/// Returns an error if the configuration is invalid.
-pub fn init(config: Config) !void {
-    _ = config;
-    // Implementation here
-}
-
-// ============================================================================
-// Unit Tests
-// ============================================================================
-
-test "Config default values" {
-    const config = Config{};
-    try std.testing.expectEqual(false, config.debug);
-    try std.testing.expectEqual(@as(u32, 3), config.max_retries);
-    try std.testing.expectEqual(@as(u64, 30_000), config.timeout_ms);
-}
-
-test "init with default config" {
-    try init(.{});
-}
+// Top-level convenience re-exports
+pub const RaftNode = node.RaftNode;
+pub const Config = node.Config;
+pub const Ready = ready.Ready;
+pub const Role = state.Role;
+pub const HardState = state.HardState;
+pub const SoftState = state.SoftState;
+pub const Entry = rpc.Entry;
+pub const EntryKind = rpc.EntryKind;
+pub const Message = rpc.Message;
+pub const Snapshot = rpc.Snapshot;
+pub const SnapshotMetadata = rpc.SnapshotMetadata;
+pub const ClusterConfig = rpc.ClusterConfig;
+pub const Storage = storage.Storage;
+pub const InMemoryStorage = storage.InMemoryStorage;
+pub const FileStorage = file_storage.FileStorage;
+pub const Transport = transport.Transport;
+pub const InProcessTransport = transport.InProcessTransport;
+pub const isNoop = rpc.Entry.isNoop;
 
 test {
-    // Ensure all declarations are referenced for test coverage
     std.testing.refAllDecls(@This());
 }

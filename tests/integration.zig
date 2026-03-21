@@ -3,38 +3,27 @@
 
 //! Integration tests for raft
 //!
-//! These tests verify end-to-end functionality and cross-module interactions.
+//! These tests verify end-to-end functionality and cross-module interactions
+//! using the test harness Network.
 
 const std = @import("std");
-const lib = @import("raft");
+const raft = @import("raft");
+const harness = @import("harness");
+
+// Pull in scenario test files so they are discovered by the test runner.
+comptime {
+    _ = @import("scenarios/replication.zig");
+    _ = @import("scenarios/membership.zig");
+}
 
 // ============================================================================
 // Integration Tests
 // ============================================================================
 
-test "integration: library initializes successfully" {
-    try lib.init(.{});
-}
+test "integration: three-node cluster elects a leader" {
+    var net = try harness.Network.init(std.testing.allocator, 3);
+    defer net.deinit();
 
-test "integration: custom configuration" {
-    try lib.init(.{
-        .debug = true,
-        .max_retries = 5,
-        .timeout_ms = 60_000,
-    });
-}
-
-test "integration: version is defined" {
-    try std.testing.expectEqualStrings("0.1.0", lib.version);
-}
-
-// ============================================================================
-// Test Utilities
-// ============================================================================
-
-fn expectSuccess(result: anytype) !void {
-    _ = result catch |err| {
-        std.debug.print("Unexpected error: {}\n", .{err});
-        return error.TestUnexpectedResult;
-    };
+    const leader = try net.waitForLeader(50);
+    try std.testing.expect(leader >= 1 and leader <= 3);
 }
