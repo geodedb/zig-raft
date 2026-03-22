@@ -28,3 +28,43 @@ The following items from the design spec are intentionally not addressed in this
 ## Open Gaps
 
 *None — all gaps resolved.*
+
+## Geode Extraction Metadata
+
+This repository is the right home for the reusable Raft core, but the Geode review found a clear distinction between the portable consensus engine and Geode-specific transport/persistence/transaction adapters.
+
+### Geode Boundary
+
+Move/own here:
+
+| Geode source | Why it belongs in `raft` |
+|---|---|
+| `src/distributed/raft.zig:38`, `:45`, `:64`, `:146`, `:157` | Core node state, log entry, message, config, and node types |
+| `src/distributed/raft.zig:188`, `:242`, `:254`, `:285`, `:297`, `:323`, `:363`, `:399`, `:405`, `:459`, `:550`, `:650`, `:716` | Portable Raft lifecycle, ticking, message handling, proposal, election, append-entries, snapshot handling, and commit advancement |
+| `src/distributed/raft.zig:754`, `:768`, `:788` | Direct source-level core tests |
+| `tests/e2e_distributed_raft.zig:55`, `:109`, `:148`, `:180`, `:224`, `:256` | Cluster-level election, replication, partition recovery, and commit advancement behavior |
+
+Keep in Geode or split into adapter code:
+
+| Geode source | Why it stays |
+|---|---|
+| `src/distributed/raft_consensus.zig:62`, `:87`, `:94` | Transaction prepare/decide, schema, and snapshot-pointer commands are Geode-specific distributed behavior layered on top of Raft |
+| `src/distributed/raft_consensus.zig:135` through `:211` | QUIC transport/client abstractions are application integration, not the Raft core |
+| `src/distributed/raft_consensus.zig:215` through `:367` | Persistent storage integration is an adapter boundary, not the consensus core itself |
+| `src/distributed/raft_consensus.zig:412` through `:457` | Protobuf frame encoding/decoding is transport framing glue |
+| `build.zig:431`, `:432`, `:433`, `:434` | `raft_schema` protobuf wiring is Geode build integration |
+| `src/dist/scaffold.zig:15` through `:259` | Alternate scaffold implementation and 2PC/shard-map helpers are not the core extraction target |
+
+### Geode Tests And Benchmarks
+
+| Geode reference | Purpose |
+|---|---|
+| `src/distributed/raft.zig:754`, `:768`, `:788` | Core unit coverage |
+| `tests/e2e_distributed_raft.zig:55`, `:109`, `:148`, `:180`, `:224`, `:256` | End-to-end cluster behavior |
+| `src/tools/run_variance_benches.zig:300`, `:301`, `:308`, `:312`, `:314`, `:370`, `:398`, `:465` | Current synthetic variance benchmark reference |
+
+### Current Assessment
+
+- Reusable core: `src/distributed/raft.zig`.
+- Non-core Geode adjacency: `raft_consensus.zig`, protobuf framing, QUIC transport, persistent storage adapter, and transaction/schema commands.
+- Migration priority: keep the consensus node and message/state machine in this repo; treat the rest as explicit adapters.
