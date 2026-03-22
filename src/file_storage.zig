@@ -172,8 +172,11 @@ pub const FileStorage = struct {
             fs.snapshot_term = meta.term;
             fs.snapshot_data_digest = meta.data_digest orelse (.{0} ** 32);
             // Cache config for compactImpl to preserve across rewrites.
+            // Roll back first appendSlice if second fails to prevent
+            // inconsistent snapshot config state (SEC-0105).
             if (meta.config) |cfg| {
                 try fs.snapshot_config_voters.appendSlice(allocator, cfg.voters);
+                errdefer fs.snapshot_config_voters.clearRetainingCapacity();
                 try fs.snapshot_config_voters_outgoing.appendSlice(allocator, cfg.voters_outgoing);
                 fs.snapshot_config_is_joint = cfg.is_joint;
             }
@@ -547,16 +550,20 @@ pub const FileStorage = struct {
         const compact_pos = self.findIndexPos(index) orelse return;
 
         // Record the term at the compaction point.
-        self.snapshot_term = self.index.items[compact_pos].term;
-        self.snapshot_index = index;
-
-        // Save updated snapshot metadata atomically (preserving existing data digest and config).
+        // Persist BEFORE mutating in-memory state so a failed write does not
+        // leave snapshot_term/snapshot_index diverged from disk (SEC-0109,
+        // same pattern as SEC-0084 in RaftLog.compact).
+        const new_term = self.index.items[compact_pos].term;
         const cached_cfg = rpc.ClusterConfig{
             .voters = self.snapshot_config_voters.items,
             .voters_outgoing = self.snapshot_config_voters_outgoing.items,
             .is_joint = self.snapshot_config_is_joint,
         };
-        try self.writeSnapshotMeta(self.snapshot_index, self.snapshot_term, self.snapshot_data_digest, cached_cfg);
+        try self.writeSnapshotMeta(index, new_term, self.snapshot_data_digest, cached_cfg);
+
+        // Persistence succeeded — now safe to update in-memory state.
+        self.snapshot_term = new_term;
+        self.snapshot_index = index;
 
         const remaining_count = self.index.items.len - (compact_pos + 1);
 

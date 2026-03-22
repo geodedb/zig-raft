@@ -166,6 +166,21 @@ pub fn build(b: *std.Build) void {
     const run_replication_tests = b.addRunArtifact(replication_tests);
     scenarios_step.dependOn(&run_replication_tests.step);
 
+    const adversarial_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/scenarios/adversarial.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "raft", .module = module },
+                .{ .name = "harness", .module = harness_module },
+                .{ .name = "checker", .module = checker_module },
+            },
+        }),
+    });
+    const run_adversarial_tests = b.addRunArtifact(adversarial_tests);
+    scenarios_step.dependOn(&run_adversarial_tests.step);
+
     // Chaos tests with optional seed for deterministic replay
     const chaos_step = b.step("test-chaos", "Run chaos tests");
     const chaos_seed = b.option(u64, "seed", "Deterministic seed for chaos test replay");

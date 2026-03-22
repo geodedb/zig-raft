@@ -43,7 +43,9 @@ pub const Config = struct {
         if (self.election_tick == 0) return ConfigError.InvalidElectionTick;
         if (self.heartbeat_tick == 0) return ConfigError.InvalidHeartbeatTick;
         if (self.heartbeat_tick >= self.election_tick) return ConfigError.HeartbeatNotLessThanElection;
-        if (self.snapshot_chunk_size == 0) return ConfigError.InvalidSnapshotChunkSize;
+        // Minimum 1024 bytes prevents accidental resource exhaustion in
+        // buildInstallSnapshotMessages() (SEC-0100).
+        if (self.snapshot_chunk_size < 1024) return ConfigError.InvalidSnapshotChunkSize;
 
         // Reject self-inclusion, zero IDs, and duplicate peer IDs (SEC-0033, SEC-0085).
         for (self.peers, 0..) |peer, i| {
@@ -502,20 +504,16 @@ pub const RaftNode = struct {
     }
 
     fn becomeLeader(self: *RaftNode) !void {
-        self.role = .leader;
-        self.leader_id = self.id;
-        self.is_pre_vote_election = false;
-
         // Initialize replication_state with dynamic voters (SEC-0044).
+        // All fallible operations run BEFORE committing the role change so
+        // that OOM cannot leave us in a zombie-leader state (SEC-0103).
         const peers = try self.dynamicPeers();
         defer if (peers.len > 0) self.allocator.free(peers);
-        self.replication_state = try repl.ReplicationState.init(
+        const rs = try repl.ReplicationState.init(
             self.allocator,
             peers,
             self.log.lastIndex(),
         );
-
-        self.election_state.resetHeartbeatElapsed();
 
         // Append no-op entry (critical for correctness, section 2.7).
         // Checked overflow: lastIndex + 1 (SEC-0071).
@@ -526,7 +524,19 @@ pub const RaftNode = struct {
             .kind = .noop,
             .data = &.{},
         };
-        try self.log.append(&.{noop});
+        self.log.append(&.{noop}) catch |err| {
+            // Clean up replication state on noop append failure (SEC-0103).
+            var rs_mut = rs;
+            rs_mut.deinit();
+            return err;
+        };
+
+        // All fallible operations succeeded — commit the state transition.
+        self.role = .leader;
+        self.leader_id = self.id;
+        self.is_pre_vote_election = false;
+        self.replication_state = rs;
+        self.election_state.resetHeartbeatElapsed();
     }
 
     /// Synchronize replication_state.peers with the current voter set.
@@ -869,21 +879,10 @@ pub const RaftNode = struct {
             // snapshot_index track the snapshot point (SEC-0090).
             try self.log.restore(snapshot_val);
 
-            // Apply snapshot config to MembershipState so followers have
-            // the correct voter set after receiving a snapshot (SEC-0073).
+            // Apply snapshot config to MembershipState using the centralized
+            // validation path (SEC-0073, SEC-0099).
             if (snapshot_val.metadata.config.voters.len > 0) {
-                var new_voters = std.ArrayList(u64){};
-                try new_voters.appendSlice(self.allocator, snapshot_val.metadata.config.voters);
-                errdefer new_voters.deinit(self.allocator);
-                var new_outgoing = std.ArrayList(u64){};
-                if (snapshot_val.metadata.config.is_joint and snapshot_val.metadata.config.voters_outgoing.len > 0) {
-                    try new_outgoing.appendSlice(self.allocator, snapshot_val.metadata.config.voters_outgoing);
-                }
-                self.membership_state.voters.deinit(self.allocator);
-                self.membership_state.voters = new_voters;
-                self.membership_state.voters_outgoing.deinit(self.allocator);
-                self.membership_state.voters_outgoing = new_outgoing;
-                self.membership_state.is_joint = snapshot_val.metadata.config.is_joint;
+                try self.membership_state.applySnapshotConfig(snapshot_val.metadata.config);
             }
             self.ready_state.setSnapshot(snapshot_val);
             self.sendMsg(msg.leader_id, rpc.Message{ .install_snapshot_response = .{
@@ -1288,4 +1287,15 @@ test "Config.validate rejects self in peers (SEC-0033)" {
 test "Config.validate accepts valid unique peers (SEC-0033)" {
     const cfg = Config{ .id = 1, .peers = &.{ 2, 3, 4 } };
     try cfg.validate();
+}
+
+test "Config.validate rejects small snapshot_chunk_size (SEC-0100)" {
+    const too_small = Config{ .id = 1, .peers = &.{ 2, 3 }, .snapshot_chunk_size = 1 };
+    try std.testing.expectError(ConfigError.InvalidSnapshotChunkSize, too_small.validate());
+
+    const at_boundary = Config{ .id = 1, .peers = &.{ 2, 3 }, .snapshot_chunk_size = 1023 };
+    try std.testing.expectError(ConfigError.InvalidSnapshotChunkSize, at_boundary.validate());
+
+    const min_valid = Config{ .id = 1, .peers = &.{ 2, 3 }, .snapshot_chunk_size = 1024 };
+    try min_valid.validate();
 }

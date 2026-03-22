@@ -128,10 +128,14 @@ pub const ReplicationState = struct {
         };
 
         // Apply max_bytes limit.
+        // Use checked addition to prevent u64 wraparound (SEC-0104).
         var total_bytes: u64 = 0;
         var count: usize = 0;
         for (entries) |entry| {
-            total_bytes += entry.data.len;
+            total_bytes = std.math.add(u64, total_bytes, entry.data.len) catch {
+                // Overflow means we've exceeded any representable limit — stop here.
+                break;
+            };
             count += 1;
             if (total_bytes > max_bytes and count > 1) {
                 count -= 1;

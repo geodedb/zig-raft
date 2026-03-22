@@ -2,7 +2,7 @@
 
 **Last updated:** 2026-03-22
 **Spec:** `docs/superpowers/specs/2026-03-21-raft-design.md`
-**Methodology:** Requirements-to-code audit + nine adversarial security review passes -- all source, tests, CI, and docs compared against design spec, then reviewed for security vulnerabilities. Pass 1 (SEC-0001..SEC-0011, all remediated), Pass 2 (SEC-0012..SEC-0028, all remediated or Won't Do), Pass 3 (SEC-0029..SEC-0036, all remediated), Pass 4 (SEC-0037..SEC-0044, all remediated or Won't Do), Pass 5 (SEC-0045..SEC-0064, all remediated), Pass 6 (SEC-0065..SEC-0068, all remediated or Won't Do), Pass 7 (SEC-0069..SEC-0070, all remediated), Pass 8 (SEC-0071..SEC-0073, all remediated), Pass 9 (SEC-0074..SEC-0097, all remediated or Won't Do).
+**Methodology:** Requirements-to-code audit + thirteen adversarial security review passes -- all source, tests, CI, and docs compared against design spec, then reviewed for security vulnerabilities. Pass 1 (SEC-0001..SEC-0011, all remediated), Pass 2 (SEC-0012..SEC-0028, all remediated or Won't Do), Pass 3 (SEC-0029..SEC-0036, all remediated), Pass 4 (SEC-0037..SEC-0044, all remediated or Won't Do), Pass 5 (SEC-0045..SEC-0064, all remediated), Pass 6 (SEC-0065..SEC-0068, all remediated or Won't Do), Pass 7 (SEC-0069..SEC-0070, all remediated), Pass 8 (SEC-0071..SEC-0073, all remediated), Pass 9 (SEC-0074..SEC-0097, all remediated or Won't Do), Pass 10 (SEC-0098..SEC-0101, all remediated), Pass 11 (SEC-0103..SEC-0106, all remediated), Pass 12 (SEC-0107..SEC-0108, all remediated), Pass 13 (SEC-0109..SEC-0110, all remediated).
 
 ## Summary
 
@@ -15,19 +15,19 @@
 | Medium | 0 | 5 | 0 |
 | Low | 0 | 2 | 0 |
 
-All 162 tests pass (116 unit, 1 integration, 34 scenario, 11 chaos). All spec gaps resolved. See [GAP_ANALYSIS_RESOLVED.md](GAP_ANALYSIS_RESOLVED.md).
+All 182 tests pass (124 unit, 1 integration, 46 scenario, 11 chaos). All spec gaps resolved. See [GAP_ANALYSIS_RESOLVED.md](GAP_ANALYSIS_RESOLVED.md).
 
-### Security Findings (SEC-0001 through SEC-0097)
+### Security Findings (SEC-0001 through SEC-0110)
 
 | Severity | Open | Resolved | Won't Do |
 |----------|------|----------|----------|
-| Critical | 0 | 2 | 0 |
+| Critical | 0 | 3 | 0 |
 | High | 0 | 20 | 0 |
-| Medium | 0 | 46 | 4 |
-| Low | 0 | 15 | 5 |
-| Info | 0 | 7 | 1 |
+| Medium | 0 | 50 | 4 |
+| Low | 0 | 21 | 5 |
+| Info | 0 | 8 | 1 |
 
-**0 open findings.** 97 total findings across 9 passes: all 97 resolved or Won't Do.
+**0 open findings**. 109 total findings across 13 passes: all resolved or Won't Do.
 
 ## Won't Do -- Handled via External Controls
 
@@ -43,6 +43,142 @@ All 162 tests pass (116 unit, 1 integration, 34 scenario, 11 chaos). All spec ga
 - **SEC-0093: Test harness `page_allocator` defeats leak detection** -- The harness intentionally uses `page_allocator` because Raft's shared-ownership entry slices create complex free patterns that confuse the testing allocator. The comment in `tests/harness.zig:78-79` documents this trade-off. Switching to `testing.allocator` would require refactoring ownership semantics across the entire codebase.
 - **SEC-0099: `Config.peers` borrowed slice can dangle** -- This is standard Zig borrowing semantics. The caller is responsible for ensuring the peers slice outlives the `RaftNode`. The test harness already dupes the slice (`allocator.dupe(u64, peers.items)`). Adding automatic duplication inside `RaftNode.init()` would break the existing ownership contract.
 - **SEC-0102: File storage tests use predictable `/tmp` paths** -- Test-only code with no production impact. The hardcoded paths are deterministic for reproducible test debugging. TOCTOU risk is negligible in a test environment.
+
+---
+
+## Security Findings -- Pass 13 (SEC-0109 through SEC-0110) -- Resolved
+
+2 findings identified through exhaustive adversarial review with 5 parallel review agents covering all 14 source modules, tests, CI/CD, build system, and configs. 7 automated scanners re-run (0 findings). 8+ agent-reported findings verified against actual code; 6 filtered as false positives.
+
+### Medium Severity (1 finding)
+
+| Rank | Sev | Risk | Finding | Component | CWE | Evidence | Issue | Status |
+|------|-----|------|---------|-----------|-----|----------|-------|--------|
+| 1 | Medium | 30 | `FileStorage.compactImpl()` mutates `snapshot_term`/`snapshot_index` before fallible `writeSnapshotMeta()` — failed persistence leaves in-memory state diverged from disk (same bug pattern as SEC-0084) | `src/file_storage.zig` | CWE-460 | `file_storage.zig:553-554` mutate state, line 562 `writeSnapshotMeta()` can fail | [#116](https://gitlab.com/devnw/zig/raft/-/issues/116) | Resolved — persist BEFORE mutating in-memory fields (SEC-0109) |
+
+### Low Severity (1 finding)
+
+| Rank | Sev | Risk | Finding | Component | CWE | Evidence | Issue | Status |
+|------|-----|------|---------|-----------|-----|----------|-------|--------|
+| 2 | Low | 10 | `validateSnapshotConfig()` and `applySnapshotConfig()` accept `is_joint=true` with empty `voters_outgoing` — creates inconsistent joint consensus state violating Raft §6 | `src/snapshot.zig`, `src/membership.zig` | CWE-20 | `snapshot.zig:280` no joint/outgoing consistency check; `membership.zig:180` skips empty outgoing but sets `is_joint=true` at line 189 | [#117](https://gitlab.com/devnw/zig/raft/-/issues/117) | Resolved — added bidirectional is_joint/voters_outgoing consistency validation (SEC-0110) |
+
+### False Positives Filtered (Pass 13)
+
+> Agent-reported findings verified against actual code and filtered:
+
+- **"Missing leader validation in AppendEntries"** — Raft does not require followers to verify leader membership. Term-based leader acceptance is the protocol's design.
+- **"Race condition in ReplicationState parallel operations"** — Per CLAUDE.md, spice parallelism is used only for read-only work (building AppendEntries payloads, broadcasting votes). No concurrent mutation.
+- **"Unbounded slice in `truncateUnstable()`"** — `keep` is always `<= items.len` by construction (clamped at line 304). Safe.
+- **"Integer overflow in trim_count subtraction"** — `first_unstable >= 1` guaranteed by construction (snapshot_index starts at 0, first_unstable = snapshot_index + 1). Subtraction cannot underflow.
+- **"Off-by-one in max_bytes entry count check"** — `count > 1` is intentional: always include at least one entry regardless of size (matches etcd/raft behavior).
+- **"Snapshot term validation gap"** — Already mitigated by `node.zig` term check (`msg.term < self.current_term` rejects stale snapshots before reaching `SnapshotState`).
+
+---
+
+## Security Findings -- Pass 12 (SEC-0107 through SEC-0108) -- Resolved
+
+2 findings identified through exhaustive adversarial review with 5 parallel review agents covering all 14 source modules, tests, CI/CD, build system, and configs. 7 automated scanners re-run (0 findings). 10+ agent-reported findings verified against actual code; 8+ filtered as false positives.
+
+### Critical Severity (1 finding)
+
+| Rank | Sev | Risk | Finding | Component | CWE | Evidence | Issue | Status |
+|------|-----|------|---------|-----------|-----|----------|-------|--------|
+| 1 | Critical | 80 | Use-After-Free: `receiveChunk()` frees existing pending snapshot data/config but does not null `self.pending_snapshot` before fallible `validateSnapshotConfig()` — failed validation leaves freed ArrayLists reachable, causing double-free or UAF on next call | `src/snapshot.zig` | CWE-416, CWE-415 | `snapshot.zig:157-163` — deinit at 158-159, validateSnapshotConfig at 163 can fail, pending_snapshot not nulled | [#114](https://gitlab.com/devnw/zig/raft/-/issues/114) | Resolved — null `self.pending_snapshot` after freeing, before fallible call (SEC-0107) |
+
+### Low Severity (1 finding)
+
+| Rank | Sev | Risk | Finding | Component | CWE | Evidence | Issue | Status |
+|------|-----|------|---------|-----------|-----|----------|-------|--------|
+| 2 | Low | 8 | `validateSnapshotConfig()` has no upper bound on voter count — O(n²) dedup check + unbounded `appendSlice` copy enables CPU DoS and OOM from a malicious peer | `src/snapshot.zig` | CWE-770, CWE-400 | `snapshot.zig:275-289` — no `MAX_VOTERS_PER_SET` limit; lines 168/172 copy unbounded voter IDs | [#115](https://gitlab.com/devnw/zig/raft/-/issues/115) | Resolved — added `MAX_VOTERS_PER_SET = 255` constant and early bounds check (SEC-0108) |
+
+### False Positives Filtered (Pass 12)
+
+> Agent-reported findings verified against actual code and filtered:
+
+- **"Quorum `committedForSet` off-by-one at `buf[n/2]`"** — Math is correct: for n=5, `buf[2]` is the 3rd-highest match_index (median), requiring 3 peers at or above. Majority = `n/2 + 1 = 3`. Correct for all cluster sizes.
+- **"log.zig `slice()` bounds wraparound on subtraction"** — `lo >= first_unstable` checked at line 104 before `lo - first_unstable` at line 105. `end` bounds-checked at line 107. Safe.
+- **"InMemoryStorage `entriesImpl` missing index validation"** — Line 159 (`end > self.log.items.len`) catches out-of-range; returns `Unavailable`. Safe.
+- **"Snapshot rename race: no syncDir between meta and data renames"** — BLAKE3 mismatch detection at lines 516-527 prevents loading corrupted data. Recovery path at lines 474-478 handles missing `snapshot.data` when `.tmp` exists.
+- **"Ready duplicate message emission"** — By design; Raft protocol is idempotent. Consumer receives whatever `node.zig` emits.
+- **"Missing errdefer for `owned_voters_outgoing` in receiveChunk"** — No fallible operations follow the `toOwnedSlice` call. Errdefer not needed.
+- **"`truncateFrom` missing fsync after `setEndPos`"** — Caller `appendEntriesImpl` calls `file.sync()` at line 342 after the full batch. Intentional batching for performance.
+- **"Cross-set voter deduplication in snapshot config"** — A voter in both sets is valid during joint consensus (Raft §6). Same node can be in old and new configurations simultaneously.
+
+---
+
+## Security Findings -- Pass 11 (SEC-0103 through SEC-0106) -- Resolved
+
+4 findings identified through exhaustive adversarial review with 5 parallel review agents covering all 14 source modules, tests, CI/CD, build system, and configs. All 12 automated scanners re-run (0 findings). Multiple agent-reported findings verified against actual code; 5+ filtered as false positives (WAL u64 overflow unreachable, snapshot @intCast widening, recovery offset bounded by file_size).
+
+### Medium Severity (1 finding)
+
+| Rank | Sev | Risk | Finding | Component | CWE | Evidence | Issue | Status |
+|------|-----|------|---------|-----------|-----|----------|-------|--------|
+| 1 | Medium | 24 | `becomeLeader()` sets `role=.leader` before fallible `ReplicationState.init()` — OOM leaves zombie leader with null replication_state | `src/node.zig` | CWE-665 | `node.zig:507` sets role, `node.zig:514` can fail; subsequent leader ops silently no-op | [#110](https://gitlab.com/devnw/zig/raft/-/issues/110) | Resolved — deferred role assignment until after all fallible operations succeed (SEC-0103) |
+
+### Low Severity (2 findings)
+
+| Rank | Sev | Risk | Finding | Component | CWE | Evidence | Issue | Status |
+|------|-----|------|---------|-----------|-----|----------|-------|--------|
+| 2 | Low | 8 | Unchecked `total_bytes += entry.data.len` in `buildEntries()` bypasses max_bytes_per_msg on u64 overflow | `src/replication.zig` | CWE-190 | `replication.zig:134` — wrapping addition when `max_entry_size=0` (unlimited) | [#111](https://gitlab.com/devnw/zig/raft/-/issues/111) | Resolved — replaced `+=` with `std.math.add` checked addition (SEC-0104) |
+| 3 | Low | 8 | Partial `appendSlice` failure in `FileStorage.init()` leaves inconsistent snapshot config (voters set, outgoing empty) | `src/file_storage.zig` | CWE-460 | `file_storage.zig:176-177` — no errdefer rollback between sequential fallible calls | [#112](https://gitlab.com/devnw/zig/raft/-/issues/112) | Resolved — added `errdefer` rollback between sequential appendSlice calls (SEC-0105) |
+
+### Info Severity (1 finding)
+
+| Rank | Sev | Risk | Finding | Component | CWE | Evidence | Issue | Status |
+|------|-----|------|---------|-----------|-----|----------|-------|--------|
+| 4 | Info | 4 | `election_elapsed` u32 tick counter wraps to zero after ~4.3B ticks, permanently disabling election timeout | `src/election.zig` | CWE-190 | `election.zig:66` — `+= 1` wraps; ~136 years at 1ms/tick | [#113](https://gitlab.com/devnw/zig/raft/-/issues/113) | Resolved — replaced `+=` with saturating addition `+|` + unit test (SEC-0106) |
+
+### False Positives Filtered (Pass 11)
+
+> Agent-reported findings verified against actual code and filtered:
+
+- **"WAL wal_end u64 overflow on cumulative writes"** — `wal_end` tracks file offset; individual entries capped at ~4GB (u32 data_len). Overflowing u64 requires ~18 exabytes of WAL data. Not reachable in any practical deployment.
+- **"WAL recovery offset + total_record_size overflow"** — Both values bounded by `file_size` (actual file on disk). Sum cannot exceed u64 for any real file.
+- **"Snapshot @intCast(offset) truncation"** — `offset` is `usize`, target is `u64`. On 64-bit systems this is identity; on 32-bit it's a widening cast. Always safe.
+- **"Snapshot buildInstallSnapshotMessages chunk_size unvalidated"** — `chunk_size` is validated by `Config.validate()` (minimum 1024, SEC-0100). Already fixed.
+- **"appendSlice double-free via meta.voters_buf"** — `ArrayList.appendSlice` copies data into its own buffer; `defer m.freeConfig()` frees the source. No aliasing between `fs.snapshot_config_voters` buffer and `meta.voters_buf`.
+
+---
+
+## Security Findings -- Pass 10 (SEC-0098 through SEC-0101) -- Resolved
+
+4 findings identified through exhaustive adversarial review with 5 parallel review agents covering all source modules, tests, CI/CD, and configs. All 12 automated scanners re-run (0 findings). 30+ agent-reported findings verified against actual code; 26+ filtered as false positives or duplicates of existing findings.
+
+### Medium Severity (2 findings)
+
+| Rank | Sev | Risk | Finding | Component | CWE | Evidence | Issue | Status |
+|------|-----|------|---------|-----------|-----|----------|-------|--------|
+| 1 | Medium | 24 | `receiveChunk()` accepts `last_included_term=0` — term 0 is invalid in Raft, corrupts snapshot_term history | `src/snapshot.zig` | CWE-20 | `snapshot.zig:145-177` — no validation of `msg.last_included_term > 0`; flows to `log.restore()` at `log.zig:272` | [#106](https://gitlab.com/devnw/zig/raft/-/issues/106) | Resolved — added term=0 validation in `receiveChunk()` + unit test (SEC-0098) |
+| 2 | Medium | 24 | No adversarial/Byzantine test scenarios — validation code from SEC-0001 through SEC-0097 not exercised by malicious inputs | `tests/scenarios/` | N/A | Missing test scenarios for: bogus terms, inflated indices, oversized payloads, sender mismatches, invalid snapshot metadata | [#109](https://gitlab.com/devnw/zig/raft/-/issues/109) | Resolved — added `tests/scenarios/adversarial.zig` with 12 test cases (SEC-0101) |
+
+### Low Severity (2 findings)
+
+| Rank | Sev | Risk | Finding | Component | CWE | Evidence | Issue | Status |
+|------|-----|------|---------|-----------|-----|----------|-------|--------|
+| 3 | Low | 12 | `handleInstallSnapshot()` applies snapshot config via direct mutation, bypassing `applyConfig()` validation path | `src/node.zig` | CWE-20 | `node.zig:874-887` — direct mutation of `membership_state.voters/voters_outgoing` instead of `applyConfig()` | [#107](https://gitlab.com/devnw/zig/raft/-/issues/107) | Resolved — added `applySnapshotConfig()` in `membership.zig` with full validation (SEC-0099) |
+| 4 | Low | 8 | `Config.validate()` only rejects `snapshot_chunk_size == 0`; value=1 causes 256M+ message allocation in `buildInstallSnapshotMessages()` | `src/node.zig`, `src/snapshot.zig` | CWE-770 | `node.zig:46` — no minimum enforced; `snapshot.zig:114-115` — `num_chunks = data.len / chunk_size` | [#108](https://gitlab.com/devnw/zig/raft/-/issues/108) | Resolved — raised minimum to 1024 bytes in `Config.validate()` + unit test (SEC-0100) |
+
+### False Positives Filtered (Pass 10)
+
+> 26+ agent-reported findings verified against actual code and filtered:
+
+- **"Out-of-bounds slice in maybeAppend offset calculation"** — `offset = conflict_idx - prev_log_index - 1 = i` (loop index), always `< entries.len`. Safe by construction.
+- **"Leader commit term not validated in followers"** — Per Raft §5.3, followers accept `leader_commit` from the leader. The leader is responsible for only committing entries from the current term (Figure 8). This is correct Raft behavior.
+- **"Double-voting race condition in startElection"** — In the Ready-State pattern, the consumer persists hard state from `Ready` before calling `advance()`. If consumer doesn't persist before crash, that's consumer responsibility (same as etcd/raft).
+- **"Unchecked leader_commit bounds"** — `commitTo()` does `@min(committed, self.lastIndex())`, clamping any value to the actual log size. Safe.
+- **"match_index not bounded to leader's log"** — Even if inflated, `commitTo()` clamping prevents commit beyond actual log. The leader's `lastIndex()` is the ultimate bound.
+- **"Log compaction below committed index"** — `appliedTo()` at `log.zig:189` enforces `applied <= committed`. Cannot compact uncommitted entries.
+- **"Cross-set voter overlap in joint consensus config"** — In Raft §6, a node CAN legitimately be in both old and new voter sets during joint consensus. Already documented in Pass 8 false positives.
+- **"CI Zig download missing SHA256 verification"** — Duplicate of SEC-0008/SEC-0042 (Won't Do — managed at CI catalog level).
+- **"Transport authentication not enforced"** — Design decision documented in `transport.zig:9-18`. Consumer responsibility.
+- **"CRC32 for persistent state integrity"** — Documented design tradeoff (Pass 2-3). CRC32 for accidental corruption; BLAKE3 for snapshot data.
+- **"File permissions not explicitly set"** — Consumer responsibility per `file_storage.zig:38-43` docstring.
+- **"Symlink attack on data directory"** — Consumer responsibility per `file_storage.zig:38-43` docstring.
+- **"Election timeout overflow"** — `std.math.mul` with `catch maxInt(u32)` produces valid range for `intRangeLessThan()`. Safe.
+- **"Empty voter set guard in vote response handler"** — `MembershipState.init()` and `Config.validate()` prevent empty voter sets.
+- **"No validation of unchanged config in proposeChange"** — Not a security issue; at most log pollution.
+- **"TOCTOU between snapshot.meta and snapshot.data renames"** — Mitigated by exclusive file lock (SEC-0066) and crash recovery in `loadSnapshotImpl()`.
 
 ---
 

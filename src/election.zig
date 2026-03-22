@@ -63,11 +63,14 @@ pub const ElectionState = struct {
     }
 
     pub fn tickElection(self: *ElectionState) void {
-        self.election_elapsed += 1;
+        // Saturating add prevents u32 wraparound from resetting the
+        // election timer after ~4.3 billion ticks (SEC-0106).
+        self.election_elapsed = self.election_elapsed +| 1;
     }
 
     pub fn tickHeartbeat(self: *ElectionState) void {
-        self.heartbeat_elapsed += 1;
+        // Saturating add for consistency with tickElection (SEC-0106).
+        self.heartbeat_elapsed = self.heartbeat_elapsed +| 1;
     }
 
     pub fn resetElectionElapsed(self: *ElectionState) void {
@@ -302,4 +305,24 @@ test "shouldGrantVote pre_vote skips voted_for check" {
 
     // Pre-vote still checks log freshness — stale log is denied.
     try std.testing.expect(!shouldGrantVote(3, 2, 4, 1, 5, 2, true));
+}
+
+test "tick counters use saturating addition (SEC-0106)" {
+    var es = ElectionState.init(std.testing.allocator, 10, 1, 42);
+    defer es.deinit();
+
+    // Set election_elapsed near u32 max to verify saturation.
+    es.election_elapsed = std.math.maxInt(u32) - 1;
+    es.tickElection();
+    try std.testing.expectEqual(std.math.maxInt(u32), es.election_elapsed);
+    // One more tick should saturate at max, not wrap to 0.
+    es.tickElection();
+    try std.testing.expectEqual(std.math.maxInt(u32), es.election_elapsed);
+
+    // Same for heartbeat.
+    es.heartbeat_elapsed = std.math.maxInt(u32) - 1;
+    es.tickHeartbeat();
+    try std.testing.expectEqual(std.math.maxInt(u32), es.heartbeat_elapsed);
+    es.tickHeartbeat();
+    try std.testing.expectEqual(std.math.maxInt(u32), es.heartbeat_elapsed);
 }

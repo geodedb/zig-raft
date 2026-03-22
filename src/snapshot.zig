@@ -148,10 +148,19 @@ pub const SnapshotState = struct {
                 return SnapshotError.StaleSnapshot;
             }
 
+            // Term 0 is invalid in Raft — the first election produces term 1 (SEC-0098).
+            if (msg.last_included_term == 0) {
+                return SnapshotError.InvalidSnapshotConfig;
+            }
+
             // Start a new pending snapshot (reset existing if any).
+            // Null out BEFORE the fallible validateSnapshotConfig() call so
+            // that a validation failure does not leave freed ArrayLists
+            // reachable via self.pending_snapshot (SEC-0107).
             if (self.pending_snapshot) |*pending| {
                 pending.data.deinit(self.allocator);
                 pending.deinitConfig(self.allocator);
+                self.pending_snapshot = null;
             }
 
             // Validate incoming config (SEC-0043): reject empty voter sets and duplicates.
@@ -259,12 +268,27 @@ pub const SnapshotState = struct {
     }
 };
 
+/// Maximum number of voters allowed in a snapshot config.
+/// No real Raft cluster exceeds this; the limit prevents O(n²) CPU
+/// cost in the deduplication check and unbounded memory allocation
+/// from a malicious peer (SEC-0108).
+const MAX_VOTERS_PER_SET: usize = 255;
+
 /// Validate a snapshot config received from a peer (SEC-0043).
 /// Rejects empty voter sets and duplicate voter IDs, matching the
 /// checks in Config.validate() (SEC-0033).
 fn validateSnapshotConfig(cfg: rpc.ClusterConfig) SnapshotError!void {
     // Must have at least one voter.
     if (cfg.voters.len == 0) return SnapshotError.InvalidSnapshotConfig;
+
+    // Joint configs must have a non-empty outgoing voter set; non-joint
+    // configs must NOT have one (SEC-0110).
+    if (cfg.is_joint and cfg.voters_outgoing.len == 0) return SnapshotError.InvalidSnapshotConfig;
+    if (!cfg.is_joint and cfg.voters_outgoing.len > 0) return SnapshotError.InvalidSnapshotConfig;
+
+    // Reject unreasonably large voter sets (SEC-0108).
+    if (cfg.voters.len > MAX_VOTERS_PER_SET) return SnapshotError.InvalidSnapshotConfig;
+    if (cfg.voters_outgoing.len > MAX_VOTERS_PER_SET) return SnapshotError.InvalidSnapshotConfig;
 
     // Check for duplicates in voters.
     for (cfg.voters, 0..) |v, i| {
@@ -592,6 +616,24 @@ test "receiveChunk rejects stale snapshot" {
     defer if (snap.?.metadata.config.voters_outgoing.len > 0) ss.allocator.free(snap.?.metadata.config.voters_outgoing);
 }
 
+test "receiveChunk rejects zero term (SEC-0098)" {
+    var ss = SnapshotState.init(std.testing.allocator, 100, 1024, 0);
+    defer ss.deinit();
+
+    const result = ss.receiveChunk(.{
+        .term = 1,
+        .leader_id = 1,
+        .last_included_index = 5,
+        .last_included_term = 0, // Invalid: term 0 is impossible in Raft
+        .offset = 0,
+        .data = "data",
+        .done = true,
+        .checksum = zero_checksum,
+        .config = test_config,
+    });
+    try std.testing.expectError(SnapshotError.InvalidSnapshotConfig, result);
+}
+
 test "receiveChunk rejects invalid snapshot config (SEC-0043)" {
     var ss = SnapshotState.init(std.testing.allocator, 100, 1024, 0);
     defer ss.deinit();
@@ -675,4 +717,129 @@ test "receiveChunk rejects invalid snapshot config (SEC-0043)" {
     defer ss.allocator.free(valid_result.?.data);
     defer if (valid_result.?.metadata.config.voters.len > 0) ss.allocator.free(valid_result.?.metadata.config.voters);
     defer if (valid_result.?.metadata.config.voters_outgoing.len > 0) ss.allocator.free(valid_result.?.metadata.config.voters_outgoing);
+}
+
+test "receiveChunk restart after config validation failure does not double-free (SEC-0107)" {
+    var ss = SnapshotState.init(std.testing.allocator, 100, 1024, 0);
+    defer ss.deinit();
+
+    // Start a valid chunked transfer.
+    _ = try ss.receiveChunk(.{
+        .term = 1,
+        .leader_id = 1,
+        .last_included_index = 5,
+        .last_included_term = 1,
+        .offset = 0,
+        .data = "partial",
+        .done = false,
+        .checksum = zero_checksum,
+        .config = test_config,
+    });
+    try std.testing.expect(ss.pending_snapshot != null);
+
+    // Send a new first-chunk (offset=0) with an INVALID config.
+    // This frees the old pending and then fails validation.
+    // Before SEC-0107 fix, pending_snapshot held freed ArrayLists.
+    const bad_config = rpc.ClusterConfig{
+        .voters = &.{}, // empty = invalid
+        .voters_outgoing = &.{},
+        .is_joint = false,
+    };
+    const result = ss.receiveChunk(.{
+        .term = 1,
+        .leader_id = 1,
+        .last_included_index = 10,
+        .last_included_term = 2,
+        .offset = 0,
+        .data = "new",
+        .done = true,
+        .checksum = zero_checksum,
+        .config = bad_config,
+    });
+    try std.testing.expectError(SnapshotError.InvalidSnapshotConfig, result);
+
+    // pending_snapshot must be null after the failed restart.
+    try std.testing.expect(ss.pending_snapshot == null);
+
+    // A subsequent valid transfer must succeed without double-free.
+    const digest = blake3Hash("recovery");
+    const snap = try ss.receiveChunk(.{
+        .term = 2,
+        .leader_id = 1,
+        .last_included_index = 15,
+        .last_included_term = 3,
+        .offset = 0,
+        .data = "recovery",
+        .done = true,
+        .checksum = digest,
+        .config = test_config,
+    });
+    try std.testing.expect(snap != null);
+    defer ss.allocator.free(snap.?.data);
+    defer if (snap.?.metadata.config.voters.len > 0) ss.allocator.free(snap.?.metadata.config.voters);
+    defer if (snap.?.metadata.config.voters_outgoing.len > 0) ss.allocator.free(snap.?.metadata.config.voters_outgoing);
+}
+
+test "validateSnapshotConfig rejects is_joint=true with empty outgoing (SEC-0110)" {
+    var ss = SnapshotState.init(std.testing.allocator, 100, 1024, 0);
+    defer ss.deinit();
+
+    // is_joint=true but voters_outgoing is empty — must be rejected.
+    const result = ss.receiveChunk(.{
+        .term = 1,
+        .leader_id = 1,
+        .last_included_index = 5,
+        .last_included_term = 1,
+        .offset = 0,
+        .data = "data",
+        .done = true,
+        .checksum = zero_checksum,
+        .config = .{ .voters = &[_]u64{ 1, 2, 3 }, .voters_outgoing = &.{}, .is_joint = true },
+    });
+    try std.testing.expectError(SnapshotError.InvalidSnapshotConfig, result);
+}
+
+test "validateSnapshotConfig rejects non-joint with outgoing voters (SEC-0110)" {
+    var ss = SnapshotState.init(std.testing.allocator, 100, 1024, 0);
+    defer ss.deinit();
+
+    // is_joint=false but voters_outgoing is non-empty — must be rejected.
+    const result = ss.receiveChunk(.{
+        .term = 1,
+        .leader_id = 1,
+        .last_included_index = 5,
+        .last_included_term = 1,
+        .offset = 0,
+        .data = "data",
+        .done = true,
+        .checksum = zero_checksum,
+        .config = .{ .voters = &[_]u64{ 1, 2, 3 }, .voters_outgoing = &[_]u64{ 4, 5 }, .is_joint = false },
+    });
+    try std.testing.expectError(SnapshotError.InvalidSnapshotConfig, result);
+}
+
+test "validateSnapshotConfig rejects oversized voter sets (SEC-0108)" {
+    var ss = SnapshotState.init(std.testing.allocator, 100, 1024, 0);
+    defer ss.deinit();
+
+    // Build a voter set exceeding MAX_VOTERS_PER_SET.
+    var oversized: [256]u64 = undefined;
+    for (&oversized, 1..) |*v, i| v.* = i;
+    const big_config = rpc.ClusterConfig{
+        .voters = &oversized,
+        .voters_outgoing = &.{},
+        .is_joint = false,
+    };
+    const result = ss.receiveChunk(.{
+        .term = 1,
+        .leader_id = 1,
+        .last_included_index = 5,
+        .last_included_term = 1,
+        .offset = 0,
+        .data = "data",
+        .done = true,
+        .checksum = zero_checksum,
+        .config = big_config,
+    });
+    try std.testing.expectError(SnapshotError.InvalidSnapshotConfig, result);
 }

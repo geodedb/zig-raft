@@ -150,6 +150,49 @@ pub const MembershipState = struct {
         self.pending_config_change = parsed.is_joint;
     }
 
+    /// Apply a snapshot config to membership state (SEC-0099).
+    /// Validates the config using the same rules as applyConfig (SEC-0053),
+    /// then replaces the current voter sets.
+    pub fn applySnapshotConfig(self: *MembershipState, cfg: rpc.ClusterConfig) !void {
+        // Validate voters: non-empty, no zero IDs, no duplicates.
+        if (cfg.voters.len == 0) return error.InvalidData;
+        for (cfg.voters, 0..) |v, i| {
+            if (v == 0) return error.InvalidData;
+            for (cfg.voters[0..i]) |prev| {
+                if (v == prev) return error.InvalidData;
+            }
+        }
+        // Joint configs must have a non-empty outgoing voter set; non-joint
+        // configs must NOT have one (SEC-0110).
+        if (cfg.is_joint and cfg.voters_outgoing.len == 0) return error.InvalidData;
+        if (!cfg.is_joint and cfg.voters_outgoing.len > 0) return error.InvalidData;
+        if (cfg.is_joint) {
+            for (cfg.voters_outgoing, 0..) |v, i| {
+                if (v == 0) return error.InvalidData;
+                for (cfg.voters_outgoing[0..i]) |prev| {
+                    if (v == prev) return error.InvalidData;
+                }
+            }
+        }
+
+        // Perform all fallible copies before mutating state.
+        var new_voters = std.ArrayList(u64){};
+        try new_voters.appendSlice(self.allocator, cfg.voters);
+        errdefer new_voters.deinit(self.allocator);
+
+        var new_outgoing = std.ArrayList(u64){};
+        if (cfg.is_joint) {
+            try new_outgoing.appendSlice(self.allocator, cfg.voters_outgoing);
+        }
+
+        // All allocations succeeded — now mutate state (infallible from here).
+        self.voters.deinit(self.allocator);
+        self.voters = new_voters;
+        self.voters_outgoing.deinit(self.allocator);
+        self.voters_outgoing = new_outgoing;
+        self.is_joint = cfg.is_joint;
+    }
+
     /// Check if leader should step down (leader ID not in current voters).
     /// Leader only steps down after the final non-joint config commits.
     pub fn shouldLeaderStepDown(self: *const MembershipState, leader_id: u64) bool {
@@ -470,6 +513,72 @@ test "serialization round-trip — serialize then deserialize voters" {
     try std.testing.expectEqual(@as(usize, 2), joint_parsed.voters_outgoing.len);
     try std.testing.expectEqual(@as(u64, 1), joint_parsed.voters_outgoing[0]);
     try std.testing.expectEqual(@as(u64, 2), joint_parsed.voters_outgoing[1]);
+}
+
+test "applySnapshotConfig — replaces voters with validation (SEC-0099)" {
+    const allocator = std.testing.allocator;
+    const initial = [_]u64{ 1, 2, 3 };
+    var ms = try MembershipState.init(allocator, &initial);
+    defer ms.deinit();
+
+    // Valid non-joint config.
+    try ms.applySnapshotConfig(.{
+        .voters = &[_]u64{ 4, 5, 6 },
+        .voters_outgoing = &.{},
+        .is_joint = false,
+    });
+    try std.testing.expectEqual(@as(usize, 3), ms.voters.items.len);
+    try std.testing.expectEqual(@as(u64, 4), ms.voters.items[0]);
+    try std.testing.expect(!ms.is_joint);
+
+    // Valid joint config.
+    try ms.applySnapshotConfig(.{
+        .voters = &[_]u64{ 7, 8 },
+        .voters_outgoing = &[_]u64{ 4, 5 },
+        .is_joint = true,
+    });
+    try std.testing.expectEqual(@as(usize, 2), ms.voters.items.len);
+    try std.testing.expectEqual(@as(usize, 2), ms.voters_outgoing.items.len);
+    try std.testing.expect(ms.is_joint);
+
+    // Rejects empty voters.
+    try std.testing.expectError(error.InvalidData, ms.applySnapshotConfig(.{
+        .voters = &.{},
+        .voters_outgoing = &.{},
+        .is_joint = false,
+    }));
+
+    // Rejects zero voter ID.
+    try std.testing.expectError(error.InvalidData, ms.applySnapshotConfig(.{
+        .voters = &[_]u64{ 0, 1 },
+        .voters_outgoing = &.{},
+        .is_joint = false,
+    }));
+
+    // Rejects duplicate voter IDs.
+    try std.testing.expectError(error.InvalidData, ms.applySnapshotConfig(.{
+        .voters = &[_]u64{ 1, 1 },
+        .voters_outgoing = &.{},
+        .is_joint = false,
+    }));
+
+    // State unchanged after rejected config.
+    try std.testing.expectEqual(@as(usize, 2), ms.voters.items.len);
+    try std.testing.expectEqual(@as(u64, 7), ms.voters.items[0]);
+
+    // Rejects is_joint=true with empty outgoing (SEC-0110).
+    try std.testing.expectError(error.InvalidData, ms.applySnapshotConfig(.{
+        .voters = &[_]u64{ 1, 2, 3 },
+        .voters_outgoing = &.{},
+        .is_joint = true,
+    }));
+
+    // Rejects is_joint=false with non-empty outgoing (SEC-0110).
+    try std.testing.expectError(error.InvalidData, ms.applySnapshotConfig(.{
+        .voters = &[_]u64{ 1, 2, 3 },
+        .voters_outgoing = &[_]u64{ 4, 5 },
+        .is_joint = false,
+    }));
 }
 
 test "isVoter — checks both voter sets" {
