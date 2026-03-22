@@ -481,19 +481,58 @@ All 11 findings remediated in-place with code changes and tests. Key fixes:
 - "Underflow in buildAppendEntries" — guard at line 109 prevents this
 - "Missing leader failover test during joint" — test gap, not vulnerability
 
+### Pass 16: Deep Adversarial Review (SEC-0122..SEC-0136)
+
+15 new findings identified through exhaustive adversarial review with 5 parallel agents covering protocol safety, storage/crash safety, transport/RPC validation, CI/CD/supply chain, and memory safety/API misuse. 8 automated scanners re-run (0 findings). 40+ agent-reported findings verified against code; 25+ filtered as false positives or duplicates.
+
+**15 findings filed as GitLab issues (#129-#143). All resolved.** Key findings:
+- `handleInstallSnapshot` leaks snapshot data/config on `applySnapshotConfig()` failure (SEC-0122, HIGH)
+- Joint-consensus snapshot doesn't set `pending_config_index` — extends SEC-0120 to snapshot path (SEC-0123, HIGH)
+- `RaftLog.append()` leaks `data_copy` on OOM + no batch rollback (SEC-0124, MEDIUM)
+- `InMemoryStorage.appendEntriesImpl` same leak + no rollback (SEC-0125, MEDIUM)
+- `RaftNode.init()` missing errdefers for `log_inst`/`membership_inst` (SEC-0126, MEDIUM)
+- `max_bytes_per_msg` check bypassed when `max_entry_size == 0` (SEC-0127, MEDIUM)
+- Entry index consistency not validated in `handleAppendEntries` (SEC-0128, MEDIUM)
+- CI `ZIG_VERSION` injectable via pipeline trigger API (SEC-0129, MEDIUM)
+- `init()` deletes snapshot `.tmp` files before crash recovery (SEC-0130, MEDIUM)
+- `ready_state.prev_hard_state` not restored from persisted state (SEC-0131, LOW)
+- Missing `syncDir()` after WAL deletion in compaction (SEC-0132, LOW)
+- Pre-vote lacks leader lease check (SEC-0133, LOW)
+- RPC request handlers don't validate sender membership (SEC-0134, LOW)
+- RPC handlers accept `leader_id/candidate_id == 0` (SEC-0135, LOW)
+- No `workflow:rules` restricting CI pipeline execution (SEC-0136, LOW)
+
+**Scanner results (Pass 16):**
+
+| Tool | Version | Result |
+|------|---------|--------|
+| gitleaks | 8.30.0 | 0 findings |
+| trufflehog | 3.92.5 | 0 findings |
+| osv-scanner | 2.3.2 | No package sources |
+| trivy (fs) | 0.69.0 | 0 vulns, 0 secrets |
+| syft + grype | 1.41.1 / 0.107.0 | 0 vulns |
+| semgrep | 1.150.0 | 0 findings (p/default config) |
+| checkov | 3.2.499 | 0 failed |
+| shellcheck | 0.10.0+ | No shell scripts in repo |
+
+**False positives filtered (25+):** See GAP_ANALYSIS.md Pass 16 section for full list.
+
 ## Notes
 
-- No secrets detected in repo history (12 commits scanned)
+- No secrets detected in repo history (13 commits scanned)
 - Zig ecosystem lacks lockfile/SBOM tooling -- osv-scanner found no package sources
 - No Dockerfiles, Helm charts, Terraform, or other IaC in repo
 - CI uses component includes from `gitlab.com/devnw/ci-catalog` at `@v1.7.1` (mutable tag) and `@v1.2.1` -- Won't Do (managed at CI catalog level)
 - `debian:bookworm-slim` Docker image used without digest pinning -- Won't Do (managed at CI catalog level)
 - CODEOWNERS updated from placeholder to `@devnw` (SEC-0010, resolved in Pass 1)
 - `SECURITY.md` updated from GitHub to GitLab references (INFO-1, resolved in Pass 1)
-- 107 total security findings across 12 passes: all resolved or Won't Do, 0 open
+- 135 total security findings across 16 passes: all 135 resolved or Won't Do
+- Pass 16 remediation: SEC-0122 errdefer snapshot leak, SEC-0123 pending_config_index from snapshot, SEC-0124 log.append errdefer+rollback, SEC-0125 storage.append errdefer+rollback, SEC-0126 init errdefers, SEC-0127 max_bytes_per_msg outside entry_size guard, SEC-0128 entry index validation, SEC-0129 ZIG_VERSION sanitization, SEC-0130 .tmp deletion after recovery, SEC-0131 restored hard state in ready_state, SEC-0132 syncDir after WAL deletion, SEC-0133 pre-vote leader lease check, SEC-0134 membership check on request handlers, SEC-0135 reject ID==0, SEC-0136 workflow:rules
+- Pass 15 remediation: SEC-0119 stale-term rejection, SEC-0120 pending_config_index in advance(), SEC-0121 gitleaks regex anchoring
+- Pass 14 remediation: SEC-0111..SEC-0118 (8 findings)
 - Pass 12 remediation: SEC-0107 null pending snapshot before fallible call, SEC-0108 voter count limit (MAX_VOTERS_PER_SET=255)
 - Pass 11 remediation: SEC-0103 deferred role assignment, SEC-0104 checked addition, SEC-0105 errdefer rollback, SEC-0106 saturating tick counters
 - Pass 10 remediation: SEC-0098 term=0 validation, SEC-0099 centralized `applySnapshotConfig()`, SEC-0100 minimum 1024-byte chunk size, SEC-0101 adversarial test suite (12 scenarios)
 - Pass 9 remediation: 21 findings resolved in code, 3 closed as Won't Do (SEC-0093 harness allocator intentional, SEC-0099 caller responsibility, SEC-0102 test-only)
-- All 178 tests pass (120 unit, 1 integration, 46 scenario, 11 chaos) after Pass 11 remediation
-- Automated scanners (12 tools) found 0 issues across all 11 passes -- all findings are from manual adversarial review
+- All 185 tests pass (124 unit, 1 integration, 49 scenario, 11 chaos) after Pass 15 remediation
+- Automated scanners (8 tools) found 0 issues across all 16 passes -- all findings are from manual adversarial review

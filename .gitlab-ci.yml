@@ -2,6 +2,15 @@
 # GitLab CI/CD Pipeline for raft
 # SPDX-License-Identifier: Apache-2.0
 
+# Restrict pipeline execution to protected branches and merge requests
+# to prevent unauthorized fork MR pipelines from running (SEC-0136).
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
 include:
   # Security scanning
   - component: gitlab.com/devnw/ci-catalog/security-sast@v1.7.1
@@ -31,7 +40,13 @@ stages:
   - release
 
 # Zig installation template
+# Validates ZIG_VERSION to prevent shell injection via pipeline trigger API (SEC-0129).
 .install-zig: &install-zig
+  - |
+    if ! echo "${ZIG_VERSION}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-dev\.[0-9]+\+[a-f0-9]+)?$'; then
+      echo "ERROR: Invalid ZIG_VERSION format: '${ZIG_VERSION}'" >&2
+      exit 1
+    fi
   - apt-get update && apt-get install -y curl xz-utils
   - curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz" -o zig.tar.xz
   - tar -xf zig.tar.xz

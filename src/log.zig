@@ -47,11 +47,23 @@ pub const RaftLog = struct {
     }
 
     pub fn append(self: *RaftLog, entries: []const rpc.Entry) !void {
+        const initial_len = self.unstable_entries.items.len;
+        // Roll back all appended entries on failure to prevent partial
+        // batch appends and leaked data copies (SEC-0124).
+        errdefer {
+            for (self.unstable_entries.items[initial_len..]) |e| {
+                if (e.data.len > 0) self.allocator.free(e.data);
+            }
+            self.unstable_entries.shrinkRetainingCapacity(initial_len);
+        }
+
         for (entries) |entry| {
             const data_copy = if (entry.data.len > 0)
                 try self.allocator.dupe(u8, entry.data)
             else
                 entry.data;
+            // Free data_copy if ArrayList.append fails (SEC-0124).
+            errdefer if (data_copy.len > 0) self.allocator.free(data_copy);
 
             try self.unstable_entries.append(self.allocator, .{
                 .index = entry.index,

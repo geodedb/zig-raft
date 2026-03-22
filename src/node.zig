@@ -99,7 +99,9 @@ pub const RaftNode = struct {
     pub fn init(allocator: std.mem.Allocator, config: Config, storage_impl: stg.Storage) !RaftNode {
         try config.validate();
 
-        const log_inst = try raft_log.RaftLog.init(allocator, storage_impl);
+        var log_inst = try raft_log.RaftLog.init(allocator, storage_impl);
+        // Free log on init failure to prevent leak (SEC-0126).
+        errdefer log_inst.deinit();
 
         // Load snapshot to restore membership config (SEC-0073).
         // RaftLog.init already loaded and freed its own copy for index/term.
@@ -109,6 +111,8 @@ pub const RaftNode = struct {
         // Build initial voter set: use snapshot config if available,
         // otherwise fall back to static config.peers (SEC-0073).
         var membership_inst: mem.MembershipState = undefined;
+        // Track whether snapshot is in joint consensus for pending_config_index (SEC-0123).
+        var snap_pending_config_index: u64 = 0;
         if (loaded_snap) |snap_val| {
             defer stg.freeSnapshot(allocator, snap_val);
             if (snap_val.metadata.config.voters.len > 0) {
@@ -117,6 +121,9 @@ pub const RaftNode = struct {
                 if (snap_val.metadata.config.is_joint and snap_val.metadata.config.voters_outgoing.len > 0) {
                     try membership_inst.voters_outgoing.appendSlice(allocator, snap_val.metadata.config.voters_outgoing);
                     membership_inst.is_joint = true;
+                    // Joint consensus snapshot: set pending_config_index so a
+                    // new leader can finalize the transition (SEC-0123).
+                    snap_pending_config_index = snap_val.metadata.index;
                 }
             } else {
                 // Snapshot has no config — fall back to static peers.
@@ -135,6 +142,9 @@ pub const RaftNode = struct {
             membership_inst = try mem.MembershipState.init(allocator, all_voters.items);
         }
 
+        // Free membership on init failure to prevent leak (SEC-0126).
+        errdefer membership_inst.deinit();
+
         // Restore hard state from storage to prevent double-voting on
         // restart and term regression (SEC-0077).
         const restored_hs = try storage_impl.loadHardState();
@@ -148,7 +158,7 @@ pub const RaftNode = struct {
             .current_term = initial_term,
             .voted_for = initial_voted_for,
             .is_pre_vote_election = false,
-            .pending_config_index = 0,
+            .pending_config_index = snap_pending_config_index,
             .log = log_inst,
             .election_state = elect.ElectionState.init(
                 allocator,
@@ -164,7 +174,9 @@ pub const RaftNode = struct {
                 config.snapshot_chunk_size,
                 config.max_snapshot_size,
             ),
-            .ready_state = rd.ReadyState.init(allocator, st.HardState.initial),
+            // Use restored hard state to avoid redundant persist on first
+            // advance() after restart (SEC-0131).
+            .ready_state = rd.ReadyState.init(allocator, restored_hs),
             .config = config,
             .transport = null,
             .storage = storage_impl,
@@ -640,21 +652,63 @@ pub const RaftNode = struct {
     fn handleRequestVote(self: *RaftNode, from: u64, msg: rpc.RequestVote) !void {
         _ = from;
 
+        // Reject messages from node ID 0 — invalid sender (SEC-0135).
+        if (msg.candidate_id == 0) return;
+
         // If msg.term > current_term and not a pre-vote, step down.
         if (msg.term > self.current_term and !msg.pre_vote) {
             self.becomeFollower(msg.term, null);
         }
 
-        // Leaders must NOT grant pre-votes to prevent disruptive re-elections
-        // from partitioned nodes (Raft §9.6, SEC-0061).
-        if (msg.pre_vote and self.role == .leader) {
-            const response = rpc.Message{ .request_vote_response = .{
+        // Reject requests from non-member nodes for symmetry with
+        // response handlers (SEC-0134).
+        const cfg = self.membership_state.config();
+        var is_member = false;
+        for (cfg.voters) |v| {
+            if (v == msg.candidate_id) {
+                is_member = true;
+                break;
+            }
+        }
+        if (!is_member) {
+            for (cfg.voters_outgoing) |v| {
+                if (v == msg.candidate_id) {
+                    is_member = true;
+                    break;
+                }
+            }
+        }
+        if (!is_member) {
+            std.log.warn("raft: RequestVote from non-member {d}, rejecting", .{msg.candidate_id});
+            self.sendMsg(msg.candidate_id, rpc.Message{ .request_vote_response = .{
                 .term = self.current_term,
                 .vote_granted = false,
-                .pre_vote = true,
-            } };
-            self.sendMsg(msg.candidate_id, response);
+                .pre_vote = msg.pre_vote,
+            } });
             return;
+        }
+
+        // Leaders must NOT grant pre-votes to prevent disruptive re-elections
+        // from partitioned nodes (Raft §9.6, SEC-0061).
+        // Followers/candidates with a known leader also reject pre-votes
+        // for same-term requests to prevent disruption (SEC-0133).
+        if (msg.pre_vote) {
+            if (self.role == .leader) {
+                self.sendMsg(msg.candidate_id, rpc.Message{ .request_vote_response = .{
+                    .term = self.current_term,
+                    .vote_granted = false,
+                    .pre_vote = true,
+                } });
+                return;
+            }
+            if (self.leader_id != null and msg.term <= self.current_term) {
+                self.sendMsg(msg.candidate_id, rpc.Message{ .request_vote_response = .{
+                    .term = self.current_term,
+                    .vote_granted = false,
+                    .pre_vote = true,
+                } });
+                return;
+            }
         }
 
         const grant = elect.shouldGrantVote(
@@ -765,10 +819,13 @@ pub const RaftNode = struct {
             } });
             return;
         }
-        if (self.config.max_entry_size > 0) {
+        // Validate entry sizes and aggregate message size (SEC-0127).
+        // Aggregate check runs even when max_entry_size==0 (unlimited individual
+        // entries) to enforce max_bytes_per_msg.
+        {
             var total_bytes: u64 = 0;
             for (msg.entries) |entry| {
-                if (entry.data.len > self.config.max_entry_size) {
+                if (self.config.max_entry_size > 0 and entry.data.len > self.config.max_entry_size) {
                     self.sendMsg(msg.leader_id, rpc.Message{ .append_entries_response = .{
                         .term = self.current_term,
                         .success = false,
@@ -798,6 +855,33 @@ pub const RaftNode = struct {
                     .conflict_term = 0,
                 } });
                 return;
+            }
+        }
+
+        // Validate entry index continuity: entries must be sequential
+        // starting at prev_log_index + 1 (SEC-0128).
+        if (msg.entries.len > 0) {
+            const expected_first = std.math.add(u64, msg.prev_log_index, 1) catch {
+                self.sendMsg(msg.leader_id, rpc.Message{ .append_entries_response = .{
+                    .term = self.current_term,
+                    .success = false,
+                    .match_index = 0,
+                    .conflict_index = 0,
+                    .conflict_term = 0,
+                } });
+                return;
+            };
+            for (msg.entries, 0..) |entry, i| {
+                if (entry.index != expected_first + i) {
+                    self.sendMsg(msg.leader_id, rpc.Message{ .append_entries_response = .{
+                        .term = self.current_term,
+                        .success = false,
+                        .match_index = 0,
+                        .conflict_index = 0,
+                        .conflict_term = 0,
+                    } });
+                    return;
+                }
             }
         }
 
@@ -870,6 +954,31 @@ pub const RaftNode = struct {
     fn handleInstallSnapshot(self: *RaftNode, from: u64, msg: rpc.InstallSnapshot) !void {
         _ = from;
 
+        // Reject messages from node ID 0 — invalid sender (SEC-0135).
+        if (msg.leader_id == 0) return;
+
+        // Reject requests from non-member nodes (SEC-0134).
+        const cfg = self.membership_state.config();
+        var is_member = false;
+        for (cfg.voters) |v| {
+            if (v == msg.leader_id) {
+                is_member = true;
+                break;
+            }
+        }
+        if (!is_member) {
+            for (cfg.voters_outgoing) |v| {
+                if (v == msg.leader_id) {
+                    is_member = true;
+                    break;
+                }
+            }
+        }
+        if (!is_member) {
+            std.log.warn("raft: InstallSnapshot from non-member {d}, ignoring", .{msg.leader_id});
+            return;
+        }
+
         if (msg.term < self.current_term) {
             self.sendMsg(msg.leader_id, rpc.Message{ .install_snapshot_response = .{
                 .term = self.current_term,
@@ -893,6 +1002,10 @@ pub const RaftNode = struct {
         };
 
         if (result) |snapshot_val| {
+            // Free snapshot data if any fallible operation below fails,
+            // preventing up to 256 MiB leak (SEC-0122).
+            errdefer stg.freeSnapshot(self.allocator, snapshot_val);
+
             // Restore log state from the snapshot so committed/applied/
             // snapshot_index track the snapshot point (SEC-0090).
             try self.log.restore(snapshot_val);
@@ -902,8 +1015,16 @@ pub const RaftNode = struct {
             if (snapshot_val.metadata.config.voters.len > 0) {
                 try self.membership_state.applySnapshotConfig(snapshot_val.metadata.config);
             }
-            // Snapshot supersedes any in-flight config change (SEC-0112).
-            self.pending_config_index = 0;
+            // If snapshot is in joint consensus, set pending_config_index
+            // so the leader can finalize the transition (SEC-0123).
+            if (snapshot_val.metadata.config.is_joint) {
+                self.pending_config_index = snapshot_val.metadata.index;
+            } else {
+                // Snapshot supersedes any in-flight config change (SEC-0112).
+                self.pending_config_index = 0;
+            }
+            // Transfer ownership to ready_state — errdefer will not fire
+            // on normal return since setSnapshot is infallible.
             self.ready_state.setSnapshot(snapshot_val);
             self.sendMsg(msg.leader_id, rpc.Message{ .install_snapshot_response = .{
                 .term = self.current_term,

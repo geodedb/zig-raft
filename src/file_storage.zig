@@ -151,15 +151,19 @@ pub const FileStorage = struct {
             if (fs.wal_file) |f| f.close();
         }
 
-        // Clean up stale tmp files from interrupted snapshot writes (SEC-0041).
-        dir.deleteFile("snapshot.data.tmp") catch {};
-        dir.deleteFile("snapshot.meta.tmp") catch {};
+        // Clean up stale hard_state tmp (safe — not used by recovery).
         dir.deleteFile("hard_state.tmp") catch {};
+
+        // NOTE: snapshot .tmp files are NOT deleted here — loadSnapshotImpl()
+        // uses snapshot.data.tmp for crash recovery when a rename was
+        // interrupted (SEC-0130, SEC-0041). They are cleaned up after
+        // snapshot recovery below.
 
         // Recover hard state.
         fs.hard_state = fs.readHardStateFile() catch state.HardState.initial;
 
         // Recover snapshot metadata (config now included in V3 format, SEC-0039).
+        // This also recovers from interrupted snapshot.data renames (SEC-0130).
         const snap_meta = fs.readSnapshotMeta() catch null;
         if (snap_meta) |meta| {
             // Free the owned buffers from readSnapshotMeta on both success and
@@ -181,6 +185,11 @@ pub const FileStorage = struct {
                 fs.snapshot_config_is_joint = cfg.is_joint;
             }
         }
+
+        // Now that snapshot recovery is complete, clean up any stale .tmp
+        // files that were preserved for crash recovery (SEC-0130, SEC-0041).
+        dir.deleteFile("snapshot.data.tmp") catch {};
+        dir.deleteFile("snapshot.meta.tmp") catch {};
 
         // Open WAL and rebuild in-memory index with torn write recovery.
         try fs.recoverWal();
@@ -592,6 +601,9 @@ pub const FileStorage = struct {
                 self.wal_file = null;
             }
             self.dir.deleteFile("wal") catch {};
+            // Sync directory metadata to ensure WAL deletion is durable,
+            // preventing ghost WAL on crash (SEC-0132).
+            self.syncDir() catch {};
             self.wal_end = 0;
             return;
         }

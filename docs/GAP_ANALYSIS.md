@@ -2,7 +2,7 @@
 
 **Last updated:** 2026-03-22
 **Spec:** `docs/superpowers/specs/2026-03-21-raft-design.md`
-**Methodology:** Requirements-to-code audit + fifteen adversarial security review passes -- all source, tests, CI, and docs compared against design spec, then reviewed for security vulnerabilities. Pass 1 (SEC-0001..SEC-0011, all remediated), Pass 2 (SEC-0012..SEC-0028, all remediated or Won't Do), Pass 3 (SEC-0029..SEC-0036, all remediated), Pass 4 (SEC-0037..SEC-0044, all remediated or Won't Do), Pass 5 (SEC-0045..SEC-0064, all remediated), Pass 6 (SEC-0065..SEC-0068, all remediated or Won't Do), Pass 7 (SEC-0069..SEC-0070, all remediated), Pass 8 (SEC-0071..SEC-0073, all remediated), Pass 9 (SEC-0074..SEC-0097, all remediated or Won't Do), Pass 10 (SEC-0098..SEC-0101, all remediated), Pass 11 (SEC-0103..SEC-0106, all remediated), Pass 12 (SEC-0107..SEC-0108, all remediated), Pass 13 (SEC-0109..SEC-0110, all remediated), Pass 14 (SEC-0111..SEC-0118, all remediated), Pass 15 (SEC-0119..SEC-0121, all remediated).
+**Methodology:** Requirements-to-code audit + sixteen adversarial security review passes -- all source, tests, CI, and docs compared against design spec, then reviewed for security vulnerabilities. Pass 1 (SEC-0001..SEC-0011, all remediated), Pass 2 (SEC-0012..SEC-0028, all remediated or Won't Do), Pass 3 (SEC-0029..SEC-0036, all remediated), Pass 4 (SEC-0037..SEC-0044, all remediated or Won't Do), Pass 5 (SEC-0045..SEC-0064, all remediated), Pass 6 (SEC-0065..SEC-0068, all remediated or Won't Do), Pass 7 (SEC-0069..SEC-0070, all remediated), Pass 8 (SEC-0071..SEC-0073, all remediated), Pass 9 (SEC-0074..SEC-0097, all remediated or Won't Do), Pass 10 (SEC-0098..SEC-0101, all remediated), Pass 11 (SEC-0103..SEC-0106, all remediated), Pass 12 (SEC-0107..SEC-0108, all remediated), Pass 13 (SEC-0109..SEC-0110, all remediated), Pass 14 (SEC-0111..SEC-0118, all remediated), Pass 15 (SEC-0119..SEC-0121, all remediated), Pass 16 (SEC-0122..SEC-0136, all remediated).
 
 ## Summary
 
@@ -17,17 +17,17 @@
 
 All 185 tests pass (124 unit, 1 integration, 49 scenario, 11 chaos). All spec gaps resolved. See [GAP_ANALYSIS_RESOLVED.md](GAP_ANALYSIS_RESOLVED.md).
 
-### Security Findings (SEC-0001 through SEC-0121)
+### Security Findings (SEC-0001 through SEC-0136)
 
 | Severity | Open | Resolved | Won't Do |
 |----------|------|----------|----------|
 | Critical | 0 | 5 | 0 |
-| High | 0 | 20 | 0 |
-| Medium | 0 | 55 | 4 |
-| Low | 0 | 25 | 5 |
+| High | 0 | 22 | 0 |
+| Medium | 0 | 62 | 4 |
+| Low | 0 | 31 | 5 |
 | Info | 0 | 8 | 1 |
 
-**0 open findings.** 120 total findings across 15 passes, all resolved or Won't Do.
+**0 open findings.** 135 total findings across 16 passes; all 135 resolved or Won't Do.
 
 ## Won't Do -- Handled via External Controls
 
@@ -43,6 +43,75 @@ All 185 tests pass (124 unit, 1 integration, 49 scenario, 11 chaos). All spec ga
 - **SEC-0093: Test harness `page_allocator` defeats leak detection** -- The harness intentionally uses `page_allocator` because Raft's shared-ownership entry slices create complex free patterns that confuse the testing allocator. The comment in `tests/harness.zig:78-79` documents this trade-off. Switching to `testing.allocator` would require refactoring ownership semantics across the entire codebase.
 - **SEC-0099: `Config.peers` borrowed slice can dangle** -- This is standard Zig borrowing semantics. The caller is responsible for ensuring the peers slice outlives the `RaftNode`. The test harness already dupes the slice (`allocator.dupe(u64, peers.items)`). Adding automatic duplication inside `RaftNode.init()` would break the existing ownership contract.
 - **SEC-0102: File storage tests use predictable `/tmp` paths** -- Test-only code with no production impact. The hardcoded paths are deterministic for reproducible test debugging. TOCTOU risk is negligible in a test environment.
+
+---
+
+## Security Findings -- Pass 16 (SEC-0122 through SEC-0136) -- All Resolved
+
+15 findings identified through exhaustive adversarial review with 5 parallel agents (protocol safety, storage/crash safety, transport/RPC, CI/CD/supply chain, memory safety/API misuse). 8 automated scanners re-run (0 findings). 40+ agent-reported candidates verified against actual code; 25+ filtered as false positives, duplicates, or by-design patterns.
+
+### High Severity (2 findings)
+
+| Rank | Sev | Risk | Finding | Component | CWE | Evidence | Issue | Status |
+|------|-----|------|---------|-----------|-----|----------|-------|--------|
+| 1 | High | 60 | `handleInstallSnapshot` leaks snapshot data/config when `applySnapshotConfig()` fails after `log.restore()` mutated state — up to 256 MiB leak + log/applied inconsistency | `src/node.zig` | CWE-401, CWE-460 | `node.zig:898` restore succeeds, `node.zig:903` applySnapshotConfig can fail (OOM), no errdefer for snapshot_val | [#129](https://gitlab.com/devnw/zig/raft/-/issues/129) | Resolved (SEC-0122) |
+| 2 | High | 48 | Joint-consensus snapshot does not set `pending_config_index` — leader cannot finalize, cluster permanently stuck in joint consensus after snapshot-based recovery (extends SEC-0120) | `src/node.zig` | CWE-670 | `node.zig:906` unconditionally sets 0; `node.zig:151` init always 0; `node.zig:359` finalization requires > 0 | [#130](https://gitlab.com/devnw/zig/raft/-/issues/130) | Resolved (SEC-0123) |
+
+### Medium Severity (7 findings)
+
+| Rank | Sev | Risk | Finding | Component | CWE | Evidence | Issue | Status |
+|------|-----|------|---------|-----------|-----|----------|-------|--------|
+| 3 | Medium | 36 | `max_bytes_per_msg` check bypassed when `max_entry_size == 0` — aggregate message size unchecked, 64 arbitrarily large entries accepted | `src/node.zig` | CWE-770 | `node.zig:768` total-bytes check inside `if (max_entry_size > 0)` guard | [#134](https://gitlab.com/devnw/zig/raft/-/issues/134) | Resolved (SEC-0127) |
+| 4 | Medium | 32 | Entry index consistency not validated in `handleAppendEntries` — malicious entries with wrong `.index` stored as-is, corrupting `lastIndex()` | `src/node.zig`, `src/log.zig` | CWE-20 | `log.zig:146` uses computed idx, `log.zig:57` stores entry.index as-is, `log.zig:67` reads it for lastIndex | [#135](https://gitlab.com/devnw/zig/raft/-/issues/135) | Resolved (SEC-0128) |
+| 5 | Medium | 32 | CI `ZIG_VERSION` variable injectable via pipeline trigger API — used unsanitized in shell string interpolation | `.gitlab-ci.yml` | CWE-78 | `.gitlab-ci.yml:23,36` `${ZIG_VERSION}` in curl URL and PATH export | [#136](https://gitlab.com/devnw/zig/raft/-/issues/136) | Resolved (SEC-0129) |
+| 6 | Medium | 32 | `init()` deletes snapshot `.tmp` files before `loadSnapshotImpl()` crash recovery can use them — two-phase rename recovery broken | `src/file_storage.zig` | CWE-367 | `file_storage.zig:155` deletes .tmp, `file_storage.zig:490` recovery depends on .tmp existing | [#137](https://gitlab.com/devnw/zig/raft/-/issues/137) | Resolved (SEC-0130) |
+| 7 | Medium | 24 | `RaftLog.append()` leaks `data_copy` on OOM + no batch rollback for partial appends | `src/log.zig` | CWE-401, CWE-460 | `log.zig:52` dupe succeeds, `log.zig:56` append can fail, no errdefer | [#131](https://gitlab.com/devnw/zig/raft/-/issues/131) | Resolved (SEC-0124) |
+| 8 | Medium | 24 | `InMemoryStorage.appendEntriesImpl` same leak pattern + truncation before append is irrecoverable on failure | `src/storage.zig` | CWE-401, CWE-460 | `storage.zig:138` dupe, `storage.zig:142` append can fail; truncation at 124-133 runs first | [#132](https://gitlab.com/devnw/zig/raft/-/issues/132) | Resolved (SEC-0125) |
+| 9 | Medium | 24 | `RaftNode.init()` missing errdefers — `log_inst` and `membership_inst` leaked on post-construction errors | `src/node.zig` | CWE-401 | `node.zig:102` log_inst, `node.zig:107` loadSnapshot can fail, `node.zig:140` loadHardState can fail | [#133](https://gitlab.com/devnw/zig/raft/-/issues/133) | Resolved (SEC-0126) |
+
+### Low Severity (6 findings)
+
+| Rank | Sev | Risk | Finding | Component | CWE | Evidence | Issue | Status |
+|------|-----|------|---------|-----------|-----|----------|-------|--------|
+| 10 | Low | 24 | RPC request handlers accept messages from non-member nodes (asymmetry with response handlers which DO validate) | `src/node.zig` | CWE-20, CWE-345 | `node.zig:640` handleRequestVote, `node.zig:870` handleInstallSnapshot — no membership check; compare response handlers | [#141](https://gitlab.com/devnw/zig/raft/-/issues/141) | Resolved (SEC-0134) |
+| 11 | Low | 20 | `ready_state.prev_hard_state` initialized to `HardState.initial` instead of restored hard state — redundant persist on first advance() after restart | `src/node.zig` | CWE-665 | `node.zig:167` uses `st.HardState.initial` instead of `restored_hs` | [#138](https://gitlab.com/devnw/zig/raft/-/issues/138) | Resolved (SEC-0131) |
+| 12 | Low | 16 | Missing `syncDir()` after WAL deletion in zero-remaining compaction path — ghost WAL possible on crash | `src/file_storage.zig` | CWE-662 | `file_storage.zig:594` deleteFile without syncDir; contrast line 672 which does sync | [#139](https://gitlab.com/devnw/zig/raft/-/issues/139) | Resolved (SEC-0132) |
+| 13 | Low | 16 | Pre-vote grant lacks leader lease check for same-term requests — weakened disruption prevention vs etcd/raft | `src/node.zig` | CWE-754 | `node.zig:660-671` no `self.leader_id` check for pre-votes; common case unaffected | [#140](https://gitlab.com/devnw/zig/raft/-/issues/140) | Resolved (SEC-0133) |
+| 14 | Low | 16 | No `workflow:rules` in CI restricting pipeline execution on fork MRs | `.gitlab-ci.yml` | CWE-284 | Missing `workflow:rules` section | [#143](https://gitlab.com/devnw/zig/raft/-/issues/143) | Resolved (SEC-0136) |
+| 15 | Low | 8 | RPC handlers accept `leader_id/candidate_id == 0` despite Config rejecting id=0 | `src/node.zig` | CWE-20 | `node.zig:752` becomeFollower with msg.leader_id=0 accepted; `node.zig:42` Config rejects 0 | [#142](https://gitlab.com/devnw/zig/raft/-/issues/142) | Resolved (SEC-0135) |
+
+### False Positives Filtered (Pass 16)
+
+The following 25+ agent-reported candidates were verified against actual code and filtered:
+
+- **"InProcessTransport unbounded inbox growth"** — Test-only code, not production transport (documented in Pass 15)
+- **"Transport vtable null/dangling pointer risk"** — Standard Zig vtable pattern, design risk not code bug (documented in Pass 15)
+- **"No replay attack prevention in transport"** — Raft protocol is idempotent by design; duplicate messages harmless
+- **"Tagged union safety in Message"** — Zig tagged unions guarantee compile-time safety via exhaustive switch
+- **"Entry data lifetime / ownership"** — By design per Ready-State pattern; documented in CLAUDE.md
+- **"ClusterConfig serialization boundary issues"** — Fully covered by SEC-0054, SEC-0060
+- **"Malicious peer causes excessive disk I/O"** — Rate-limited by max_entries_per_msg (64) and heartbeat cadence
+- **"Malicious peer causes node to spin in a loop"** — All handlers O(n) with bounded inputs; no retry loops
+- **"Identity spoofing between cluster members"** — Transport auth is consumer responsibility (SEC-0001)
+- **"Missing leader membership check in handleAppendEntries"** — Per Raft paper: followers MUST accept valid-term leaders
+- **"Empty entries in AppendEntries not validated"** — Empty entries slice is valid heartbeat
+- **"leader_commit trusted without upper bound"** — commitTo clamps to @min(leader_commit, lastIndex())
+- **"advance() captures stale unstable slice"** — No operation between capture (line 428) and use (line 473) modifies unstable_entries; fragile pattern but not exploitable
+- **"RaftLog.firstUnstableIndex() saturation at lastIndex()"** — Requires u64::MAX log index; practically unreachable
+- **"ReadyState.deinit() doesn't free pending snapshot"** — Consumer owns snapshot data after Ready; by-design ownership model
+- **"CI downloads Zig without hash verification"** — Duplicate of SEC-0008/SEC-0042 (Won't Do)
+- **"CI component includes use mutable tags"** — Duplicate of SEC-0018 (Won't Do)
+- **"check-yaml --unsafe in pre-commit"** — Duplicate of SEC-0019 (Won't Do)
+- **"autofix_prs: true in pre-commit config"** — Duplicate of SEC-0068 (Won't Do)
+- **"No timeout on CI test jobs"** — Managed at GitLab project level
+- **"No branch protection in CI config"** — Managed at GitLab project level
+- **"Makefile rm -rf in clean target"** — Hardcoded paths, no user input expansion
+- **"build.zig.zon paths excludes tests/"** — By design for library packaging
+- **"Commitizen bump_pattern allows non-security prefixes"** — Standard semver practice
+- **"Pre-commit hooks skipped in CI (ci.skip)"** — Zig hooks require toolchain not available in pre-commit.ci
+- **"build.zig.zon dependency Git SHA-1 + transitive deps"** — Zig package hash provides content-based verification
+- **"CONTRIBUTING.md missing security review requirements"** — Documentation enhancement, not security finding
+- **".gitignore missing AI assistant config directories"** — Informational, not library security
 
 ---
 

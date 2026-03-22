@@ -116,7 +116,8 @@ pub const ElectionState = struct {
     }
 
     pub fn resetVotes(self: *ElectionState) void {
-        self.votes_received.clearAndFree();
+        // Retain capacity to avoid re-allocation on next election (PERF-017).
+        self.votes_received.clearRetainingCapacity();
     }
 };
 

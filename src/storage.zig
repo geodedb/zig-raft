@@ -133,11 +133,23 @@ pub const InMemoryStorage = struct {
             }
         }
 
+        const initial_len = self.log.items.len;
+        // Roll back appended entries on failure to prevent partial
+        // appends and leaked data copies (SEC-0125).
+        errdefer {
+            for (self.log.items[initial_len..]) |e| {
+                if (e.data.len > 0) self.allocator.free(e.data);
+            }
+            self.log.shrinkRetainingCapacity(initial_len);
+        }
+
         for (ents) |entry| {
             const data_copy = if (entry.data.len > 0)
                 try self.allocator.dupe(u8, entry.data)
             else
                 entry.data;
+            // Free data_copy if ArrayList.append fails (SEC-0125).
+            errdefer if (data_copy.len > 0) self.allocator.free(data_copy);
 
             try self.log.append(self.allocator, .{
                 .index = entry.index,
