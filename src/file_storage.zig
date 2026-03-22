@@ -404,7 +404,11 @@ pub const FileStorage = struct {
     }
 
     pub fn loadSnapshotImpl(self: *FileStorage) !?rpc.Snapshot {
-        var meta = self.readSnapshotMeta() catch return null;
+        // Propagate real errors; only return null for FileNotFound (SEC-0064).
+        var meta = self.readSnapshotMeta() catch |err| {
+            if (err == error.FileNotFound) return null;
+            return err;
+        };
 
         const data_file = self.dir.openFile("snapshot.data", .{}) catch |err| {
             // If snapshot.data is missing but snapshot.data.tmp exists, a crash
@@ -722,6 +726,11 @@ pub const FileStorage = struct {
         // Minimum: 48 (header) + 4 (config_len) + 0 (config) + 4 (crc) = 56
         if (file_size < 56) return error.InvalidSnapshotMeta;
 
+        // Cap allocation to prevent unbounded memory usage from corrupt metadata (SEC-0057).
+        // 1 MiB is far beyond any reasonable config size.
+        const max_meta_size: usize = 1024 * 1024;
+        if (file_size > max_meta_size) return error.InvalidSnapshotMeta;
+
         const buf = try self.allocator.alloc(u8, file_size);
         defer self.allocator.free(buf);
         const n = try file.readAll(buf);
@@ -734,8 +743,11 @@ pub const FileStorage = struct {
         if (stored_crc != computed_crc) return error.InvalidSnapshotMeta;
 
         const config_len = std.mem.readInt(u32, buf[48..52], .little);
-        // Validate config_len against file size: 48 + 4 + config_len + 4 == file_size
-        if (48 + 4 + config_len + 4 != file_size) return error.InvalidSnapshotMeta;
+        // Validate config_len against file size using checked arithmetic (SEC-0054).
+        // Expected: 48 + 4 + config_len + 4 == file_size
+        const expected_size = std.math.add(usize, 56, @as(usize, config_len)) catch
+            return error.InvalidSnapshotMeta;
+        if (expected_size != file_size) return error.InvalidSnapshotMeta;
 
         const config_data = buf[52..][0..config_len];
         const parsed = try mem.MembershipState.deserializeConfig(self.allocator, config_data);

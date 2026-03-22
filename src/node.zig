@@ -217,6 +217,14 @@ pub const RaftNode = struct {
     pub fn proposeConfigChange(self: *RaftNode, new_peers: []const u64) !void {
         if (self.role != .leader) return error.NotLeader;
 
+        // Validate new_peers: reject zero IDs and duplicates (SEC-0058).
+        for (new_peers, 0..) |peer, i| {
+            if (peer == 0) return error.InvalidData;
+            for (new_peers[0..i]) |prev| {
+                if (peer == prev) return error.InvalidData;
+            }
+        }
+
         // Pre-validate serialized size against max_entry_size BEFORE mutating
         // membership state (SEC-0029). Joint config format:
         //   [0x01][new_count: u32][new u64s...][old_count: u32][old u64s...]
@@ -235,6 +243,8 @@ pub const RaftNode = struct {
             self.current_term,
             self.log.lastIndex() + 1,
         );
+        // Free serialized config data if log.append fails (SEC-0047).
+        errdefer if (entry.data.len > 0) self.allocator.free(entry.data);
 
         try self.log.append(&.{entry});
         self.pending_config_index = entry.index;
@@ -305,6 +315,8 @@ pub const RaftNode = struct {
                     self.log.lastIndex() + 1,
                 );
                 if (final_entry) |entry| {
+                    // Free serialized config data if log.append fails (SEC-0048).
+                    errdefer if (entry.data.len > 0) self.allocator.free(entry.data);
                     try self.log.append(&.{entry});
                     self.pending_config_index = 0;
                 }
@@ -447,7 +459,7 @@ pub const RaftNode = struct {
             self.is_pre_vote_election = true;
             // Don't increment term or set voted_for for pre-vote.
         } else {
-            self.current_term += 1;
+            self.current_term = std.math.add(u64, self.current_term, 1) catch return error.Overflow;
             self.voted_for = self.id;
             self.is_pre_vote_election = false;
         }
@@ -476,7 +488,7 @@ pub const RaftNode = struct {
         }
 
         // Build and send RequestVote to all peers.
-        const request_term = if (pre_vote) self.current_term + 1 else self.current_term;
+        const request_term = if (pre_vote) std.math.add(u64, self.current_term, 1) catch return error.Overflow else self.current_term;
         const msg = rpc.Message{ .request_vote = .{
             .term = request_term,
             .candidate_id = self.id,
@@ -496,6 +508,18 @@ pub const RaftNode = struct {
         // If msg.term > current_term and not a pre-vote, step down.
         if (msg.term > self.current_term and !msg.pre_vote) {
             self.becomeFollower(msg.term, null);
+        }
+
+        // Leaders must NOT grant pre-votes to prevent disruptive re-elections
+        // from partitioned nodes (Raft §9.6, SEC-0061).
+        if (msg.pre_vote and self.role == .leader) {
+            const response = rpc.Message{ .request_vote_response = .{
+                .term = self.current_term,
+                .vote_granted = false,
+                .pre_vote = true,
+            } };
+            self.sendMsg(msg.candidate_id, response);
+            return;
         }
 
         const grant = elect.shouldGrantVote(
@@ -615,13 +639,14 @@ pub const RaftNode = struct {
     fn handleAppendEntriesResponse(self: *RaftNode, from: u64, msg: rpc.AppendEntriesResponse) !void {
         if (self.role != .leader) return;
 
+        // Validate sender is a known peer BEFORE processing term (SEC-0056).
+        var rs = &(self.replication_state orelse return);
+        const progress = rs.peers.getPtr(from) orelse return;
+
         if (msg.term > self.current_term) {
             self.becomeFollower(msg.term, null);
             return;
         }
-
-        var rs = &(self.replication_state orelse return);
-        const progress = rs.peers.getPtr(from) orelse return;
 
         if (msg.success) {
             _ = progress.maybeUpdate(msg.match_index);
@@ -681,8 +706,15 @@ pub const RaftNode = struct {
     }
 
     fn handleInstallSnapshotResponse(self: *RaftNode, from: u64, msg: rpc.InstallSnapshotResponse) !void {
-        _ = from;
         if (self.role != .leader) return;
+
+        // Validate sender is a known peer before processing (SEC-0052).
+        if (self.replication_state) |*rs| {
+            if (rs.peers.get(from) == null) {
+                std.log.warn("raft: InstallSnapshotResponse from unknown peer {d}", .{from});
+                return;
+            }
+        } else return;
 
         if (msg.term > self.current_term) {
             self.becomeFollower(msg.term, null);

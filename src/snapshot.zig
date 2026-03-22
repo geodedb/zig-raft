@@ -183,13 +183,19 @@ pub const SnapshotState = struct {
             return SnapshotError.UnexpectedOffset;
         }
 
-        try pending.data.appendSlice(self.allocator, msg.data);
-
-        // Enforce max_snapshot_size (0 = unlimited).
-        if (self.max_snapshot_size > 0 and pending.data.items.len > self.max_snapshot_size) {
-            self.clearPending();
-            return SnapshotError.SnapshotTooLarge;
+        // Enforce max_snapshot_size BEFORE allocation (SEC-0063). 0 = unlimited.
+        if (self.max_snapshot_size > 0) {
+            const new_size = std.math.add(u64, pending.data.items.len, msg.data.len) catch {
+                self.clearPending();
+                return SnapshotError.SnapshotTooLarge;
+            };
+            if (new_size > self.max_snapshot_size) {
+                self.clearPending();
+                return SnapshotError.SnapshotTooLarge;
+            }
         }
+
+        try pending.data.appendSlice(self.allocator, msg.data);
 
         if (msg.done) {
             const assembled = pending.data.items;
@@ -203,8 +209,11 @@ pub const SnapshotState = struct {
             }
 
             // Transfer ownership of buffers to the caller via toOwnedSlice.
+            // Add errdefer between sequential fallible calls to prevent leaks (SEC-0049).
             const owned_data = try pending.data.toOwnedSlice(self.allocator);
+            errdefer self.allocator.free(owned_data);
             const owned_voters = try pending.config_voters.toOwnedSlice(self.allocator);
+            errdefer if (owned_voters.len > 0) self.allocator.free(owned_voters);
             const owned_voters_outgoing = try pending.config_voters_outgoing.toOwnedSlice(self.allocator);
 
             // Use the owned config copied from the first chunk (SEC-0030).
@@ -228,7 +237,11 @@ pub const SnapshotState = struct {
             return snapshot;
         }
 
-        pending.expected_offset = msg.offset + msg.data.len;
+        // Checked overflow on expected_offset accumulation (SEC-0050).
+        pending.expected_offset = std.math.add(u64, msg.offset, msg.data.len) catch {
+            self.clearPending();
+            return SnapshotError.SnapshotTooLarge;
+        };
         return null;
     }
 

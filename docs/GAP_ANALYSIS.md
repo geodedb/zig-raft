@@ -2,7 +2,7 @@
 
 **Last updated:** 2026-03-21
 **Spec:** `docs/superpowers/specs/2026-03-21-raft-design.md`
-**Methodology:** Requirements-to-code audit + four adversarial security review passes -- all source, tests, CI, and docs compared against design spec, then reviewed for security vulnerabilities. Pass 1 (SEC-0001..SEC-0011, all remediated), Pass 2 (SEC-0012..SEC-0028, all remediated or Won't Do), Pass 3 (SEC-0029..SEC-0036, all remediated), Pass 4 (SEC-0037..SEC-0044, all remediated or Won't Do).
+**Methodology:** Requirements-to-code audit + five adversarial security review passes -- all source, tests, CI, and docs compared against design spec, then reviewed for security vulnerabilities. Pass 1 (SEC-0001..SEC-0011, all remediated), Pass 2 (SEC-0012..SEC-0028, all remediated or Won't Do), Pass 3 (SEC-0029..SEC-0036, all remediated), Pass 4 (SEC-0037..SEC-0044, all remediated or Won't Do), Pass 5 (SEC-0045..SEC-0064, all remediated).
 
 ## Summary
 
@@ -17,17 +17,17 @@
 
 All 160 tests pass (114 unit, 1 integration, 34 scenario, 11 chaos). All spec gaps resolved. See [GAP_ANALYSIS_RESOLVED.md](GAP_ANALYSIS_RESOLVED.md).
 
-### Security Findings (SEC-0001 through SEC-0044)
+### Security Findings (SEC-0001 through SEC-0064)
 
 | Severity | Open | Resolved | Won't Do |
 |----------|------|----------|----------|
 | Critical | 0 | 2 | 0 |
-| High | 0 | 3 | 0 |
-| Medium | 0 | 22 | 4 |
-| Low | 0 | 9 | 2 |
+| High | 0 | 14 | 0 |
+| Medium | 0 | 30 | 4 |
+| Low | 0 | 10 | 2 |
 | Info | 0 | 5 | 0 |
 
-**0 open findings.** All 44 findings across 4 passes resolved or Won't Do.
+**0 open findings.** All 64 security findings across 5 passes resolved or Won't Do.
 
 ## Won't Do -- Handled via External Controls
 
@@ -39,6 +39,45 @@ All 160 tests pass (114 unit, 1 integration, 34 scenario, 11 chaos). All spec ga
 - **Docker tag pinning:** Managed at CI catalog level (`debian:bookworm-slim` without digest pinning in CI catalog components).
 - **SEC-0042: CI downloads Zig toolchain without SHA256 verification** -- Same as SEC-0008; CI/CD toolchain download integrity is managed centrally via the CI catalog level controls, not in individual repositories.
 - **Pre-commit hooks:** Pre-commit configuration and enforcement is handled via CI pipeline stages and developer tooling external to this repository. Changes to `.pre-commit-config.yaml` are governed by the CI catalog team's security review process.
+
+---
+
+## Security Findings -- Pass 5 (SEC-0045 through SEC-0064) -- All Resolved
+
+### High Severity (11 findings)
+
+| Rank | Sev | Risk | Finding | Component | CWE | Fix | Issue | Status |
+|------|-----|------|---------|-----------|-----|-----|-------|--------|
+| 1 | High | 56 | `finalizeChange` mutates state before fallible serialization -- OOM corrupts joint consensus permanently | `src/membership.zig` | CWE-662, CWE-755 | Serialize BEFORE mutating state; all allocations succeed before any state change (SEC-0045) | [#53](https://gitlab.com/devnw/zig/raft/-/issues/53) | **Resolved** |
+| 2 | High | 56 | `proposeChange` mutates state before fallible operations -- OOM corrupts membership state permanently | `src/membership.zig` | CWE-662, CWE-755 | Serialize and copy new voters BEFORE mutating state; errdefer on data; infallible state mutation after all allocations (SEC-0046) | [#54](https://gitlab.com/devnw/zig/raft/-/issues/54) | **Resolved** |
+| 3 | High | 48 | Memory leak -- `proposeConfigChange` leaks `entry.data` on `log.append` failure | `src/node.zig` | CWE-401 | Added `errdefer` to free `entry.data` if `log.append` fails (SEC-0047) | [#55](https://gitlab.com/devnw/zig/raft/-/issues/55) | **Resolved** |
+| 4 | High | 48 | Memory leak -- `tick()` leaks `final_entry.data` on `log.append` failure | `src/node.zig` | CWE-401 | Added `errdefer` to free `entry.data` if `log.append` fails (SEC-0048) | [#56](https://gitlab.com/devnw/zig/raft/-/issues/56) | **Resolved** |
+| 5 | High | 48 | Memory leak on `toOwnedSlice` partial failure in `receiveChunk` (up to 256 MiB per event) | `src/snapshot.zig` | CWE-401 | Added `errdefer` between sequential `toOwnedSlice` calls (SEC-0049) | [#57](https://gitlab.com/devnw/zig/raft/-/issues/57) | **Resolved** |
+| 6 | High | 44 | Integer overflow in `expected_offset` accumulation -- wraps to 0 in ReleaseFast | `src/snapshot.zig` | CWE-190 | Use `std.math.add` for checked overflow; clear pending on overflow (SEC-0050) | [#58](https://gitlab.com/devnw/zig/raft/-/issues/58) | **Resolved** |
+| 7 | High | 44 | `InMemoryStorage.termImpl/entriesImpl` missing upper-bound guard -- panics on OOB | `src/storage.zig` | CWE-125, CWE-129 | Added upper-bound checks returning `Unavailable` for out-of-range indices (SEC-0051) | [#59](https://gitlab.com/devnw/zig/raft/-/issues/59) | **Resolved** |
+| 8 | High | 44 | `handleInstallSnapshotResponse` ignores sender -- any node can demote leader | `src/node.zig` | CWE-287 | Validate sender is a known peer in `replication_state` before processing (SEC-0052) | [#60](https://gitlab.com/devnw/zig/raft/-/issues/60) | **Resolved** |
+| 9 | High | 40 | `applyConfig` installs deserialized voter sets without semantic validation | `src/membership.zig` | CWE-20 | Added validation: reject empty voter sets, zero IDs, duplicates before applying config (SEC-0053) | [#61](https://gitlab.com/devnw/zig/raft/-/issues/61) | **Resolved** |
+| 10 | High | 40 | Integer overflow in V3 snapshot meta size validation -- u32 arithmetic wraps | `src/file_storage.zig` | CWE-190, CWE-131 | Use `std.math.add` for checked arithmetic in config_len validation (SEC-0054) | [#62](https://gitlab.com/devnw/zig/raft/-/issues/62) | **Resolved** |
+| 11 | High | 40 | `maybeUpdate` integer overflow -- `match + 1` wraps u64::MAX, crashes debug builds | `src/replication.zig` | CWE-190 | Use `std.math.add` with fallback to `match` on overflow (SEC-0055) | [#63](https://gitlab.com/devnw/zig/raft/-/issues/63) | **Resolved** |
+
+### Medium Severity (8 findings)
+
+| Rank | Sev | Risk | Finding | Component | CWE | Fix | Issue | Status |
+|------|-----|------|---------|-----------|-----|-----|-------|--------|
+| 12 | Medium | 32 | `handleAppendEntriesResponse` validates peer AFTER term-demotion check | `src/node.zig` | CWE-287 | Moved peer validation BEFORE term-demotion check; unknown sender cannot trigger `becomeFollower` (SEC-0056) | [#64](https://gitlab.com/devnw/zig/raft/-/issues/64) | **Resolved** |
+| 13 | Medium | 28 | Uncapped allocation from untrusted `file_size` in `readSnapshotMeta` | `src/file_storage.zig` | CWE-770 | Added 1 MiB cap on snapshot meta allocation (SEC-0057) | [#65](https://gitlab.com/devnw/zig/raft/-/issues/65) | **Resolved** |
+| 14 | Medium | 28 | `proposeConfigChange` accepts zero IDs and duplicate peer IDs | `src/node.zig` | CWE-20 | Added validation loop: reject zero IDs and duplicates in `new_peers` (SEC-0058) | [#66](https://gitlab.com/devnw/zig/raft/-/issues/66) | **Resolved** |
+| 15 | Medium | 24 | Memory leak in `buildAppendEntries` on OOM in trimming path | `src/replication.zig` | CWE-401 | Catch alloc failure and free original entries slice before returning error (SEC-0059) | [#67](https://gitlab.com/devnw/zig/raft/-/issues/67) | **Resolved** |
+| 16 | Medium | 24 | `deserializeVoters` accepts arbitrary type byte (not 0x00/0x01) | `src/membership.zig` | CWE-20 | Added explicit validation: only 0x00 and 0x01 accepted (SEC-0060) | [#68](https://gitlab.com/devnw/zig/raft/-/issues/68) | **Resolved** |
+| 17 | Medium | 24 | Leaders grant pre-votes, enabling disruptive re-elections (§9.6 violation) | `src/node.zig` | CWE-400 | Leaders now reject pre-vote requests with `vote_granted=false` before evaluating the vote (SEC-0061) | [#69](https://gitlab.com/devnw/zig/raft/-/issues/69) | **Resolved** |
+| 18 | Medium | 20 | `current_term += 1` unchecked overflow in `startElection` | `src/node.zig` | CWE-190 | Use `std.math.add` for checked overflow; return `error.Overflow` on wrap (SEC-0062) | [#70](https://gitlab.com/devnw/zig/raft/-/issues/70) | **Resolved** |
+| 19 | Medium | 20 | `max_snapshot_size` checked after allocation in `receiveChunk` | `src/snapshot.zig` | CWE-770 | Check size BEFORE `appendSlice` allocation using checked arithmetic (SEC-0063) | [#71](https://gitlab.com/devnw/zig/raft/-/issues/71) | **Resolved** |
+
+### Low Severity (1 finding)
+
+| Rank | Sev | Risk | Finding | Component | CWE | Fix | Issue | Status |
+|------|-----|------|---------|-----------|-----|-----|-------|--------|
+| 20 | Low | 12 | `loadSnapshotImpl` swallows all `readSnapshotMeta` errors as null | `src/file_storage.zig` | CWE-755 | Only return null for `FileNotFound`; propagate all other errors (SEC-0064) | [#72](https://gitlab.com/devnw/zig/raft/-/issues/72) | **Resolved** |
 
 ---
 

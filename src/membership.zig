@@ -59,19 +59,22 @@ pub const MembershipState = struct {
         if (new_voters.len == 0) return error.InvalidData;
         if (self.pending_config_change) return MembershipError.ConfigChangePending;
 
-        self.pending_config_change = true;
+        // Perform ALL fallible operations BEFORE mutating state (SEC-0046).
+        // Serialize using current voters as outgoing set.
+        const data = try serializeJoint(self.allocator, new_voters, self.voters.items);
+        errdefer self.allocator.free(data);
 
-        // Move current voters to voters_outgoing.
+        // Copy new_voters into a fresh list before mutating.
+        var new_voter_list = std.ArrayList(u64){};
+        try new_voter_list.appendSlice(self.allocator, new_voters);
+
+        // All allocations succeeded — now mutate state (infallible from here).
+        self.pending_config_change = true;
         self.voters_outgoing.deinit(self.allocator);
         self.voters_outgoing = self.voters;
-
-        // Set voters to new_voters (copy).
-        self.voters = .{};
-        try self.voters.appendSlice(self.allocator, new_voters);
-
+        self.voters = new_voter_list;
         self.is_joint = true;
 
-        const data = try serializeJoint(self.allocator, new_voters, self.voters_outgoing.items);
         return .{
             .index = index,
             .term = current_term,
@@ -86,11 +89,14 @@ pub const MembershipState = struct {
     pub fn finalizeChange(self: *MembershipState, current_term: u64, index: u64) !?rpc.Entry {
         if (!self.is_joint) return null;
 
+        // Perform ALL fallible operations BEFORE mutating state (SEC-0045).
+        const data = try serializeFinal(self.allocator, self.voters.items);
+
+        // All allocations succeeded — now mutate state (infallible from here).
         self.voters_outgoing.clearAndFree(self.allocator);
         self.is_joint = false;
         self.pending_config_change = false;
 
-        const data = try serializeFinal(self.allocator, self.voters.items);
         return .{
             .index = index,
             .term = current_term,
@@ -100,17 +106,45 @@ pub const MembershipState = struct {
     }
 
     /// Apply a committed config entry (update voter sets from entry data).
+    /// Validates deserialized voter sets for empty sets, zero IDs, and
+    /// duplicates before applying (SEC-0053).
     pub fn applyConfig(self: *MembershipState, entry: rpc.Entry) !void {
         var parsed = try deserializeVoters(self.allocator, entry.data);
         defer parsed.deinit();
 
-        self.voters.clearAndFree(self.allocator);
-        try self.voters.appendSlice(self.allocator, parsed.voters);
-
-        self.voters_outgoing.clearAndFree(self.allocator);
-        if (parsed.is_joint) {
-            try self.voters_outgoing.appendSlice(self.allocator, parsed.voters_outgoing);
+        // Semantic validation of deserialized config (SEC-0053).
+        if (parsed.voters.len == 0) return error.InvalidData;
+        for (parsed.voters, 0..) |v, i| {
+            if (v == 0) return error.InvalidData;
+            for (parsed.voters[0..i]) |prev| {
+                if (v == prev) return error.InvalidData;
+            }
         }
+        if (parsed.is_joint) {
+            for (parsed.voters_outgoing, 0..) |v, i| {
+                if (v == 0) return error.InvalidData;
+                for (parsed.voters_outgoing[0..i]) |prev| {
+                    if (v == prev) return error.InvalidData;
+                }
+            }
+        }
+
+        // Perform all fallible copies before mutating state.
+        var new_voters = std.ArrayList(u64){};
+        try new_voters.appendSlice(self.allocator, parsed.voters);
+        errdefer new_voters.deinit(self.allocator);
+
+        var new_outgoing = std.ArrayList(u64){};
+        if (parsed.is_joint) {
+            try new_outgoing.appendSlice(self.allocator, parsed.voters_outgoing);
+        }
+
+        // All allocations succeeded — now mutate state (infallible from here).
+        self.voters.deinit(self.allocator);
+        self.voters = new_voters;
+
+        self.voters_outgoing.deinit(self.allocator);
+        self.voters_outgoing = new_outgoing;
 
         self.is_joint = parsed.is_joint;
         self.pending_config_change = parsed.is_joint;
@@ -194,6 +228,8 @@ pub const MembershipState = struct {
     fn deserializeVoters(allocator: std.mem.Allocator, data: []const u8) !DeserializedConfig {
         if (data.len < 1) return error.InvalidData;
 
+        // Validate is_joint byte: only 0x00 (final) and 0x01 (joint) are valid (SEC-0060).
+        if (data[0] != 0x00 and data[0] != 0x01) return error.InvalidData;
         const is_joint = data[0] == 0x01;
         var offset: usize = 1;
 

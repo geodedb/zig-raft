@@ -35,7 +35,8 @@ pub const PeerProgress = struct {
             self.match_index = match;
             changed = true;
         }
-        const desired_next = match + 1;
+        // Checked overflow: match + 1 wraps on u64::MAX (SEC-0055).
+        const desired_next = std.math.add(u64, match, 1) catch match;
         if (desired_next > self.next_index) {
             self.next_index = desired_next;
         }
@@ -130,7 +131,11 @@ pub const ReplicationState = struct {
         // Free excess if we trimmed — allocate result BEFORE freeing source
         // to avoid use-after-free (trimmed points into entries).
         if (count < entries.len) {
-            const result = try self.allocator.alloc(rpc.Entry, trimmed.len);
+            const result = self.allocator.alloc(rpc.Entry, trimmed.len) catch |err| {
+                // Free the original entries slice on alloc failure (SEC-0059).
+                self.allocator.free(entries);
+                return err;
+            };
             @memcpy(result, trimmed);
             self.allocator.free(entries);
             return rpc.Message{ .append_entries = .{

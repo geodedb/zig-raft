@@ -13,7 +13,7 @@
 4. **Automated Scanning** -- 12 tools (see below)
 5. **Manual Adversarial Review** -- full source audit of all 12 src modules, test infra, CI config, pre-commit config
 6. **Scoring** -- CVSS-inspired risk scoring (0-100) based on severity, exploitability, impact
-7. **Issue Filing** -- 38 GitLab issues (#9-#30, #31-#36, #37-#44, #45-#52), labels for severity/type/confidence/status
+7. **Issue Filing** -- 58 GitLab issues (#9-#30, #31-#36, #37-#44, #45-#52, #53-#72), labels for severity/type/confidence/status
 8. **GAP_ANALYSIS.md** -- updated with full stack-ranked findings table
 
 ## Tool Versions
@@ -148,16 +148,40 @@ All 11 findings remediated in-place with code changes and tests. Key fixes:
 - Added `dynamicPeers()` helper; `becomeLeader()`, `sendHeartbeats()`, `startElection()` now use `membership_state.voters` (dynamic) instead of static `config.peers`, including joint consensus outgoing voters (SEC-0044)
 - Added `serializeConfig`/`deserializeConfig` public helpers to `MembershipState` for config persistence
 
+### Pass 5: Deep Review of Pass 1-4 Remediation Code (SEC-0045..SEC-0064)
+
+20 new findings identified through exhaustive adversarial review of the ~1400 lines of security remediation code from Passes 1-4, which constitutes new attack surface. 4 parallel review agents covering: file_storage.zig, node.zig, snapshot.zig+membership.zig, and log+replication+election+quorum+ready+storage+transport. All 8 automated scanners re-run (0 findings). Focus areas:
+- State mutation ordering relative to fallible operations (OOM resilience)
+- Memory leak paths on error (errdefer coverage)
+- Integer overflow/underflow in arithmetic from untrusted input
+- Missing input validation at deserialization boundaries
+- Peer authentication gaps in RPC response handlers
+- Raft protocol compliance (§9.6 pre-vote, joint consensus)
+
+**All 20 findings filed as GitLab issues (#53-#72). All 20 remediated.** Key fixes:
+- `finalizeChange` and `proposeChange` reordered: serialize BEFORE mutating state (SEC-0045, SEC-0046)
+- Added `errdefer` in `proposeConfigChange`, `tick`, `receiveChunk`, `buildAppendEntries` for OOM leak prevention (SEC-0047, SEC-0048, SEC-0049, SEC-0059)
+- `std.math.add` for checked overflow in `expected_offset`, V3 meta validation, `maybeUpdate`, `startElection` (SEC-0050, SEC-0054, SEC-0055, SEC-0062)
+- `InMemoryStorage.termImpl/entriesImpl` upper-bound guard returns `Unavailable` (SEC-0051)
+- `handleInstallSnapshotResponse` validates sender is known peer (SEC-0052)
+- `applyConfig` validates deserialized voter sets: empty, zero IDs, duplicates (SEC-0053)
+- `handleAppendEntriesResponse` validates peer BEFORE term-demotion check (SEC-0056)
+- `readSnapshotMeta` capped to 1 MiB, `loadSnapshotImpl` propagates errors (SEC-0057, SEC-0064)
+- `proposeConfigChange` validates new_peers for zero IDs and duplicates (SEC-0058)
+- `deserializeVoters` rejects non-0x00/0x01 type bytes (SEC-0060)
+- Leaders reject pre-votes to prevent disruptive re-elections (§9.6) (SEC-0061)
+- `receiveChunk` checks `max_snapshot_size` BEFORE allocation (SEC-0063)
+
 ## Notes
 
-- No secrets detected in repo history (6 commits scanned)
+- No secrets detected in repo history (7 commits scanned)
 - Zig ecosystem lacks lockfile/SBOM tooling -- osv-scanner found no package sources
 - No Dockerfiles, Helm charts, Terraform, or other IaC in repo
 - CI uses component includes from `gitlab.com/devnw/ci-catalog` at `@v1.7.1` (mutable tag) and `@v1.2.1` -- Won't Do (managed at CI catalog level)
 - `debian:bookworm-slim` Docker image used without digest pinning -- Won't Do (managed at CI catalog level)
 - CODEOWNERS updated from placeholder to `@devnw` (SEC-0010, resolved in Pass 1)
 - `SECURITY.md` updated from GitHub to GitLab references (INFO-1, resolved in Pass 1)
-- All 44 security findings across 4 passes resolved or Won't Do
+- 64 total security findings across 5 passes: all 64 resolved or Won't Do
 - 0 open findings
 - All 160 tests pass (114 unit, 1 integration, 34 scenario, 11 chaos)
-- Automated scanners (12 tools) found 0 issues across all 4 passes -- all findings are from manual review
+- Automated scanners (12 tools) found 0 issues across all 5 passes -- all findings are from manual review

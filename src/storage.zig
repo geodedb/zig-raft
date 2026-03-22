@@ -133,6 +133,9 @@ pub const InMemoryStorage = struct {
         const start = lo - self.snapshot_index - 1;
         const end = hi - self.snapshot_index - 1;
 
+        // Upper-bound guard: return Unavailable for out-of-range indices (SEC-0051).
+        if (end > self.log.items.len) return StorageError.Unavailable;
+
         const slice = self.log.items[start..end];
         const result = try self.allocator.alloc(rpc.Entry, slice.len);
         @memcpy(result, slice);
@@ -144,6 +147,8 @@ pub const InMemoryStorage = struct {
         if (index == self.snapshot_index) return self.snapshot_term;
 
         const pos = index - self.snapshot_index - 1;
+        // Upper-bound guard: return Unavailable for out-of-range index (SEC-0051).
+        if (pos >= self.log.items.len) return StorageError.Unavailable;
         return self.log.items[pos].term;
     }
 
