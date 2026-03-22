@@ -87,7 +87,26 @@ pub const InProcessTransport = struct {
     fn sendImpl(ptr: *anyopaque, to: u64, msg: rpc.Message) void {
         const self: *InProcessTransport = @ptrCast(@alignCast(ptr));
         const inbox = self.inboxes.getPtr(to) orelse return;
-        inbox.append(self.allocator, msg) catch return;
+        // Deep-copy AppendEntries entries so the sender can free its
+        // copy after send without leaving dangling pointers (SEC-0140).
+        var copied_msg = msg;
+        switch (msg) {
+            .append_entries => |ae| {
+                if (ae.entries.len > 0) {
+                    const dup = self.allocator.dupe(rpc.Entry, ae.entries) catch return;
+                    copied_msg = rpc.Message{ .append_entries = .{
+                        .term = ae.term,
+                        .leader_id = ae.leader_id,
+                        .prev_log_index = ae.prev_log_index,
+                        .prev_log_term = ae.prev_log_term,
+                        .entries = dup,
+                        .leader_commit = ae.leader_commit,
+                    } };
+                }
+            },
+            else => {},
+        }
+        inbox.append(self.allocator, copied_msg) catch return;
     }
 };
 

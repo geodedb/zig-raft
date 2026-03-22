@@ -57,7 +57,26 @@ const TestTransport = struct {
 
     fn sendImpl(ptr: *anyopaque, to: u64, msg: raft.Message) void {
         const self: *TestTransport = @ptrCast(@alignCast(ptr));
-        self.queue.append(self.allocator, .{ .from = self.node_id, .to = to, .msg = msg }) catch {};
+        // Deep-copy AppendEntries entries so the sender can free its
+        // slice after send without leaving dangling pointers (SEC-0140).
+        var queued_msg = msg;
+        switch (msg) {
+            .append_entries => |ae| {
+                if (ae.entries.len > 0) {
+                    const dup = self.allocator.dupe(raft.Entry, ae.entries) catch return;
+                    queued_msg = raft.Message{ .append_entries = .{
+                        .term = ae.term,
+                        .leader_id = ae.leader_id,
+                        .prev_log_index = ae.prev_log_index,
+                        .prev_log_term = ae.prev_log_term,
+                        .entries = dup,
+                        .leader_commit = ae.leader_commit,
+                    } };
+                }
+            },
+            else => {},
+        }
+        self.queue.append(self.allocator, .{ .from = self.node_id, .to = to, .msg = queued_msg }) catch {};
     }
 };
 

@@ -3,7 +3,7 @@
 
 const std = @import("std");
 const rpc = @import("rpc.zig");
-const stg = @import("storage.zig");
+const membership = @import("membership.zig");
 
 const zero_checksum: [32]u8 = .{0} ** 32;
 
@@ -153,6 +153,12 @@ pub const SnapshotState = struct {
                 return SnapshotError.InvalidSnapshotConfig;
             }
 
+            // A snapshot cannot originate from a future term relative to the
+            // sender's current term — reject to prevent term corruption (SEC-0141).
+            if (msg.last_included_term > msg.term) {
+                return SnapshotError.InvalidSnapshotConfig;
+            }
+
             // Start a new pending snapshot (reset existing if any).
             // Null out BEFORE the fallible validateSnapshotConfig() call so
             // that a validation failure does not leave freed ArrayLists
@@ -268,11 +274,8 @@ pub const SnapshotState = struct {
     }
 };
 
-/// Maximum number of voters allowed in a snapshot config.
-/// No real Raft cluster exceeds this; the limit prevents O(n²) CPU
-/// cost in the deduplication check and unbounded memory allocation
-/// from a malicious peer (SEC-0108).
-const MAX_VOTERS_PER_SET: usize = 255;
+/// Shared voter-set cap from membership.zig (SEC-0108, SEC-0143).
+const MAX_VOTERS_PER_SET: usize = membership.MAX_VOTERS_PER_SET;
 
 /// Validate a snapshot config received from a peer (SEC-0043).
 /// Rejects empty voter sets and duplicate voter IDs, matching the
@@ -421,8 +424,9 @@ test "receiveChunk assembles multiple chunks and verifies BLAKE3" {
     const digest = blake3Hash(full_data);
 
     // Chunk 1: offset 0, not done
+    // last_included_term must be <= term (SEC-0141).
     const r1 = try ss.receiveChunk(.{
-        .term = 1,
+        .term = 2,
         .leader_id = 1,
         .last_included_index = 10,
         .last_included_term = 2,
@@ -436,7 +440,7 @@ test "receiveChunk assembles multiple chunks and verifies BLAKE3" {
 
     // Chunk 2: offset 5, not done
     const r2 = try ss.receiveChunk(.{
-        .term = 1,
+        .term = 2,
         .leader_id = 1,
         .last_included_index = 10,
         .last_included_term = 2,
@@ -450,7 +454,7 @@ test "receiveChunk assembles multiple chunks and verifies BLAKE3" {
 
     // Chunk 3: offset 10, done with BLAKE3 digest
     const r3 = try ss.receiveChunk(.{
-        .term = 1,
+        .term = 2,
         .leader_id = 1,
         .last_included_index = 10,
         .last_included_term = 2,
@@ -746,7 +750,7 @@ test "receiveChunk restart after config validation failure does not double-free 
         .is_joint = false,
     };
     const result = ss.receiveChunk(.{
-        .term = 1,
+        .term = 2,
         .leader_id = 1,
         .last_included_index = 10,
         .last_included_term = 2,
@@ -764,7 +768,7 @@ test "receiveChunk restart after config validation failure does not double-free 
     // A subsequent valid transfer must succeed without double-free.
     const digest = blake3Hash("recovery");
     const snap = try ss.receiveChunk(.{
-        .term = 2,
+        .term = 3,
         .leader_id = 1,
         .last_included_index = 15,
         .last_included_term = 3,
@@ -842,4 +846,42 @@ test "validateSnapshotConfig rejects oversized voter sets (SEC-0108)" {
         .config = big_config,
     });
     try std.testing.expectError(SnapshotError.InvalidSnapshotConfig, result);
+}
+
+test "receiveChunk rejects last_included_term > term (SEC-0141)" {
+    var ss = SnapshotState.init(std.testing.allocator, 100, 1024, 0);
+    defer ss.deinit();
+
+    // A snapshot whose last_included_term exceeds the sender's current term
+    // is impossible in a correct Raft cluster — reject it.
+    const result = ss.receiveChunk(.{
+        .term = 1,
+        .leader_id = 1,
+        .last_included_index = 10,
+        .last_included_term = 5, // > term (1)
+        .offset = 0,
+        .data = "bad",
+        .done = true,
+        .checksum = zero_checksum,
+        .config = test_config,
+    });
+    try std.testing.expectError(SnapshotError.InvalidSnapshotConfig, result);
+
+    // Equal terms should be accepted.
+    const digest = blake3Hash("ok");
+    const snap = try ss.receiveChunk(.{
+        .term = 3,
+        .leader_id = 1,
+        .last_included_index = 10,
+        .last_included_term = 3, // == term
+        .offset = 0,
+        .data = "ok",
+        .done = true,
+        .checksum = digest,
+        .config = test_config,
+    });
+    try std.testing.expect(snap != null);
+    defer ss.allocator.free(snap.?.data);
+    defer if (snap.?.metadata.config.voters.len > 0) ss.allocator.free(snap.?.metadata.config.voters);
+    defer if (snap.?.metadata.config.voters_outgoing.len > 0) ss.allocator.free(snap.?.metadata.config.voters_outgoing);
 }

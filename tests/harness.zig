@@ -54,7 +54,26 @@ const NodeTransport = struct {
 
     fn sendImpl(ptr: *anyopaque, to: u64, msg: raft.Message) void {
         const self: *NodeTransport = @ptrCast(@alignCast(ptr));
-        self.queue.append(.{ .from = self.node_id, .to = to, .msg = msg });
+        // Deep-copy AppendEntries entries so the sender can free its
+        // slice after send without leaving dangling pointers (SEC-0140).
+        var queued_msg = msg;
+        switch (msg) {
+            .append_entries => |ae| {
+                if (ae.entries.len > 0) {
+                    const dup = self.queue.allocator.dupe(raft.Entry, ae.entries) catch return;
+                    queued_msg = raft.Message{ .append_entries = .{
+                        .term = ae.term,
+                        .leader_id = ae.leader_id,
+                        .prev_log_index = ae.prev_log_index,
+                        .prev_log_term = ae.prev_log_term,
+                        .entries = dup,
+                        .leader_commit = ae.leader_commit,
+                    } };
+                }
+            },
+            else => {},
+        }
+        self.queue.append(.{ .from = self.node_id, .to = to, .msg = queued_msg });
     }
 };
 

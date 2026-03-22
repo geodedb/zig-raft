@@ -8,23 +8,24 @@ const stg = @import("storage.zig");
 pub const RaftLog = struct {
     storage: stg.Storage,
     unstable_entries: std.ArrayList(rpc.Entry),
+    /// Logical start offset into unstable_entries.items — entries before
+    /// this index have been stabilized and freed. Avoids O(n) shift on
+    /// every stableTo/compact call (PERF-009).
+    unstable_start: usize = 0,
     committed: u64,
     applied: u64,
     snapshot_index: u64,
     snapshot_term: u64,
+    /// Cached result of storage.lastIndex() to avoid vtable dispatch on
+    /// every lastIndex() call when unstable_entries is empty (PERF-010).
+    cached_storage_last_index: u64,
     allocator: std.mem.Allocator,
 
-    pub fn init(allocator: std.mem.Allocator, storage: stg.Storage) !RaftLog {
-        const snap = try storage.loadSnapshot();
-        var snap_idx: u64 = 0;
-        var snap_trm: u64 = 0;
-        if (snap) |s| {
-            snap_idx = s.metadata.index;
-            snap_trm = s.metadata.term;
-            // Free heap-allocated snapshot data and config after extracting
-            // the index/term we need (SEC-0072).
-            stg.freeSnapshot(allocator, s);
-        }
+    /// Initialize a RaftLog with pre-loaded snapshot metadata.
+    /// The caller is responsible for loading the snapshot once and passing
+    /// the index/term here, avoiding a redundant loadSnapshot() call (PERF-021).
+    pub fn init(allocator: std.mem.Allocator, storage: stg.Storage, snap_idx: u64, snap_trm: u64) !RaftLog {
+        const storage_last = storage.lastIndex() catch snap_idx;
 
         return .{
             .storage = storage,
@@ -33,17 +34,34 @@ pub const RaftLog = struct {
             .applied = snap_idx,
             .snapshot_index = snap_idx,
             .snapshot_term = snap_trm,
+            .cached_storage_last_index = storage_last,
             .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *RaftLog) void {
-        for (self.unstable_entries.items) |entry| {
+        for (self.activeUnstable()) |entry| {
             if (entry.data.len > 0) {
                 self.allocator.free(entry.data);
             }
         }
         self.unstable_entries.deinit(self.allocator);
+    }
+
+    /// Active (non-compacted) unstable entries (PERF-009).
+    fn activeUnstable(self: *const RaftLog) []rpc.Entry {
+        return self.unstable_entries.items[self.unstable_start..];
+    }
+
+    /// Compact dead prefix if wasted space exceeds active length (PERF-009).
+    fn maybeCompactUnstable(self: *RaftLog) void {
+        if (self.unstable_start > 0 and self.unstable_start >= self.activeUnstable().len) {
+            const items = self.unstable_entries.items;
+            const remaining = items.len - self.unstable_start;
+            std.mem.copyForwards(rpc.Entry, items[0..remaining], items[self.unstable_start..]);
+            self.unstable_entries.shrinkRetainingCapacity(remaining);
+            self.unstable_start = 0;
+        }
     }
 
     pub fn append(self: *RaftLog, entries: []const rpc.Entry) !void {
@@ -75,10 +93,12 @@ pub const RaftLog = struct {
     }
 
     pub fn lastIndex(self: *RaftLog) u64 {
-        if (self.unstable_entries.items.len > 0) {
-            return self.unstable_entries.items[self.unstable_entries.items.len - 1].index;
+        const active = self.activeUnstable();
+        if (active.len > 0) {
+            return active[active.len - 1].index;
         }
-        return self.storage.lastIndex() catch self.snapshot_index;
+        // Use cached value to avoid vtable dispatch (PERF-010).
+        return self.cached_storage_last_index;
     }
 
     pub fn lastTerm(self: *RaftLog) u64 {
@@ -91,15 +111,31 @@ pub const RaftLog = struct {
 
         // Check unstable entries first via offset arithmetic.
         const first_unstable = self.firstUnstableIndex();
+        const active = self.activeUnstable();
         if (index >= first_unstable) {
             const offset = index - first_unstable;
-            if (offset < self.unstable_entries.items.len) {
-                return self.unstable_entries.items[offset].term;
+            if (offset < active.len) {
+                return active[offset].term;
             }
             return stg.StorageError.Unavailable;
         }
 
         return self.storage.term(index);
+    }
+
+    /// Return a non-owning borrowed view if the range is entirely within
+    /// unstable entries. Returns null if the range spans stable storage —
+    /// caller should fall back to slice() which allocates (PERF-003).
+    pub fn borrowUnstable(self: *RaftLog, lo: u64, hi: u64) ?[]const rpc.Entry {
+        if (lo >= hi) return &[_]rpc.Entry{};
+        const first_unstable = self.firstUnstableIndex();
+        if (lo < first_unstable) return null;
+        const active = self.activeUnstable();
+        const start = lo - first_unstable;
+        const end = hi - first_unstable;
+        if (end > active.len or start > active.len)
+            return null;
+        return active[start..end];
     }
 
     pub fn slice(self: *RaftLog, lo: u64, hi: u64) ![]rpc.Entry {
@@ -113,13 +149,14 @@ pub const RaftLog = struct {
         }
 
         // Entirely in unstable entries.
+        const active = self.activeUnstable();
         if (lo >= first_unstable) {
             const start = lo - first_unstable;
             const end = hi - first_unstable;
-            if (end > self.unstable_entries.items.len or start > self.unstable_entries.items.len) {
+            if (end > active.len or start > active.len) {
                 return error.OutOfRange;
             }
-            const unstable_slice = self.unstable_entries.items[start..end];
+            const unstable_slice = active[start..end];
             const result = try self.allocator.alloc(rpc.Entry, unstable_slice.len);
             @memcpy(result, unstable_slice);
             return result;
@@ -130,10 +167,10 @@ pub const RaftLog = struct {
         defer self.allocator.free(stable);
 
         const unstable_end = hi - first_unstable;
-        if (unstable_end > self.unstable_entries.items.len) {
+        if (unstable_end > active.len) {
             return error.OutOfRange;
         }
-        const unstable_slice = self.unstable_entries.items[0..unstable_end];
+        const unstable_slice = active[0..unstable_end];
 
         const result = try self.allocator.alloc(rpc.Entry, stable.len + unstable_slice.len);
         @memcpy(result[0..stable.len], stable);
@@ -153,9 +190,10 @@ pub const RaftLog = struct {
         const last_new_index = std.math.add(u64, prev_log_index, entries.len) catch return error.Overflow;
 
         // Find the first conflicting entry.
+        const first_new_index = std.math.add(u64, prev_log_index, 1) catch return error.Overflow;
         var conflict_idx: u64 = 0;
         for (entries, 0..) |entry, i| {
-            const idx = std.math.add(u64, std.math.add(u64, prev_log_index, 1) catch return error.Overflow, i) catch return error.Overflow;
+            const idx = std.math.add(u64, first_new_index, i) catch return error.Overflow;
             const existing_term = self.term(idx) catch {
                 // Entry doesn't exist, append from here.
                 conflict_idx = idx;
@@ -204,34 +242,35 @@ pub const RaftLog = struct {
     }
 
     pub fn stableTo(self: *RaftLog, index: u64, term_val: u64) !void {
-        if (self.unstable_entries.items.len == 0) return;
+        const active = self.activeUnstable();
+        if (active.len == 0) return;
 
         const first_unstable = self.firstUnstableIndex();
         if (index < first_unstable) return;
 
         const offset = index - first_unstable;
-        if (offset >= self.unstable_entries.items.len) return;
+        if (offset >= active.len) return;
 
         // Only remove if the term matches.
-        if (self.unstable_entries.items[offset].term != term_val) return;
+        if (active[offset].term != term_val) return;
+
+        // Update cache: entries up to `index` are now in storage (PERF-010).
+        if (index > self.cached_storage_last_index) {
+            self.cached_storage_last_index = index;
+        }
 
         const remove_count = offset + 1;
 
         // Free data for removed entries.
-        for (self.unstable_entries.items[0..remove_count]) |entry| {
+        for (active[0..remove_count]) |entry| {
             if (entry.data.len > 0) {
                 self.allocator.free(entry.data);
             }
         }
 
-        // Shift remaining entries forward.
-        const remaining = self.unstable_entries.items.len - remove_count;
-        std.mem.copyForwards(
-            rpc.Entry,
-            self.unstable_entries.items[0..remaining],
-            self.unstable_entries.items[remove_count..],
-        );
-        self.unstable_entries.shrinkRetainingCapacity(remaining);
+        // Advance start offset instead of O(n) shift (PERF-009).
+        self.unstable_start += remove_count;
+        self.maybeCompactUnstable();
     }
 
     pub fn compact(self: *RaftLog, compact_index: u64) !void {
@@ -247,43 +286,43 @@ pub const RaftLog = struct {
         self.snapshot_term = new_snapshot_term;
         self.snapshot_index = compact_index;
 
-        // Trim unstable entries below compact_index.
-        if (self.unstable_entries.items.len > 0) {
-            const first_unstable = self.unstable_entries.items[0].index;
-            if (compact_index >= first_unstable) {
+        // Trim unstable entries below compact_index (PERF-009).
+        const active = self.activeUnstable();
+        if (active.len > 0) {
+            const first_unstable_idx = active[0].index;
+            if (compact_index >= first_unstable_idx) {
                 const trim_count = @min(
-                    compact_index - first_unstable + 1,
-                    self.unstable_entries.items.len,
+                    compact_index - first_unstable_idx + 1,
+                    active.len,
                 );
-                for (self.unstable_entries.items[0..trim_count]) |entry| {
+                for (active[0..trim_count]) |entry| {
                     if (entry.data.len > 0) {
                         self.allocator.free(entry.data);
                     }
                 }
-                const remaining = self.unstable_entries.items.len - trim_count;
-                std.mem.copyForwards(
-                    rpc.Entry,
-                    self.unstable_entries.items[0..remaining],
-                    self.unstable_entries.items[trim_count..],
-                );
-                self.unstable_entries.shrinkRetainingCapacity(remaining);
+                // Advance start offset instead of O(n) shift (PERF-009).
+                self.unstable_start += trim_count;
+                self.maybeCompactUnstable();
             }
         }
     }
 
     pub fn restore(self: *RaftLog, snapshot: rpc.Snapshot) !void {
-        // Free existing unstable entries.
-        for (self.unstable_entries.items) |entry| {
+        // Free existing unstable entries (PERF-009: only active range).
+        for (self.activeUnstable()) |entry| {
             if (entry.data.len > 0) {
                 self.allocator.free(entry.data);
             }
         }
         self.unstable_entries.shrinkRetainingCapacity(0);
+        self.unstable_start = 0;
 
         self.snapshot_index = snapshot.metadata.index;
         self.snapshot_term = snapshot.metadata.term;
         self.committed = snapshot.metadata.index;
         self.applied = snapshot.metadata.index;
+        // Reset cache to snapshot index since storage is reset (PERF-010).
+        self.cached_storage_last_index = snapshot.metadata.index;
     }
 
     pub fn matchTerm(self: *RaftLog, index: u64, term_val: u64) bool {
@@ -299,18 +338,15 @@ pub const RaftLog = struct {
     }
 
     pub fn unstableSlice(self: *RaftLog) []const rpc.Entry {
-        return self.unstable_entries.items;
-    }
-
-    pub fn hasPendingSnapshot(self: *RaftLog) bool {
-        return self.snapshot_index > self.applied;
+        return self.activeUnstable();
     }
 
     // --- Private helpers ---
 
     fn firstUnstableIndex(self: *RaftLog) u64 {
-        if (self.unstable_entries.items.len > 0) {
-            return self.unstable_entries.items[0].index;
+        const active = self.activeUnstable();
+        if (active.len > 0) {
+            return active[0].index;
         }
         // Checked overflow: lastIndex() + 1 (SEC-0070).
         return std.math.add(u64, self.lastIndex(), 1) catch self.lastIndex();
@@ -320,23 +356,26 @@ pub const RaftLog = struct {
         const first_unstable = self.firstUnstableIndex();
         if (from_index < first_unstable) {
             // Truncation point is in stable storage; clear all unstable.
-            for (self.unstable_entries.items) |entry| {
+            for (self.activeUnstable()) |entry| {
                 if (entry.data.len > 0) {
                     self.allocator.free(entry.data);
                 }
             }
             self.unstable_entries.shrinkRetainingCapacity(0);
+            self.unstable_start = 0;
             return;
         }
 
         const keep = from_index - first_unstable;
+        const active = self.activeUnstable();
         // Free entries being truncated.
-        for (self.unstable_entries.items[keep..]) |entry| {
+        for (active[keep..]) |entry| {
             if (entry.data.len > 0) {
                 self.allocator.free(entry.data);
             }
         }
-        self.unstable_entries.shrinkRetainingCapacity(keep);
+        // Shrink to unstable_start + keep (absolute position in backing array).
+        self.unstable_entries.shrinkRetainingCapacity(self.unstable_start + keep);
     }
 };
 
@@ -346,7 +385,7 @@ test "append entries and verify lastIndex/lastTerm" {
     var mem_store = stg.InMemoryStorage.init(std.testing.allocator);
     defer mem_store.deinit();
 
-    var log = try RaftLog.init(std.testing.allocator, mem_store.storage());
+    var log = try RaftLog.init(std.testing.allocator, mem_store.storage(), 0, 0);
     defer log.deinit();
 
     try std.testing.expectEqual(@as(u64, 0), log.lastIndex());
@@ -374,7 +413,7 @@ test "maybeAppend successful append" {
     };
     try mem_store.appendEntriesImpl(&stable_entries);
 
-    var log = try RaftLog.init(std.testing.allocator, mem_store.storage());
+    var log = try RaftLog.init(std.testing.allocator, mem_store.storage(), 0, 0);
     defer log.deinit();
 
     const new_entries = [_]rpc.Entry{
@@ -399,7 +438,7 @@ test "maybeAppend returns null on prev mismatch" {
     };
     try mem_store.appendEntriesImpl(&stable_entries);
 
-    var log = try RaftLog.init(std.testing.allocator, mem_store.storage());
+    var log = try RaftLog.init(std.testing.allocator, mem_store.storage(), 0, 0);
     defer log.deinit();
 
     const new_entries = [_]rpc.Entry{
@@ -421,7 +460,7 @@ test "maybeAppend truncation at conflict" {
     };
     try mem_store.appendEntriesImpl(&stable_entries);
 
-    var log = try RaftLog.init(std.testing.allocator, mem_store.storage());
+    var log = try RaftLog.init(std.testing.allocator, mem_store.storage(), 0, 0);
     defer log.deinit();
 
     // Add unstable entries at term 1.
@@ -449,7 +488,7 @@ test "commitTo advances but never decreases" {
     var mem_store = stg.InMemoryStorage.init(std.testing.allocator);
     defer mem_store.deinit();
 
-    var log = try RaftLog.init(std.testing.allocator, mem_store.storage());
+    var log = try RaftLog.init(std.testing.allocator, mem_store.storage(), 0, 0);
     defer log.deinit();
 
     const entries = [_]rpc.Entry{
@@ -479,7 +518,7 @@ test "isUpToDate various term/index comparisons" {
     var mem_store = stg.InMemoryStorage.init(std.testing.allocator);
     defer mem_store.deinit();
 
-    var log = try RaftLog.init(std.testing.allocator, mem_store.storage());
+    var log = try RaftLog.init(std.testing.allocator, mem_store.storage(), 0, 0);
     defer log.deinit();
 
     const entries = [_]rpc.Entry{
@@ -513,7 +552,7 @@ test "findConflict returns correct conflict info" {
     };
     try mem_store.appendEntriesImpl(&stable_entries);
 
-    var log = try RaftLog.init(std.testing.allocator, mem_store.storage());
+    var log = try RaftLog.init(std.testing.allocator, mem_store.storage(), 0, 0);
     defer log.deinit();
 
     // Index in log returns its term.
@@ -546,7 +585,7 @@ test "term from both stable and unstable regions" {
     };
     try mem_store.appendEntriesImpl(&stable_entries);
 
-    var log = try RaftLog.init(std.testing.allocator, mem_store.storage());
+    var log = try RaftLog.init(std.testing.allocator, mem_store.storage(), 0, 0);
     defer log.deinit();
 
     // Add unstable entries.
@@ -572,7 +611,7 @@ test "stableTo moves entries from unstable to stable" {
     var mem_store = stg.InMemoryStorage.init(std.testing.allocator);
     defer mem_store.deinit();
 
-    var log = try RaftLog.init(std.testing.allocator, mem_store.storage());
+    var log = try RaftLog.init(std.testing.allocator, mem_store.storage(), 0, 0);
     defer log.deinit();
 
     const entries = [_]rpc.Entry{

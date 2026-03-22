@@ -6,6 +6,12 @@ const rpc = @import("rpc.zig");
 
 pub const MembershipError = error{ConfigChangePending};
 
+/// Maximum number of voters allowed per voter set. Caps the O(n²)
+/// duplicate check in applyConfig/applySnapshotConfig and prevents
+/// unbounded memory allocation from a malicious peer (SEC-0143).
+/// Must match snapshot.zig MAX_VOTERS_PER_SET.
+pub const MAX_VOTERS_PER_SET: usize = 255;
+
 /// Check if a node ID is a voter in the current config (either set).
 pub fn isVoter(config: rpc.ClusterConfig, id: u64) bool {
     for (config.voters) |v| {
@@ -25,6 +31,8 @@ pub const MembershipState = struct {
     voters_outgoing: std.ArrayList(u64),
     is_joint: bool,
     pending_config_change: bool,
+    /// Pre-allocated voter list from proposeChange, awaiting commitProposeChange (SEC-0138).
+    prepared_voters: ?std.ArrayList(u64),
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, initial_voters: []const u64) !MembershipState {
@@ -35,11 +43,13 @@ pub const MembershipState = struct {
             .voters_outgoing = .{},
             .is_joint = false,
             .pending_config_change = false,
+            .prepared_voters = null,
             .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *MembershipState) void {
+        if (self.prepared_voters) |*pv| pv.deinit(self.allocator);
         self.voters.deinit(self.allocator);
         self.voters_outgoing.deinit(self.allocator);
     }
@@ -55,6 +65,11 @@ pub const MembershipState = struct {
 
     /// Start a config change: creates a joint config Entry.
     /// Returns error.ConfigChangePending if one is already in progress.
+    ///
+    /// IMPORTANT: This only serializes the entry — it does NOT mutate state.
+    /// The caller MUST call `commitProposeChange()` after the entry is
+    /// durably appended to the log. This two-phase pattern prevents
+    /// membership corruption if `log.append()` fails on OOM (SEC-0138).
     pub fn proposeChange(self: *MembershipState, new_voters: []const u64, current_term: u64, index: u64) !rpc.Entry {
         if (new_voters.len == 0) return error.InvalidData;
         if (self.pending_config_change) return MembershipError.ConfigChangePending;
@@ -64,16 +79,13 @@ pub const MembershipState = struct {
         const data = try serializeJoint(self.allocator, new_voters, self.voters.items);
         errdefer self.allocator.free(data);
 
-        // Copy new_voters into a fresh list before mutating.
+        // Pre-allocate new voter list so commitProposeChange is infallible.
         var new_voter_list = std.ArrayList(u64){};
         try new_voter_list.appendSlice(self.allocator, new_voters);
+        errdefer new_voter_list.deinit(self.allocator);
 
-        // All allocations succeeded — now mutate state (infallible from here).
-        self.pending_config_change = true;
-        self.voters_outgoing.deinit(self.allocator);
-        self.voters_outgoing = self.voters;
-        self.voters = new_voter_list;
-        self.is_joint = true;
+        // Stash the prepared voter list for commitProposeChange (SEC-0138).
+        self.prepared_voters = new_voter_list;
 
         return .{
             .index = index,
@@ -83,19 +95,40 @@ pub const MembershipState = struct {
         };
     }
 
+    /// Commit the propose — mutate membership state after the joint config
+    /// entry has been durably appended to the log (SEC-0138).
+    pub fn commitProposeChange(self: *MembershipState) void {
+        if (self.prepared_voters) |new_voter_list| {
+            self.pending_config_change = true;
+            self.voters_outgoing.deinit(self.allocator);
+            self.voters_outgoing = self.voters;
+            self.voters = new_voter_list;
+            self.is_joint = true;
+            self.prepared_voters = null;
+        }
+    }
+
+    /// Discard a prepared propose that was never committed (e.g. on errdefer).
+    pub fn rollbackProposeChange(self: *MembershipState) void {
+        if (self.prepared_voters) |*nvl| {
+            nvl.deinit(self.allocator);
+            self.prepared_voters = null;
+        }
+    }
+
     /// After joint config commits, produce the phase-2 (new-only) config entry.
     /// Returns null if not in joint consensus.
     /// Propagates serialization errors (including OOM) instead of swallowing (SEC-0034).
+    ///
+    /// IMPORTANT: This only serializes the entry — it does NOT mutate state.
+    /// The caller MUST call `commitFinalizeChange()` after the entry is
+    /// durably appended to the log. This two-phase pattern prevents Raft §6
+    /// safety violations if `log.append()` fails (SEC-0139).
     pub fn finalizeChange(self: *MembershipState, current_term: u64, index: u64) !?rpc.Entry {
         if (!self.is_joint) return null;
 
-        // Perform ALL fallible operations BEFORE mutating state (SEC-0045).
+        // Perform ALL fallible operations but do NOT mutate state (SEC-0045, SEC-0139).
         const data = try serializeFinal(self.allocator, self.voters.items);
-
-        // All allocations succeeded — now mutate state (infallible from here).
-        self.voters_outgoing.clearAndFree(self.allocator);
-        self.is_joint = false;
-        self.pending_config_change = false;
 
         return .{
             .index = index,
@@ -103,6 +136,14 @@ pub const MembershipState = struct {
             .kind = .config,
             .data = data,
         };
+    }
+
+    /// Commit the finalization — mutate membership state after the phase-2
+    /// config entry has been durably appended to the log (SEC-0139).
+    pub fn commitFinalizeChange(self: *MembershipState) void {
+        self.voters_outgoing.clearAndFree(self.allocator);
+        self.is_joint = false;
+        self.pending_config_change = false;
     }
 
     /// Apply a committed config entry (update voter sets from entry data).
@@ -114,6 +155,9 @@ pub const MembershipState = struct {
 
         // Semantic validation of deserialized config (SEC-0053).
         if (parsed.voters.len == 0) return error.InvalidData;
+        // Reject unreasonably large voter sets (SEC-0143).
+        if (parsed.voters.len > MAX_VOTERS_PER_SET) return error.InvalidData;
+        if (parsed.voters_outgoing.len > MAX_VOTERS_PER_SET) return error.InvalidData;
         for (parsed.voters, 0..) |v, i| {
             if (v == 0) return error.InvalidData;
             for (parsed.voters[0..i]) |prev| {
@@ -373,7 +417,7 @@ test "init — voters set correctly, not joint" {
     try std.testing.expect(!ms.pending_config_change);
 }
 
-test "proposeChange — creates joint config entry" {
+test "proposeChange — creates joint config entry after commit" {
     const allocator = std.testing.allocator;
     const initial = [_]u64{ 1, 2, 3 };
     var ms = try MembershipState.init(allocator, &initial);
@@ -382,6 +426,13 @@ test "proposeChange — creates joint config entry" {
     const new_voters = [_]u64{ 2, 3, 4 };
     const entry = try ms.proposeChange(&new_voters, 5, 10);
     defer allocator.free(entry.data);
+
+    // Before commit, state should NOT be joint yet (SEC-0138).
+    try std.testing.expect(!ms.is_joint);
+    try std.testing.expect(!ms.pending_config_change);
+
+    // Simulate successful log.append — commit the state change.
+    ms.commitProposeChange();
 
     try std.testing.expectEqual(rpc.EntryKind.config, entry.kind);
     try std.testing.expectEqual(@as(u64, 5), entry.term);
@@ -401,13 +452,14 @@ test "proposeChange — returns error when change already pending" {
     const new_voters = [_]u64{ 2, 3, 4 };
     const entry = try ms.proposeChange(&new_voters, 5, 10);
     defer allocator.free(entry.data);
+    ms.commitProposeChange();
 
     const second = [_]u64{ 5, 6 };
     const result = ms.proposeChange(&second, 5, 11);
     try std.testing.expectError(MembershipError.ConfigChangePending, result);
 }
 
-test "finalizeChange — produces final config entry, clears outgoing" {
+test "finalizeChange — produces final config entry, clears outgoing after commit" {
     const allocator = std.testing.allocator;
     const initial = [_]u64{ 1, 2, 3 };
     var ms = try MembershipState.init(allocator, &initial);
@@ -416,9 +468,17 @@ test "finalizeChange — produces final config entry, clears outgoing" {
     const new_voters = [_]u64{ 2, 3, 4 };
     const joint_entry = try ms.proposeChange(&new_voters, 5, 10);
     defer allocator.free(joint_entry.data);
+    ms.commitProposeChange();
 
     const final_entry = (try ms.finalizeChange(5, 11)).?;
     defer allocator.free(final_entry.data);
+
+    // Before commitFinalizeChange, state should still be joint (SEC-0139).
+    try std.testing.expect(ms.is_joint);
+    try std.testing.expect(ms.pending_config_change);
+
+    // After commit, state transitions to non-joint.
+    ms.commitFinalizeChange();
 
     try std.testing.expectEqual(rpc.EntryKind.config, final_entry.kind);
     try std.testing.expectEqual(@as(u64, 11), final_entry.index);
@@ -446,9 +506,11 @@ test "shouldLeaderStepDown — true when leader not in new voters after finalize
     const new_voters = [_]u64{ 2, 3, 4 };
     const joint_entry = try ms.proposeChange(&new_voters, 5, 10);
     defer allocator.free(joint_entry.data);
+    ms.commitProposeChange();
 
     const final_entry = (try ms.finalizeChange(5, 11)).?;
     defer allocator.free(final_entry.data);
+    ms.commitFinalizeChange();
 
     // Leader 1 is not in new voters {2,3,4}, should step down.
     try std.testing.expect(ms.shouldLeaderStepDown(1));
@@ -465,6 +527,7 @@ test "shouldLeaderStepDown — false during joint consensus" {
     const new_voters = [_]u64{ 2, 3, 4 };
     const entry = try ms.proposeChange(&new_voters, 5, 10);
     defer allocator.free(entry.data);
+    ms.commitProposeChange();
 
     // During joint consensus, leader should NOT step down even if not in new set.
     try std.testing.expect(!ms.shouldLeaderStepDown(1));
@@ -481,10 +544,11 @@ test "config — returns correct ClusterConfig" {
     try std.testing.expectEqual(@as(usize, 0), cfg.voters_outgoing.len);
     try std.testing.expect(!cfg.is_joint);
 
-    // After proposing a change, config should reflect joint state.
+    // After proposing + committing a change, config should reflect joint state.
     const new_voters = [_]u64{ 4, 5 };
     const entry = try ms.proposeChange(&new_voters, 1, 1);
     defer allocator.free(entry.data);
+    ms.commitProposeChange();
 
     const joint_cfg = ms.config();
     try std.testing.expectEqual(@as(usize, 2), joint_cfg.voters.len);

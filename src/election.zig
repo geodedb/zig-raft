@@ -2,7 +2,6 @@
 // Copyright (c) 2024-2025 CodePros
 
 const std = @import("std");
-const state = @import("state.zig");
 
 const Allocator = std.mem.Allocator;
 

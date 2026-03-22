@@ -31,10 +31,21 @@ pub fn committedIndex(
     return @max(@min(idx, idx_out), current_commit);
 }
 
+/// Stack-buffer capacity for voter match index gathering (PERF-001).
+/// Covers clusters up to 16 voters without heap allocation.
+const STACK_VOTERS_CAP = 16;
+
 fn committedForSet(allocator: std.mem.Allocator, voters: []const u64, match_indices: []const u64, node_ids: []const u64) !u64 {
     if (voters.len == 0) return 0;
-    const buf = try allocator.alloc(u64, voters.len);
-    defer allocator.free(buf);
+
+    // Use stack buffer for typical cluster sizes (PERF-001).
+    var stack_buf: [STACK_VOTERS_CAP]u64 = undefined;
+    const buf = if (voters.len <= STACK_VOTERS_CAP)
+        stack_buf[0..voters.len]
+    else
+        try allocator.alloc(u64, voters.len);
+    defer if (voters.len > STACK_VOTERS_CAP) allocator.free(buf);
+
     var n: usize = 0;
     for (voters) |v| {
         var found = false;

@@ -7,7 +7,7 @@ A Zig library for raft
 
 ## Features
 
-- **Zero Dependencies**: Pure Zig standard library only
+- **Minimal Dependencies**: Depends only on [spice](https://gitlab.com/devnw/zig/spice) for fork/join parallelism
 - **Memory Safe**: Proper allocation patterns with no leaks
 - **Cross-Platform**: Linux, macOS, Windows support
 - **Well Tested**: Comprehensive unit and integration tests
@@ -44,9 +44,23 @@ const std = @import("std");
 const raft = @import("raft");
 
 pub fn main() !void {
-    try raft.init(.{
-        .debug = true,
-    });
+    const allocator = std.heap.page_allocator;
+
+    // Create storage and transport backends.
+    var store = try raft.InMemoryStorage.init(allocator);
+    defer store.deinit();
+    // (Use raft.FileStorage for crash-safe persistence.)
+
+    // Configure and initialize the node.
+    const config = raft.Config{ .id = 1, .peers = &.{ 2, 3 } };
+    var node = try raft.RaftNode.init(allocator, config, store.storage());
+    defer node.deinit();
+
+    // Consumer loop: tick → ready → persist/send/apply → advance.
+    node.tick(null);
+    var rd = node.ready();
+    // ... persist rd.hard_state, send rd.messages, apply rd.committed_entries ...
+    node.advance(&rd);
 }
 ```
 

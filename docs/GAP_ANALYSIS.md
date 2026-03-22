@@ -2,32 +2,171 @@
 
 **Last updated:** 2026-03-22
 **Spec:** `docs/superpowers/specs/2026-03-21-raft-design.md`
-**Methodology:** Requirements-to-code audit + sixteen adversarial security review passes -- all source, tests, CI, and docs compared against design spec, then reviewed for security vulnerabilities. Pass 1 (SEC-0001..SEC-0011, all remediated), Pass 2 (SEC-0012..SEC-0028, all remediated or Won't Do), Pass 3 (SEC-0029..SEC-0036, all remediated), Pass 4 (SEC-0037..SEC-0044, all remediated or Won't Do), Pass 5 (SEC-0045..SEC-0064, all remediated), Pass 6 (SEC-0065..SEC-0068, all remediated or Won't Do), Pass 7 (SEC-0069..SEC-0070, all remediated), Pass 8 (SEC-0071..SEC-0073, all remediated), Pass 9 (SEC-0074..SEC-0097, all remediated or Won't Do), Pass 10 (SEC-0098..SEC-0101, all remediated), Pass 11 (SEC-0103..SEC-0106, all remediated), Pass 12 (SEC-0107..SEC-0108, all remediated), Pass 13 (SEC-0109..SEC-0110, all remediated), Pass 14 (SEC-0111..SEC-0118, all remediated), Pass 15 (SEC-0119..SEC-0121, all remediated), Pass 16 (SEC-0122..SEC-0136, all remediated).
+**Methodology:** Full codebase audit across 4 domains -- gap analysis (requirements-to-code), code quality review, performance review, and adversarial security review. 18 security passes, 2 quality passes, 2 performance passes. All source, tests, CI, and docs analyzed. See [QUALITY_GAP_ANALYSIS.md](QUALITY_GAP_ANALYSIS.md) and [PERF_GAP_ANALYSIS.md](PERF_GAP_ANALYSIS.md) for detailed domain-specific findings.
 
 ## Summary
 
-### Spec-to-Code Gaps (GAP-0001 through GAP-0008)
+### Spec-to-Code Gaps (GAP-0001 through GAP-0013)
 
 | Severity | Open | Resolved | Won't Do |
 |----------|------|----------|----------|
 | Critical | 0 | 0 | 0 |
 | High | 0 | 1 | 0 |
-| Medium | 0 | 5 | 0 |
-| Low | 0 | 2 | 0 |
+| Medium | 0 | 7 | 0 |
+| Low | 0 | 5 | 0 |
 
-All 185 tests pass (124 unit, 1 integration, 49 scenario, 11 chaos). All spec gaps resolved. See [GAP_ANALYSIS_RESOLVED.md](GAP_ANALYSIS_RESOLVED.md).
+**0 open gaps.** All 13 resolved (GAP-0001 through GAP-0013). See [GAP_ANALYSIS_RESOLVED.md](GAP_ANALYSIS_RESOLVED.md) for resolved items.
 
-### Security Findings (SEC-0001 through SEC-0136)
+### Security Findings (SEC-0001 through SEC-0143)
 
 | Severity | Open | Resolved | Won't Do |
 |----------|------|----------|----------|
 | Critical | 0 | 5 | 0 |
-| High | 0 | 22 | 0 |
-| Medium | 0 | 62 | 4 |
-| Low | 0 | 31 | 5 |
+| High | 0 | 23 | 0 |
+| Medium | 0 | 66 | 4 |
+| Low | 0 | 33 | 5 |
 | Info | 0 | 8 | 1 |
 
-**0 open findings.** 135 total findings across 16 passes; all 135 resolved or Won't Do.
+**0 open findings.** 142 total findings across 18 passes; all 142 resolved or Won't Do. Pass 18: 0 new findings (full audit deep review, 12 automated tools clean).
+
+### Quality Findings (QA-001 through QA-036)
+
+| Severity | Open | Resolved | Won't Do |
+|----------|------|----------|----------|
+| High | 0 | 5 | 0 |
+| Medium | 0 | 9 | 1 |
+| Low | 0 | 9 | 0 |
+
+**24 findings total, all resolved (23 Closed + 1 Won't Do).** See [QUALITY_GAP_ANALYSIS.md](QUALITY_GAP_ANALYSIS.md) for full details.
+
+### Performance Findings (PERF-001 through PERF-028)
+
+| PerfSeverity | Open | Resolved | Deferred |
+|--------------|------|----------|----------|
+| P0 | 0 | 1 | 0 |
+| P1 | 0 | 5 | 1 |
+| P2 | 0 | 11 | 0 |
+| P3 | 0 | 5 | 0 |
+| Info | 0 | 1 | 0 |
+
+**24 findings total (23 resolved, 1 deferred, 0 open).** See [PERF_GAP_ANALYSIS.md](PERF_GAP_ANALYSIS.md) for full details.
+
+---
+
+## Full Codebase Audit Summary
+
+### Cross-Domain Results
+
+| Domain | Total Findings | Open | Resolved | Won't Do / Deferred | Issues Created |
+|--------|---------------|------|----------|----------------------|----------------|
+| Gap Analysis | 13 | 0 | 13 | 0 | 13 |
+| Quality | 24 | 0 | 23 | 1 | 24 |
+| Performance | 24 | 0 | 23 | 1 | 24 |
+| Security | 142 | 0 | 132 | 10 | 142 |
+| **Total** | **203** | **0** | **191** | **12** | **203** |
+
+### Docs Updated
+
+| File | Domain | Action |
+|------|--------|--------|
+| `docs/GAP_ANALYSIS.md` | All | Updated with cross-domain audit summary |
+| `docs/GAP_ANALYSIS_RESOLVED.md` | Gap | 13 resolved gaps |
+| `docs/QUALITY_GAP_ANALYSIS.md` | Quality | 24 findings (23 resolved, 1 Won't Do) |
+| `docs/PERF_GAP_ANALYSIS.md` | Performance | 24 findings (23 resolved, 1 deferred) |
+| `docs/SECURITY_REVIEW_NOTES.md` | Security | 18 passes, 142 findings |
+
+### Top 10 Findings (cross-domain, by severity/score)
+
+| # | Domain | ID | Finding | Severity | Score | Status |
+|---|--------|----|---------|----------|-------|--------|
+| 1 | Security | SEC-0119 | Response handlers accept stale-term votes — Election Safety violation (two leaders at same term) | Critical | 100 | Resolved |
+| 2 | Security | SEC-0120 | `pending_config_index` not tracked on follower — cluster stuck in joint consensus after leader crash | Critical | 80 | Resolved |
+| 3 | Quality | QA-024 | Duplicated snapshot meta serialization in `saveSnapshotImpl()` vs `writeSnapshotMeta()` — format divergence risk | High | 80 | Resolved |
+| 4 | Quality | QA-023b | `handleAppendEntries()` lacks non-member sender check (suspected, safe per Raft paper) | High | 80 | Resolved |
+| 5 | Performance | PERF-027 | Benchmark raft module compiled in Debug mode — all benchmark numbers 5-20x inflated | P1 | 80 | Resolved |
+| 6 | Quality | QA-002 | 11 duplicated AppendEntries rejection responses in `node.zig` | High | 64 | Resolved |
+| 7 | Security | SEC-0122 | `handleInstallSnapshot` leaks snapshot data/config when `applySnapshotConfig()` fails — up to 256 MiB leak | High | 60 | Resolved |
+| 8 | Quality | QA-001 | Stale test binaries (`test_blake3`, `test_blake3.o`) committed to repo root | High | 60 | Resolved |
+| 9 | Performance | PERF-025 | No FileStorage benchmarks — zero regression detection for WAL I/O | P2 | 48 | Resolved |
+| 10 | Quality | QA-005 | Makefile aggregate targets skip scenario and chaos tests — false CI confidence | High | 48 | Resolved |
+
+### Blockers
+
+None. All 4 audit domains completed successfully. 12 automated security scanners returned clean results. No findings block library usage.
+
+---
+
+## Quality Findings Overview
+
+**Scoring:** PriorityScore = Impact(1-5) x Likelihood(1-5) x 4 (max 100)
+
+For detailed descriptions, evidence, and remediation guidance for each finding, see [QUALITY_GAP_ANALYSIS.md](QUALITY_GAP_ANALYSIS.md).
+
+### By Category
+
+| Category | Count | Top Finding |
+|----------|-------|-------------|
+| Maintainability | 5 | QA-024 (score 80): Duplicated snapshot meta serialization |
+| Readability | 4 | QA-025 (score 40): 14 repeated `createModule` blocks in `build.zig` |
+| CI/CD | 4 | QA-005 (score 48): Makefile missing scenario/chaos test targets |
+| Tests | 3 | QA-007 (score 36): Benchmarks vulnerable to compiler elision |
+| Documentation | 2 | QA-014 (score 32): README claims "Zero Dependencies" (depends on spice) |
+| Cleanup | 6 | QA-001 (score 60): Stale test binaries at repo root |
+
+### All Quality Findings
+
+| ID | Score | Finding | Component | Issue |
+|----|-------|---------|-----------|-------|
+| QA-024 | 80 | Duplicated snapshot meta serialization | `file_storage.zig` | [#190](https://gitlab.com/devnw/zig/raft/-/issues/190) |
+| QA-023b | 80 | Missing non-member sender check in `handleAppendEntries` (suspected) | `node.zig` | [#193](https://gitlab.com/devnw/zig/raft/-/issues/193) |
+| QA-002 | 64 | 11 duplicated AppendEntries rejection responses | `node.zig` | [#171](https://gitlab.com/devnw/zig/raft/-/issues/171) |
+| QA-001 | 60 | Stale test binaries at repo root | repo root | [#172](https://gitlab.com/devnw/zig/raft/-/issues/172) |
+| QA-005 | 48 | Makefile missing scenario/chaos targets | `Makefile` | [#173](https://gitlab.com/devnw/zig/raft/-/issues/173) |
+| QA-035 | 48 | CI apt-get install in every job (~30-60s waste) | `.gitlab-ci.yml` | [#194](https://gitlab.com/devnw/zig/raft/-/issues/194) |
+| QA-036 | 48 | No custom Docker image for CI | `.gitlab-ci.yml` | [#196](https://gitlab.com/devnw/zig/raft/-/issues/196) |
+| QA-025 | 40 | 14 repeated `createModule` blocks in `build.zig` | `build.zig` | [#198](https://gitlab.com/devnw/zig/raft/-/issues/198) |
+| QA-003 | 36 | `isVoter()` unused; 3 inline checks in `node.zig` | `node.zig`, `membership.zig` | [#174](https://gitlab.com/devnw/zig/raft/-/issues/174) |
+| QA-004 | 36 | `handleAppendEntries()` 135 lines, 11 exit paths | `node.zig` | [#175](https://gitlab.com/devnw/zig/raft/-/issues/175) |
+| QA-007 | 36 | Benchmarks vulnerable to compiler elision | `tests/bench.zig` | [#176](https://gitlab.com/devnw/zig/raft/-/issues/176) |
+| QA-010 | 36 | Untested APIs: `stats()`, `advancePersist()`, `advanceApply()` | `node.zig` | [#177](https://gitlab.com/devnw/zig/raft/-/issues/177) |
+| QA-014 | 32 | README claims "Zero Dependencies" | `README.md` | [#178](https://gitlab.com/devnw/zig/raft/-/issues/178) |
+| QA-028 | 28 | `hasPendingSnapshot()` dead code | `log.zig` | [#199](https://gitlab.com/devnw/zig/raft/-/issues/199) |
+| QA-029 | 28 | `needsEntries()` dead code | `replication.zig` | [#200](https://gitlab.com/devnw/zig/raft/-/issues/200) |
+| QA-030 | 28 | `resetPeers()` dead code | `replication.zig` | [#201](https://gitlab.com/devnw/zig/raft/-/issues/201) |
+| QA-006 | 24 | Magic number `16` repeated 5 times | `node.zig`, `replication.zig` | [#179](https://gitlab.com/devnw/zig/raft/-/issues/179) |
+| QA-008 | 24 | `examples/basic.zig` is a non-functional stub | `examples/basic.zig` | [#180](https://gitlab.com/devnw/zig/raft/-/issues/180) |
+| QA-009 | 24 | WAL recovery doesn't validate entry `kind` enum | `file_storage.zig` | [#181](https://gitlab.com/devnw/zig/raft/-/issues/181) |
+| QA-011 | 24 | `integration.zig` has only 1 test | `tests/integration.zig` | [#182](https://gitlab.com/devnw/zig/raft/-/issues/182) |
+| QA-012 | 24 | CI pipeline missing bench step | `.gitlab-ci.yml` | [#183](https://gitlab.com/devnw/zig/raft/-/issues/183) |
+| QA-026 | 20 | Unused import `state` in `election.zig` | `election.zig` | [#202](https://gitlab.com/devnw/zig/raft/-/issues/202) |
+| QA-027a | 20 | Unused import `stg` in `snapshot.zig` | `snapshot.zig` | [#203](https://gitlab.com/devnw/zig/raft/-/issues/203) |
+| QA-013 | 16 | Nested overflow checks hard to read | `log.zig` | [#184](https://gitlab.com/devnw/zig/raft/-/issues/184) |
+
+---
+
+## Performance Findings Overview
+
+**Scoring:** PerfScore = Impact(1-5) x Likelihood(1-5) x 4 (max 100)
+
+For detailed descriptions, evidence, and remediation guidance for each finding, see [PERF_GAP_ANALYSIS.md](PERF_GAP_ANALYSIS.md).
+
+### Open Performance Findings
+
+**0 open findings.** All 24 performance findings resolved or deferred.
+
+### Resolved Performance Highlights
+
+23 of 24 findings resolved (1 deferred). Key wins:
+- **PERF-001 (P0, 100):** Eliminated heap allocations in commit path via `[16]u64` stack buffers
+- **PERF-002 (P1, 80):** Removed double `log.slice()` in ready/advance cycle
+- **PERF-003 (P1, 80):** Added `borrowUnstable()` zero-copy path for unstable-only reads
+- **PERF-006 (P1, 48):** Split `advance()` into `advancePersist()`/`advanceApply()` for pipeline parallelism
+- **PERF-007 (P2, 48):** Batched WAL writes — single `writeAll` + single `sync` per batch
+- **PERF-008 (P2, 48):** Bulk byte-copy WAL compaction replacing per-record decode/re-encode
+
+**1 deferred:** PERF-005 (P1, 60) — entry data duplicated twice on follower path. Test-only impact (InMemoryStorage). Requires Storage vtable interface change; deferred until next major API revision.
+
+---
 
 ## Won't Do -- Handled via External Controls
 
@@ -43,6 +182,71 @@ All 185 tests pass (124 unit, 1 integration, 49 scenario, 11 chaos). All spec ga
 - **SEC-0093: Test harness `page_allocator` defeats leak detection** -- The harness intentionally uses `page_allocator` because Raft's shared-ownership entry slices create complex free patterns that confuse the testing allocator. The comment in `tests/harness.zig:78-79` documents this trade-off. Switching to `testing.allocator` would require refactoring ownership semantics across the entire codebase.
 - **SEC-0099: `Config.peers` borrowed slice can dangle** -- This is standard Zig borrowing semantics. The caller is responsible for ensuring the peers slice outlives the `RaftNode`. The test harness already dupes the slice (`allocator.dupe(u64, peers.items)`). Adding automatic duplication inside `RaftNode.init()` would break the existing ownership contract.
 - **SEC-0102: File storage tests use predictable `/tmp` paths** -- Test-only code with no production impact. The hardcoded paths are deterministic for reproducible test debugging. TOCTOU risk is negligible in a test environment.
+
+---
+
+## Open Gaps
+
+**0 open gaps.** All 13 spec-to-code gaps resolved. See [GAP_ANALYSIS_RESOLVED.md](GAP_ANALYSIS_RESOLVED.md) for details on GAP-0001 through GAP-0013.
+
+---
+
+## Security Findings -- Pass 18: Full Audit Deep Review -- 0 New Findings
+
+**Date:** 2026-03-22. Adversarial deep review of consensus safety, crash recovery, resource exhaustion, and membership changes. 12 automated scanners (gitleaks, trufflehog, trivy, grype, osv-scanner, semgrep, checkov, syft, hadolint, shellcheck, bandit, safety) all returned clean results. Manual review confirmed all 142 prior findings (SEC-0001 through SEC-0143) resolved or Won't Do.
+
+**0 new security findings.**
+
+**Quality note:** QA-023b (`handleAppendEntries` at `node.zig:857` lacks non-member sender check) flagged as a quality finding with `confidence::suspected`. Per Raft protocol, followers MUST accept AppendEntries from any leader with a valid term (term-based leader legitimacy). Previously documented as a false positive in Pass 17. Not a security finding.
+
+---
+
+## Security Findings -- Pass 17 (SEC-0137 through SEC-0143) -- All Resolved
+
+7 findings identified through exhaustive adversarial review with 8 parallel agents (protocol safety, memory safety, storage/crash safety, transport/DoS, CI/CD/supply chain). 12 automated scanners re-run (0 findings). 20+ agent-reported candidates verified against actual code; 16+ filtered as false positives, duplicates, or by-design patterns. Focused on: state mutation ordering at caller level (beyond SEC-0045/SEC-0046 internal fixes), memory lifecycle for outbound message payloads, integer arithmetic completeness, snapshot validation gaps, crash-safety durability, and config validation consistency.
+
+### High Severity (1 finding)
+
+| Rank | Sev | Risk | Finding | Component | CWE | Evidence | Issue | Status |
+|------|-----|------|---------|-----------|-----|----------|-------|--------|
+| 1 | High | 32 | `tick/finalizeChange` premature finalization — `finalizeChange()` mutated state BEFORE `log.append()` which can fail on OOM | `src/node.zig`, `src/membership.zig` | CWE-460, CWE-670 | Split `finalizeChange()` into prepare+commit; caller does `log.append()` then `commitFinalizeChange()` (infallible); errdefer rollback on OOM | [#164](https://gitlab.com/devnw/zig/raft/-/issues/164) | **Resolved** (SEC-0139) |
+
+### Medium Severity (4 findings)
+
+| Rank | Sev | Risk | Finding | Component | CWE | Evidence | Issue | Status |
+|------|-----|------|---------|-----------|-----|----------|-------|--------|
+| 2 | Medium | 36 | Memory leak: `buildAppendEntries()` entries slice never freed after `sendMsg()` | `src/node.zig`, `src/replication.zig` | CWE-401 | Added `freeAppendEntriesPayload()` after every `sendMsg` of AE messages; all transport impls deep-copy entries before queuing | [#165](https://gitlab.com/devnw/zig/raft/-/issues/165) | **Resolved** (SEC-0140) |
+| 3 | Medium | 24 | `proposeConfigChange` membership corruption on `log.append()` OOM | `src/node.zig`, `src/membership.zig` | CWE-460, CWE-672 | Split `proposeChange()` into prepare+commit; `errdefer rollbackProposeChange()`; `commitProposeChange()` called after `log.append()` succeeds | [#166](https://gitlab.com/devnw/zig/raft/-/issues/166) | **Resolved** (SEC-0138) |
+| 4 | Medium | 24 | `receiveChunk` missing `last_included_term <= msg.term` validation | `src/snapshot.zig` | CWE-20 | Added `if (msg.last_included_term > msg.term) return InvalidSnapshotConfig` check | [#168](https://gitlab.com/devnw/zig/raft/-/issues/168) | **Resolved** (SEC-0141) |
+| 5 | Medium | 24 | `truncateFrom` missing `sync()` after `setEndPos` | `src/file_storage.zig` | CWE-662 | Added `try file.sync()` after `try file.setEndPos(self.wal_end)` | [#169](https://gitlab.com/devnw/zig/raft/-/issues/169) | **Resolved** (SEC-0142) |
+
+### Low Severity (2 findings)
+
+| Rank | Sev | Risk | Finding | Component | CWE | Evidence | Issue | Status |
+|------|-----|------|---------|-----------|-----|----------|-------|--------|
+| 6 | Low | 16 | `applyConfig` missing `MAX_VOTERS_PER_SET` cap | `src/membership.zig`, `src/snapshot.zig` | CWE-770 | Added `MAX_VOTERS_PER_SET` cap check in `applyConfig`; imported constant from `membership.zig` into `snapshot.zig` | [#170](https://gitlab.com/devnw/zig/raft/-/issues/170) | **Resolved** (SEC-0143) |
+| 7 | Low | 12 | Unchecked `expected_first + i` in entry index validation | `src/node.zig` | CWE-190 | Changed to `std.math.add(u64, expected_first, i) catch` with graceful AE rejection | [#167](https://gitlab.com/devnw/zig/raft/-/issues/167) | **Resolved** (SEC-0137) |
+
+### False Positives Filtered (Pass 17)
+
+The following 16+ agent-reported candidates were verified against actual code and filtered:
+
+- **"CI downloads Zig toolchain without hash verification"** — Duplicate of SEC-0008/SEC-0042 (Won't Do, managed at CI catalog level)
+- **"CI component includes use mutable tags"** — Duplicate of SEC-0018 (Won't Do)
+- **"InProcessTransport unbounded inbox growth"** — Test-only code, not production transport (documented in Pass 15/16)
+- **"Transport vtable null/dangling pointer risk"** — Standard Zig vtable pattern (documented in Pass 15)
+- **"WAL recovery `total_record_size` arithmetic overflow"** — False positive: `data_len` capped at 64 MiB (SEC-0027 guard) before arithmetic; `WAL_HEADER_SIZE + 64MiB + WAL_CRC_SIZE` cannot overflow u64 or usize on 64-bit
+- **"WAL zero raft_index from disk corruption"** — Local disk threat model: adversary with file write access has full control; Raft tolerates by design (corrupt entries detected via CRC32)
+- **"Term zero not rejected in RequestVote"** — Term 0 is the bootstrap term; rejecting it would prevent initial elections. By design.
+- **"Snapshot chunk restart rate limiting"** — Raft's snapshot transfer is leader-initiated; followers cannot trigger unlimited restarts. Chunk offsets validated per SEC-0050.
+- **"build.zig.zon dependency Git SHA-1 + transitive deps"** — Content hash verified by Zig package manager (documented in Pass 16)
+- **"Entry data lifetime / ownership in Ready"** — By design per Ready-State pattern; consumer processes entries before advance() (documented in Pass 15)
+- **"advance() captures stale unstable slice"** — No mutation between capture and use (documented in Pass 16)
+- **"Shallow @memcpy of Entry structs in messages"** — By design; entry data borrowed from log (documented in Pass 14/15)
+- **"recordVote unbounded HashMap growth"** — Duplicate of SEC-0083 (resolved); tallyVotes only counts voter-set members
+- **"Missing leader membership check in handleAppendEntries"** — Per Raft paper: followers MUST accept valid-term leaders (documented in Pass 16)
+- **"No timeout on CI test jobs"** — Managed at GitLab project level (documented in Pass 16)
+- **"pre-commit hooks skipped in CI"** — Zig hooks require toolchain not available in pre-commit.ci (documented in Pass 16)
 
 ---
 
@@ -589,7 +793,7 @@ The following 25+ agent-reported candidates were verified against actual code an
 
 ## Open Spec-to-Code Gaps
 
-*None -- all 8 spec gaps resolved. See [GAP_ANALYSIS_RESOLVED.md](GAP_ANALYSIS_RESOLVED.md).*
+*None -- all 13 spec gaps resolved. See [GAP_ANALYSIS_RESOLVED.md](GAP_ANALYSIS_RESOLVED.md).*
 
 ## Geode Extraction Metadata
 

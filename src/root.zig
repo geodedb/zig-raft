@@ -28,6 +28,7 @@ pub const node = @import("node.zig");
 // Top-level convenience re-exports
 pub const RaftNode = node.RaftNode;
 pub const Config = node.Config;
+pub const Stats = node.Stats;
 pub const Ready = ready.Ready;
 pub const Role = state.Role;
 pub const HardState = state.HardState;

@@ -31,6 +31,14 @@ include:
 variables:
   ZIG_VERSION: "0.15.1"
 
+# Cache the Zig toolchain download across jobs to avoid re-downloading
+# ~45 MB per job (PERF-014).
+default:
+  cache:
+    key: "zig-${ZIG_VERSION}"
+    paths:
+      - zig-linux-x86_64-${ZIG_VERSION}/
+
 stages:
   - lint
   - build
@@ -41,15 +49,26 @@ stages:
 
 # Zig installation template
 # Validates ZIG_VERSION to prevent shell injection via pipeline trigger API (SEC-0129).
+# Skips download when cached (PERF-014).
 .install-zig: &install-zig
   - |
     if ! echo "${ZIG_VERSION}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-dev\.[0-9]+\+[a-f0-9]+)?$'; then
       echo "ERROR: Invalid ZIG_VERSION format: '${ZIG_VERSION}'" >&2
       exit 1
     fi
-  - apt-get update && apt-get install -y curl xz-utils
-  - curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz" -o zig.tar.xz
-  - tar -xf zig.tar.xz
+  # QA-035: Skip apt-get when required tools are already present to save 30-60s per job.
+  # QA-036 (Won't Do): Custom Docker image with pre-installed tools requires external
+  # Docker registry infrastructure; managed at CI catalog level.
+  - |
+    if ! command -v curl >/dev/null 2>&1 || ! command -v xz >/dev/null 2>&1; then
+      apt-get update && apt-get install -y curl xz-utils
+    fi
+  - |
+    if [ ! -x "zig-linux-x86_64-${ZIG_VERSION}/zig" ]; then
+      curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz" -o zig.tar.xz
+      tar -xf zig.tar.xz
+      rm -f zig.tar.xz
+    fi
   - export PATH="$PWD/zig-linux-x86_64-${ZIG_VERSION}:$PATH"
   - zig version
 
@@ -66,7 +85,8 @@ build:
       - zig-out/
     expire_in: 1 hour
 
-# Unit tests
+# Unit tests — no needs: dependency since tests recompile from source;
+# stage ordering (test after build) is sufficient (PERF-015).
 test:
   stage: test
   image: debian:bookworm-slim
@@ -74,8 +94,6 @@ test:
     - *install-zig
   script:
     - zig build test --summary all
-  needs:
-    - build
 
 # Integration tests
 test-integration:
@@ -85,8 +103,6 @@ test-integration:
     - *install-zig
   script:
     - zig build test-integration --summary all
-  needs:
-    - build
 
 # Release optimization tests
 test-release-safe:
@@ -96,8 +112,6 @@ test-release-safe:
     - *install-zig
   script:
     - zig build test -Doptimize=ReleaseSafe --summary all
-  needs:
-    - build
 
 # Scenario tests (election, replication, snapshots, membership, persistence, file_storage)
 test-scenarios:
@@ -107,8 +121,6 @@ test-scenarios:
     - *install-zig
   script:
     - zig build test-scenarios --summary all
-  needs:
-    - build
 
 # Chaos tests (randomized fault injection with deterministic replay)
 test-chaos:
@@ -118,8 +130,6 @@ test-chaos:
     - *install-zig
   script:
     - zig build test-chaos --summary all
-  needs:
-    - build
 
 # Cross-compilation tests
 test-cross-build:
@@ -132,5 +142,15 @@ test-cross-build:
     - zig build -Dtarget=aarch64-linux
     - zig build -Dtarget=x86_64-macos
     - zig build -Dtarget=aarch64-macos
-  needs:
-    - build
+
+# Benchmarks for performance regression detection (QA-012).
+# Manual trigger only; allowed to fail since benchmark results can be noisy.
+bench:
+  stage: test
+  image: debian:bookworm-slim
+  before_script:
+    - *install-zig
+  script:
+    - zig build bench --summary all
+  when: manual
+  allow_failure: true

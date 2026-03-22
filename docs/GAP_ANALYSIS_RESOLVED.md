@@ -1,6 +1,6 @@
 # Gap Analysis — Resolved Items
 
-**Last updated:** 2026-03-21
+**Last updated:** 2026-03-22
 
 Items are moved here from `GAP_ANALYSIS.md` when the gap is confirmed resolved with evidence. The corresponding GitLab issue is closed.
 
@@ -91,3 +91,48 @@ Items are moved here from `GAP_ANALYSIS.md` when the gap is confirmed resolved w
   - Added dedicated build targets for `membership.zig` and `replication.zig` (were previously missing from build system entirely)
   - Scenario test count increased from 20 to 34
 - **Evidence:** All 34 scenario tests and 11 chaos tests pass with full invariant checking
+
+---
+
+### GAP-0009: Design spec InstallSnapshot checksum type updated (RESOLVED)
+- **GitLab issue:** [#185](https://gitlab.com/devnw/zig/raft/-/issues/185)
+- **Category:** Docs
+- **Severity:** Low
+- **Resolution:** Updated design spec InstallSnapshot RPC definition to show `checksum: [32]u8` using BLAKE3, matching the implementation in `src/rpc.zig:79-80`. Mismatch was introduced during security hardening when CRC32 was upgraded to BLAKE3.
+- **Evidence:** Spec and implementation agree on checksum type (`[32]u8`) and algorithm (BLAKE3).
+
+---
+
+### GAP-0010: Design spec InstallSnapshot config field added (RESOLVED)
+- **GitLab issue:** [#186](https://gitlab.com/devnw/zig/raft/-/issues/186)
+- **Category:** Docs
+- **Severity:** Low
+- **Resolution:** Added `config: ClusterConfig` field to the design spec InstallSnapshot RPC definition with a note about membership state restoration. Field was present in `src/rpc.zig:83` but missing from spec.
+- **Evidence:** Design spec InstallSnapshot includes `config: ClusterConfig` field with documented purpose.
+
+---
+
+### GAP-0011: Design spec NotLeader struct replaced with error pattern (RESOLVED)
+- **GitLab issue:** [#187](https://gitlab.com/devnw/zig/raft/-/issues/187)
+- **Category:** Docs
+- **Severity:** Low
+- **Resolution:** Updated spec `propose()` section to show `error{NotLeader}!void` and document that `node.leader_id` provides the leader hint. The spec previously documented a `NotLeader` struct that never existed in Zig and was removed as dead code in GAP-0006.
+- **Evidence:** Spec `propose()` error handling matches actual `error{NotLeader}` implementation; no reference to NotLeader struct.
+
+---
+
+### GAP-0012: Design spec Storage vtable loadHardState added (RESOLVED)
+- **GitLab issue:** [#189](https://gitlab.com/devnw/zig/raft/-/issues/189)
+- **Category:** Docs
+- **Severity:** Medium
+- **Resolution:** Added `loadHardState` and `saveHardState` to the design spec Storage vtable definition with safety implications documented. Omission could lead to safety-violating storage implementations (no double-voting prevention after restart). This is the exact bug SEC-0077 fixed.
+- **Evidence:** Spec Storage vtable includes both methods with documented safety implications.
+
+---
+
+### GAP-0013: README Quick Start rewritten with actual API (RESOLVED)
+- **GitLab issue:** [#191](https://gitlab.com/devnw/zig/raft/-/issues/191)
+- **Category:** Docs
+- **Severity:** Medium
+- **Resolution:** Replaced README Quick Start with a minimal working example using actual RaftNode API, InMemoryStorage, InProcessTransport, and the consumer loop pattern (tick/step/ready/advance). The previous example referenced a fictional `raft.init(.{ .debug = true })` API that never existed.
+- **Evidence:** README Quick Start code uses actual API signatures matching `src/node.zig`.

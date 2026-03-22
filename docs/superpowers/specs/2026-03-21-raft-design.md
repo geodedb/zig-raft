@@ -112,8 +112,8 @@ All internal allocations use the `std.mem.Allocator` passed to `RaftNode.init`.
 ```
 Consumer
   │
-  ├── propose(data: []const u8) !void           # submit command (leader only)
-  │     returns error.NotLeader{leader_id: ?u64} if not leader
+  ├── propose(data: []const u8) error{NotLeader}!void  # submit command (leader only)
+  │     returns error.NotLeader if not leader; read node.leader_id for redirect hint
   ├── step(msg: Message, task: ?*spice.Task)    # deliver inbound RPC
   ├── tick(task: ?*spice.Task)                  # advance logical clock
   │
@@ -155,14 +155,12 @@ The library does not use wall-clock time internally. All timing is purely tick-b
 **Leader ID hint on `propose()` error:**
 
 ```zig
-pub const NotLeader = struct {
-    leader_id: ?u64,   // current known leader, null if unknown (e.g. election in progress)
-};
-pub const ProposeError = error{ NotLeader };
-// propose() returns ProposeError!void; on NotLeader the error payload carries leader_id
+// propose() returns error{NotLeader}!void
+// On NotLeader, consumers read node.leader_id to get the current leader hint.
+pub fn propose(self: *RaftNode, data: []const u8) error{NotLeader}!void;
 ```
 
-Consumers use `leader_id` to redirect client requests.
+Consumers use `node.leader_id` to redirect client requests (the field is `?u64`, null if unknown).
 
 ---
 
@@ -285,6 +283,9 @@ pub const Storage = struct {
 
     pub const VTable = struct {
         saveHardState: *const fn (*anyopaque, HardState) anyerror!void,
+        // SAFETY-CRITICAL: loadHardState must return the last persisted term/voted_for
+        // to prevent double-voting after restart (Raft safety property).
+        loadHardState: *const fn (*anyopaque) anyerror!?HardState,
         appendEntries: *const fn (*anyopaque, []const Entry) anyerror!void,
         // Returns entries with indices in [lo, hi) — half-open range.
         // Returns error.Compacted if lo <= snapshot_index.
@@ -355,7 +356,8 @@ pub const InstallSnapshot = struct {
     offset: u64,
     data: []const u8,
     done: bool,
-    checksum: u32,   // CRC32 of complete snapshot data (present in final chunk only)
+    checksum: [32]u8,  // BLAKE3 hash of complete snapshot data (present in final chunk only)
+    config: ClusterConfig,  // Cluster membership state for snapshot-based recovery
 };
 
 pub const InstallSnapshotResponse = struct {

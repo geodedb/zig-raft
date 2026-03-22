@@ -88,6 +88,8 @@ pub const FileStorage = struct {
     snapshot_config_voters_outgoing: std.ArrayList(u64),
     snapshot_config_is_joint: bool,
     hard_state: state.HardState,
+    /// Reusable batch buffer for appendEntriesImpl (PERF-028).
+    batch_buf: std.ArrayList(u8),
     allocator: std.mem.Allocator,
 
     /// Error returned when the data directory is already locked by another process (SEC-0066).
@@ -139,6 +141,7 @@ pub const FileStorage = struct {
             .snapshot_config_voters_outgoing = .{},
             .snapshot_config_is_joint = false,
             .hard_state = state.HardState.initial,
+            .batch_buf = .{},
             .allocator = allocator,
         };
         // Free heap resources on init failure (SEC-0069). Dir and lock_file
@@ -146,6 +149,7 @@ pub const FileStorage = struct {
         // and the WAL file handle that may be opened during recoverWal().
         errdefer {
             fs.index.deinit(allocator);
+            fs.batch_buf.deinit(allocator);
             fs.snapshot_config_voters.deinit(allocator);
             fs.snapshot_config_voters_outgoing.deinit(allocator);
             if (fs.wal_file) |f| f.close();
@@ -200,6 +204,7 @@ pub const FileStorage = struct {
     pub fn deinit(self: *FileStorage) void {
         if (self.wal_file) |f| f.close();
         self.index.deinit(self.allocator);
+        self.batch_buf.deinit(self.allocator);
         self.snapshot_config_voters.deinit(self.allocator);
         self.snapshot_config_voters_outgoing.deinit(self.allocator);
         // Release exclusive directory lock (SEC-0066).
@@ -276,33 +281,40 @@ pub const FileStorage = struct {
         }
         const file = self.wal_file.?;
 
-        // Seek to the end of valid data.
-        try file.seekTo(self.wal_end);
-
-        // Track starting state for rollback on mid-loop failure (SEC-0028).
+        // Track starting state for rollback (SEC-0028).
         const saved_wal_end = self.wal_end;
         const saved_index_len = self.index.items.len;
 
+        // --- Batched WAL write: single buffer + single writeAll (PERF-007) ---
+
+        // First pass: validate entries and compute total buffer size.
+        var total_buf_size: usize = 0;
         for (ents) |entry| {
             if (entry.data.len > std.math.maxInt(u32)) {
-                // Rollback: trim index entries added in this batch.
-                self.index.shrinkRetainingCapacity(saved_index_len);
-                self.wal_end = saved_wal_end;
-                // Truncate orphaned bytes to prevent ghost entries on recovery (SEC-0081).
-                file.setEndPos(saved_wal_end) catch {};
                 return stg.StorageError.Unavailable;
             }
-            const data_len: u32 = @intCast(entry.data.len);
+            total_buf_size += WAL_HEADER_SIZE + entry.data.len + WAL_CRC_SIZE;
+        }
 
-            // Build the record payload for CRC.
-            const payload_size = WAL_HEADER_SIZE + entry.data.len;
-            const payload = self.allocator.alloc(u8, payload_size) catch |err| {
-                self.index.shrinkRetainingCapacity(saved_index_len);
-                self.wal_end = saved_wal_end;
-                file.setEndPos(saved_wal_end) catch {};
-                return err;
-            };
-            defer self.allocator.free(payload);
+        // Pre-reserve index capacity so updates below cannot fail (SEC-0028).
+        self.index.ensureTotalCapacity(self.allocator, self.index.items.len + ents.len) catch |err| {
+            return err;
+        };
+
+        // Reuse batch buffer, clearing but retaining capacity (PERF-028).
+        self.batch_buf.clearRetainingCapacity();
+        self.batch_buf.ensureTotalCapacity(self.allocator, total_buf_size) catch |err| {
+            return err;
+        };
+        self.batch_buf.expandToCapacity();
+        const buf = self.batch_buf.items[0..total_buf_size];
+
+        // Second pass: serialize all entries + CRCs into the buffer.
+        var pos: usize = 0;
+        for (ents) |entry| {
+            const data_len: u32 = @intCast(entry.data.len);
+            const record_size = WAL_HEADER_SIZE + entry.data.len;
+            const payload = buf[pos..][0..record_size];
 
             std.mem.writeInt(u32, payload[0..4], data_len, .little);
             std.mem.writeInt(u64, payload[4..12], entry.index, .little);
@@ -313,39 +325,31 @@ pub const FileStorage = struct {
             }
 
             const crc = std.hash.Crc32.hash(payload);
-            var crc_buf: [4]u8 = undefined;
-            std.mem.writeInt(u32, &crc_buf, crc, .little);
+            std.mem.writeInt(u32, buf[pos + record_size ..][0..4], crc, .little);
 
-            // Write record.
-            const offset = self.wal_end;
-            file.writeAll(payload) catch |err| {
-                self.index.shrinkRetainingCapacity(saved_index_len);
-                self.wal_end = saved_wal_end;
-                file.setEndPos(saved_wal_end) catch {};
-                return err;
-            };
-            file.writeAll(&crc_buf) catch |err| {
-                self.index.shrinkRetainingCapacity(saved_index_len);
-                self.wal_end = saved_wal_end;
-                file.setEndPos(saved_wal_end) catch {};
-                return err;
-            };
+            pos += record_size + WAL_CRC_SIZE;
+        }
 
-            // Update in-memory index.
-            self.index.append(self.allocator, .{
+        // Single seekTo + writeAll instead of 2N syscalls.
+        try file.seekTo(self.wal_end);
+        file.writeAll(buf) catch |err| {
+            file.setEndPos(saved_wal_end) catch {};
+            return err;
+        };
+
+        // Update in-memory index (capacity pre-reserved, cannot fail).
+        var offset = self.wal_end;
+        for (ents) |entry| {
+            const data_len: u32 = @intCast(entry.data.len);
+            self.index.appendAssumeCapacity(.{
                 .file_offset = offset,
                 .raft_index = entry.index,
                 .term = entry.term,
                 .data_len = data_len,
-            }) catch |err| {
-                self.index.shrinkRetainingCapacity(saved_index_len);
-                self.wal_end = saved_wal_end;
-                file.setEndPos(saved_wal_end) catch {};
-                return err;
-            };
-
-            self.wal_end += payload_size + WAL_CRC_SIZE;
+            });
+            offset += WAL_HEADER_SIZE + entry.data.len + WAL_CRC_SIZE;
         }
+        self.wal_end = offset;
 
         // Sync to disk — rollback on failure so in-memory index stays
         // consistent with what actually reached the disk (SEC-0115).
@@ -378,9 +382,52 @@ pub const FileStorage = struct {
 
         const file = self.wal_file orelse return stg.StorageError.Unavailable;
 
+        // Bulk-read the contiguous byte range covering all entries (PERF-011).
+        const first_ie = self.index.items[start_pos];
+        const last_ie = self.index.items[end_pos];
+        const range_start = first_ie.file_offset;
+        const range_end = last_ie.file_offset + WAL_HEADER_SIZE + last_ie.data_len + WAL_CRC_SIZE;
+        const range_len: usize = @intCast(range_end - range_start);
+
+        const bulk_buf = try self.allocator.alloc(u8, range_len);
+        defer self.allocator.free(bulk_buf);
+
+        try file.seekTo(range_start);
+        const bytes_read = try file.readAll(bulk_buf);
+        if (bytes_read != range_len) return stg.StorageError.Unavailable;
+
+        // Parse entries from the bulk buffer.
         for (0..count) |i| {
             const ie = self.index.items[start_pos + i];
-            result[i] = try self.readEntryAt(file, ie);
+            const buf_off: usize = @intCast(ie.file_offset - range_start);
+            const payload_size = WAL_HEADER_SIZE + ie.data_len;
+
+            if (buf_off + payload_size + WAL_CRC_SIZE > bulk_buf.len)
+                return stg.StorageError.Unavailable;
+
+            const record = bulk_buf[buf_off..][0 .. payload_size + WAL_CRC_SIZE];
+
+            // Verify CRC32 integrity (SEC-0031).
+            const payload = record[0..payload_size];
+            const stored_crc = std.mem.readInt(u32, record[payload_size..][0..4], .little);
+            const computed_crc = std.hash.Crc32.hash(payload);
+            if (stored_crc != computed_crc) return stg.StorageError.Unavailable;
+
+            const kind_byte = record[20];
+            const kind: rpc.EntryKind = std.meta.intToEnum(rpc.EntryKind, kind_byte) catch
+                return stg.StorageError.Unavailable;
+
+            const data = if (ie.data_len > 0)
+                try self.allocator.dupe(u8, record[21..][0..ie.data_len])
+            else
+                @as([]const u8, &.{});
+
+            result[i] = .{
+                .index = ie.raft_index,
+                .term = ie.term,
+                .kind = kind,
+                .data = data,
+            };
             read_count += 1;
         }
 
@@ -423,35 +470,17 @@ pub const FileStorage = struct {
             tmp.close();
         }
 
-        // writeSnapshotMeta creates snapshot.meta.tmp, syncs, then renames.
-        // We need to split that into: create tmp + rename separately.
-        // Instead, write meta tmp here and rename both together.
+        // Serialize and write snapshot metadata to temp file (QA-024).
         {
-            const config_data = try mem.MembershipState.serializeConfig(self.allocator, snap.metadata.config);
-            defer self.allocator.free(config_data);
-
-            const config_len: u32 = @intCast(config_data.len);
-            const total_size = 48 + 4 + config_data.len + 4;
-            const buf = try self.allocator.alloc(u8, total_size);
-            defer self.allocator.free(buf);
-
-            std.mem.writeInt(u64, buf[0..8], snap.metadata.index, .little);
-            std.mem.writeInt(u64, buf[8..16], snap.metadata.term, .little);
-            @memcpy(buf[16..48], &data_digest);
-            std.mem.writeInt(u32, buf[48..52], config_len, .little);
-            if (config_data.len > 0) {
-                @memcpy(buf[52..][0..config_data.len], config_data);
-            }
-            const payload = buf[0 .. total_size - 4];
-            const crc = std.hash.Crc32.hash(payload);
-            std.mem.writeInt(u32, buf[total_size - 4 ..][0..4], crc, .little);
+            const meta_buf = try serializeSnapshotMeta(self.allocator, snap.metadata.index, snap.metadata.term, data_digest, snap.metadata.config);
+            defer self.allocator.free(meta_buf);
 
             var tmp = try self.dir.createFile("snapshot.meta.tmp", .{});
             errdefer {
                 tmp.close();
                 self.dir.deleteFile("snapshot.meta.tmp") catch {};
             }
-            try tmp.writeAll(buf);
+            try tmp.writeAll(meta_buf);
             try tmp.sync();
             tmp.close();
         }
@@ -608,34 +637,40 @@ pub const FileStorage = struct {
             return;
         }
 
-        // Rewrite WAL with only the remaining entries.
+        // Rewrite WAL with only the remaining entries (PERF-008: bulk copy).
         const file = self.wal_file orelse return;
 
-        // Read remaining entries from the old WAL.
-        // Track how many entries were successfully read so the defer only
-        // frees initialized entries, not uninitialized garbage (SEC-0078).
-        const entries = try self.allocator.alloc(rpc.Entry, remaining_count);
-        var entries_read: usize = 0;
-        defer {
-            for (entries[0..entries_read]) |e| {
-                if (e.data.len > 0) self.allocator.free(@constCast(e.data));
-            }
-            self.allocator.free(entries);
-        }
+        // Compute the contiguous byte range of remaining entries.
+        const first_remaining = self.index.items[compact_pos + 1];
+        const range_start = first_remaining.file_offset;
+        const range_len: usize = @intCast(self.wal_end - range_start);
 
-        for (0..remaining_count) |i| {
-            entries[i] = try self.readEntryAt(file, self.index.items[compact_pos + 1 + i]);
-            entries_read += 1;
-        }
+        // Bulk-read the remaining WAL bytes.
+        const bulk_buf = try self.allocator.alloc(u8, range_len);
+        defer self.allocator.free(bulk_buf);
+
+        try file.seekTo(range_start);
+        const bytes_read = try file.readAll(bulk_buf);
+        if (bytes_read != range_len) return stg.StorageError.Unavailable;
 
         // Close old WAL before rewriting.
         file.close();
         self.wal_file = null;
 
-        // Write new WAL to temp, sync, rename.
+        // Build new index with adjusted offsets and write bulk buffer to temp.
         var new_index = std.ArrayList(IndexEntry){};
         errdefer new_index.deinit(self.allocator);
-        var new_end: u64 = 0;
+        try new_index.ensureTotalCapacity(self.allocator, remaining_count);
+
+        for (0..remaining_count) |i| {
+            const old_ie = self.index.items[compact_pos + 1 + i];
+            new_index.appendAssumeCapacity(.{
+                .file_offset = old_ie.file_offset - range_start,
+                .raft_index = old_ie.raft_index,
+                .term = old_ie.term,
+                .data_len = old_ie.data_len,
+            });
+        }
 
         {
             var tmp = try self.dir.createFile("wal.tmp", .{});
@@ -644,38 +679,8 @@ pub const FileStorage = struct {
                 self.dir.deleteFile("wal.tmp") catch {};
             }
 
-            for (entries) |entry| {
-                if (entry.data.len > std.math.maxInt(u32))
-                    return stg.StorageError.Unavailable;
-                const data_len: u32 = @intCast(entry.data.len);
-                const payload_size = WAL_HEADER_SIZE + entry.data.len;
-                const payload = try self.allocator.alloc(u8, payload_size);
-                defer self.allocator.free(payload);
-
-                std.mem.writeInt(u32, payload[0..4], data_len, .little);
-                std.mem.writeInt(u64, payload[4..12], entry.index, .little);
-                std.mem.writeInt(u64, payload[12..20], entry.term, .little);
-                payload[20] = @intFromEnum(entry.kind);
-                if (entry.data.len > 0) {
-                    @memcpy(payload[21..][0..entry.data.len], entry.data);
-                }
-
-                const crc = std.hash.Crc32.hash(payload);
-                var crc_buf: [4]u8 = undefined;
-                std.mem.writeInt(u32, &crc_buf, crc, .little);
-
-                try new_index.append(self.allocator, .{
-                    .file_offset = new_end,
-                    .raft_index = entry.index,
-                    .term = entry.term,
-                    .data_len = data_len,
-                });
-
-                try tmp.writeAll(payload);
-                try tmp.writeAll(&crc_buf);
-                new_end += payload_size + WAL_CRC_SIZE;
-            }
-
+            // Single bulk write of all remaining records (PERF-008).
+            try tmp.writeAll(bulk_buf);
             try tmp.sync();
             tmp.close();
         }
@@ -686,44 +691,24 @@ pub const FileStorage = struct {
         // Update in-memory state.
         self.index.deinit(self.allocator);
         self.index = new_index;
-        self.wal_end = new_end;
+        self.wal_end = range_len;
 
         // Reopen WAL for future appends.
         self.wal_file = try self.dir.openFile("wal", .{ .mode = .read_write });
     }
 
     /// Write snapshot metadata file atomically (SEC-0032, SEC-0036, SEC-0039).
-    /// Format: [index: u64 LE][term: u64 LE][data_blake3: 32 bytes][config_len: u32 LE][config_data...][crc32: u32 LE]
-    /// Backward-compatible: readers handle legacy 16-byte and 52-byte (no config) formats.
+    /// Uses shared serializeSnapshotMeta() helper (QA-024) to avoid format divergence.
     fn writeSnapshotMeta(self: *FileStorage, snap_index: u64, snap_term: u64, data_digest: [32]u8, cfg: rpc.ClusterConfig) !void {
-        // Serialize config using the membership wire format.
-        const config_data = try mem.MembershipState.serializeConfig(self.allocator, cfg);
-        defer self.allocator.free(config_data);
-
-        const config_len: u32 = @intCast(config_data.len);
-        // Header (48) + config_len field (4) + config_data + CRC (4)
-        const total_size = 48 + 4 + config_data.len + 4;
-        const buf = try self.allocator.alloc(u8, total_size);
-        defer self.allocator.free(buf);
-
-        std.mem.writeInt(u64, buf[0..8], snap_index, .little);
-        std.mem.writeInt(u64, buf[8..16], snap_term, .little);
-        @memcpy(buf[16..48], &data_digest);
-        std.mem.writeInt(u32, buf[48..52], config_len, .little);
-        if (config_data.len > 0) {
-            @memcpy(buf[52..][0..config_data.len], config_data);
-        }
-        // CRC32 covers everything except the CRC itself.
-        const payload = buf[0 .. total_size - 4];
-        const crc = std.hash.Crc32.hash(payload);
-        std.mem.writeInt(u32, buf[total_size - 4 ..][0..4], crc, .little);
+        const meta_buf = try serializeSnapshotMeta(self.allocator, snap_index, snap_term, data_digest, cfg);
+        defer self.allocator.free(meta_buf);
 
         var tmp = try self.dir.createFile("snapshot.meta.tmp", .{});
         errdefer {
             tmp.close();
             self.dir.deleteFile("snapshot.meta.tmp") catch {};
         }
-        try tmp.writeAll(buf);
+        try tmp.writeAll(meta_buf);
         try tmp.sync();
         tmp.close();
         try self.dir.rename("snapshot.meta.tmp", "snapshot.meta");
@@ -737,6 +722,35 @@ pub const FileStorage = struct {
     // ========================================================================
     // Private helpers
     // ========================================================================
+
+    /// Serialize snapshot metadata into the V3 binary format (QA-024).
+    /// Format: [index: u64 LE][term: u64 LE][data_blake3: 32 bytes][config_len: u32 LE][config_data...][crc32: u32 LE]
+    /// Returns an allocator-owned buffer that the caller must free.
+    fn serializeSnapshotMeta(allocator: std.mem.Allocator, snap_index: u64, snap_term: u64, data_digest: [32]u8, cfg: rpc.ClusterConfig) ![]u8 {
+        // Serialize config using the membership wire format.
+        const config_data = try mem.MembershipState.serializeConfig(allocator, cfg);
+        defer allocator.free(config_data);
+
+        const config_len: u32 = @intCast(config_data.len);
+        // Header (48) + config_len field (4) + config_data + CRC (4)
+        const total_size = 48 + 4 + config_data.len + 4;
+        const buf = try allocator.alloc(u8, total_size);
+        errdefer allocator.free(buf);
+
+        std.mem.writeInt(u64, buf[0..8], snap_index, .little);
+        std.mem.writeInt(u64, buf[8..16], snap_term, .little);
+        @memcpy(buf[16..48], &data_digest);
+        std.mem.writeInt(u32, buf[48..52], config_len, .little);
+        if (config_data.len > 0) {
+            @memcpy(buf[52..][0..config_data.len], config_data);
+        }
+        // CRC32 covers everything except the CRC itself.
+        const payload = buf[0 .. total_size - 4];
+        const crc = std.hash.Crc32.hash(payload);
+        std.mem.writeInt(u32, buf[total_size - 4 ..][0..4], crc, .little);
+
+        return buf;
+    }
 
     /// Read the hard_state file with CRC32 verification (SEC-0036).
     /// Format: [term: u64 LE][voted_for: u64 LE][crc32: u32 LE] = 20 bytes.
@@ -878,46 +892,49 @@ pub const FileStorage = struct {
 
         const file = self.wal_file.?;
         const file_size = try file.getEndPos();
+        if (file_size == 0) {
+            self.wal_end = 0;
+            return;
+        }
+
+        // Bulk-read entire WAL into memory (PERF-013).
+        // Guard against implausibly large WAL files (SEC-0027 extension).
+        const max_wal_read: u64 = 1024 * 1024 * 1024; // 1 GiB
+        const read_size: usize = @intCast(@min(file_size, max_wal_read));
+        const wal_buf = try self.allocator.alloc(u8, read_size);
+        defer self.allocator.free(wal_buf);
+
+        try file.seekTo(0);
+        const bytes_read = try file.readAll(wal_buf);
+        const buf = wal_buf[0..bytes_read];
+
         var offset: u64 = 0;
 
-        while (offset < file_size) {
-            // Try to read one record.
+        while (offset < buf.len) {
             const record_start = offset;
+            const off: usize = @intCast(offset);
 
-            // Read header.
-            if (offset + WAL_HEADER_SIZE > file_size) break; // Incomplete header.
+            // Read header from buffer.
+            if (off + WAL_HEADER_SIZE > buf.len) break;
+            const header = buf[off..][0..WAL_HEADER_SIZE];
 
-            var header_buf: [WAL_HEADER_SIZE]u8 = undefined;
-            try file.seekTo(offset);
-            const header_read = try file.readAll(&header_buf);
-            if (header_read != WAL_HEADER_SIZE) break;
+            const data_len = std.mem.readInt(u32, header[0..4], .little);
+            const raft_index = std.mem.readInt(u64, header[4..12], .little);
+            const term = std.mem.readInt(u64, header[12..20], .little);
 
-            const data_len = std.mem.readInt(u32, header_buf[0..4], .little);
-            const raft_index = std.mem.readInt(u64, header_buf[4..12], .little);
-            const term = std.mem.readInt(u64, header_buf[12..20], .little);
-
-            // Reject implausibly large data_len to prevent unbounded allocation
-            // from corrupted WAL headers (SEC-0027).
+            // Reject implausibly large data_len (SEC-0027).
             if (data_len > WAL_MAX_RECORD_DATA_LEN) break;
 
             const total_record_size = WAL_HEADER_SIZE + data_len + WAL_CRC_SIZE;
-            if (offset + total_record_size > file_size) break; // Incomplete record.
+            if (off + total_record_size > buf.len) break;
 
-            // Read full payload + CRC for verification.
+            // Verify CRC from buffer.
             const payload_size = WAL_HEADER_SIZE + data_len;
-            const full_buf = try self.allocator.alloc(u8, payload_size + WAL_CRC_SIZE);
-            defer self.allocator.free(full_buf);
-
-            try file.seekTo(offset);
-            const full_read = try file.readAll(full_buf);
-            if (full_read != payload_size + WAL_CRC_SIZE) break;
-
-            // Verify CRC.
-            const payload = full_buf[0..payload_size];
-            const stored_crc = std.mem.readInt(u32, full_buf[payload_size..][0..4], .little);
+            const payload = buf[off..][0..payload_size];
+            const stored_crc = std.mem.readInt(u32, buf[off + payload_size ..][0..4], .little);
             const computed_crc = std.hash.Crc32.hash(payload);
 
-            if (stored_crc != computed_crc) break; // Corrupt record — truncate here.
+            if (stored_crc != computed_crc) break;
 
             // Valid record — add to index.
             try self.index.append(self.allocator, .{
@@ -1011,6 +1028,9 @@ pub const FileStorage = struct {
 
         if (self.wal_file) |file| {
             try file.setEndPos(self.wal_end);
+            // Flush truncation to disk so recovery does not replay stale
+            // entries from the WAL tail after a crash (SEC-0142).
+            try file.sync();
         }
     }
 

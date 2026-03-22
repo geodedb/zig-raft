@@ -2,7 +2,7 @@
 
 **Date:** 2026-03-22
 **Reviewer:** Automated adversarial security review agent
-**Commit:** 50d3600 (main)
+**Commit:** db9e64e (main, Pass 17)
 **Scope:** Full codebase, CI/CD, dependencies, configuration, delivery pipeline
 
 ## Review Phases
@@ -13,7 +13,7 @@
 4. **Automated Scanning** -- 12 tools (see below)
 5. **Manual Adversarial Review** -- full source audit of all 12 src modules, test infra, CI config, pre-commit config
 6. **Scoring** -- CVSS-inspired risk scoring (0-100) based on severity, exploitability, impact
-7. **Issue Filing** -- 101 GitLab issues (#9-#30, #31-#36, #37-#44, #45-#52, #53-#72, #73-#76, #77-#78, #79-#81, #82-#105, #106-#109, #114-#125), labels for severity/type/confidence/status
+7. **Issue Filing** -- 105 GitLab issues (#9-#30, #31-#36, #37-#44, #45-#52, #53-#72, #73-#76, #77-#78, #79-#81, #82-#105, #106-#109, #114-#125, #126-#143, #164-#167), labels for severity/type/confidence/status
 8. **GAP_ANALYSIS.md** -- updated with full stack-ranked findings table
 
 ## Tool Versions
@@ -517,6 +517,65 @@ All 11 findings remediated in-place with code changes and tests. Key fixes:
 
 **False positives filtered (25+):** See GAP_ANALYSIS.md Pass 16 section for full list.
 
+### Pass 17: Deep Adversarial Review (SEC-0137..SEC-0143)
+
+7 new findings identified through exhaustive adversarial review with 8 parallel agents covering protocol safety, memory safety, storage/crash safety, transport/DoS, and CI/CD/supply chain. 12 automated scanners re-run (0 findings). 20+ agent-reported findings verified against code; 16+ filtered as false positives or duplicates. Focused on: caller-level state mutation ordering (beyond SEC-0045/SEC-0046 internal fixes), memory lifecycle for outbound message payloads, integer arithmetic completeness, snapshot validation gaps, crash-safety durability, and config validation consistency.
+
+**7 findings filed as GitLab issues (#164-#170). All remediated.** Key findings and fixes:
+- SEC-0139 (HIGH): `tick/finalizeChange` premature finalization — **Fix:** Split `finalizeChange()` into prepare+commit; `commitFinalizeChange()` called after `log.append()` succeeds; errdefer rollback on OOM
+- SEC-0140 (MEDIUM): Memory leak: `buildAppendEntries` entries slice never freed — **Fix:** Added `freeAppendEntriesPayload()` after every `sendMsg` of AE messages; all 3 transport impls deep-copy entries before queuing
+- SEC-0138 (MEDIUM): `proposeConfigChange` membership corruption on OOM — **Fix:** Split `proposeChange()` into prepare+commit; `errdefer rollbackProposeChange()`; `commitProposeChange()` after `log.append()`
+- SEC-0141 (MEDIUM): `receiveChunk` missing term validation — **Fix:** Added `if (msg.last_included_term > msg.term) return InvalidSnapshotConfig`
+- SEC-0142 (MEDIUM): `truncateFrom` missing `sync()` after `setEndPos` — **Fix:** Added `try file.sync()` after `setEndPos`
+- SEC-0143 (LOW): `applyConfig` missing `MAX_VOTERS_PER_SET` cap — **Fix:** Added 255-voter cap check in `applyConfig`; shared constant from `membership.zig`
+- SEC-0137 (LOW): Unchecked `expected_first + i` — **Fix:** Changed to `std.math.add(u64, expected_first, i) catch` with graceful AE rejection
+
+**Scanner results (Pass 17):**
+
+| Tool | Version | Result |
+|------|---------|--------|
+| gitleaks | 8.30.0 | 0 findings |
+| trufflehog | 3.92.5 | 0 findings |
+| osv-scanner | 2.3.2 | No package sources |
+| trivy (fs) | 0.69.0 | 0 vulns, 0 secrets |
+| trivy (config) | 0.69.0 | 0 misconfigs |
+| syft + grype | 1.41.1 / 0.107.0 | 0 vulns |
+| semgrep | 1.150.0 | 0 findings (p/default config) |
+| checkov | 3.2.499 | 0 failed |
+| shellcheck | 0.10.0+ | No shell scripts in repo |
+| hadolint | 2.14.0 | No Dockerfiles |
+| bandit | 1.9.3 | N/A (no Python) |
+
+**False positives filtered (16+):** See GAP_ANALYSIS.md Pass 17 section for full list.
+
+### Pass 18: Full Audit Deep Review (0 new findings)
+
+**Date:** 2026-03-22
+**Scope:** Adversarial deep review of consensus safety, crash recovery, resource exhaustion, and membership changes. Full codebase re-audit following the SEC-0001 through SEC-0143 remediation campaign.
+
+**Automated tools (12 tools, all clean):**
+
+| Tool | Result |
+|------|--------|
+| gitleaks | 0 findings |
+| trufflehog | 0 findings |
+| trivy (fs + config) | 0 vulns, 0 secrets, 0 misconfigs |
+| grype | 0 vulns |
+| osv-scanner | No package sources |
+| semgrep | 0 findings |
+| checkov | 0 failed |
+| syft | SBOM generated, 0 vulns |
+| hadolint | No Dockerfiles |
+| shellcheck | No shell scripts |
+| bandit | N/A (no Python) |
+| safety | N/A (no Python) |
+
+**Manual review:** 0 new security findings. All 142 prior findings (SEC-0001 through SEC-0143) confirmed resolved or Won't Do.
+
+**Quality note:** QA-023b (handleAppendEntries at `node.zig:857` lacks non-member sender check) flagged as a quality finding with `confidence::suspected`. handleRequestVote and handleInstallSnapshot check membership per SEC-0134, but handleAppendEntries does not. This is consistent with the Raft protocol design: followers MUST accept AppendEntries from any leader with a valid term (term-based leader legitimacy). Previously documented as a false positive in Pass 17. Tracked as a quality/protocol-analysis item, not a security finding.
+
+---
+
 ## Notes
 
 - No secrets detected in repo history (13 commits scanned)
@@ -526,7 +585,8 @@ All 11 findings remediated in-place with code changes and tests. Key fixes:
 - `debian:bookworm-slim` Docker image used without digest pinning -- Won't Do (managed at CI catalog level)
 - CODEOWNERS updated from placeholder to `@devnw` (SEC-0010, resolved in Pass 1)
 - `SECURITY.md` updated from GitHub to GitLab references (INFO-1, resolved in Pass 1)
-- 135 total security findings across 16 passes: all 135 resolved or Won't Do
+- 142 total security findings across Passes 1-17: all 142 resolved or Won't Do; Pass 18 adds 0 new findings (142 total)
+- Pass 17 remediation: SEC-0137..SEC-0143 (7 findings, all resolved)
 - Pass 16 remediation: SEC-0122 errdefer snapshot leak, SEC-0123 pending_config_index from snapshot, SEC-0124 log.append errdefer+rollback, SEC-0125 storage.append errdefer+rollback, SEC-0126 init errdefers, SEC-0127 max_bytes_per_msg outside entry_size guard, SEC-0128 entry index validation, SEC-0129 ZIG_VERSION sanitization, SEC-0130 .tmp deletion after recovery, SEC-0131 restored hard state in ready_state, SEC-0132 syncDir after WAL deletion, SEC-0133 pre-vote leader lease check, SEC-0134 membership check on request handlers, SEC-0135 reject ID==0, SEC-0136 workflow:rules
 - Pass 15 remediation: SEC-0119 stale-term rejection, SEC-0120 pending_config_index in advance(), SEC-0121 gitleaks regex anchoring
 - Pass 14 remediation: SEC-0111..SEC-0118 (8 findings)
@@ -534,5 +594,5 @@ All 11 findings remediated in-place with code changes and tests. Key fixes:
 - Pass 11 remediation: SEC-0103 deferred role assignment, SEC-0104 checked addition, SEC-0105 errdefer rollback, SEC-0106 saturating tick counters
 - Pass 10 remediation: SEC-0098 term=0 validation, SEC-0099 centralized `applySnapshotConfig()`, SEC-0100 minimum 1024-byte chunk size, SEC-0101 adversarial test suite (12 scenarios)
 - Pass 9 remediation: 21 findings resolved in code, 3 closed as Won't Do (SEC-0093 harness allocator intentional, SEC-0099 caller responsibility, SEC-0102 test-only)
-- All 185 tests pass (124 unit, 1 integration, 49 scenario, 11 chaos) after Pass 15 remediation
-- Automated scanners (8 tools) found 0 issues across all 16 passes -- all findings are from manual adversarial review
+- All 186 tests pass (125 unit, 1 integration, 49 scenario, 11 chaos) after Pass 17 remediation
+- Automated scanners (12 tools) found 0 issues across all 18 passes -- all findings are from manual adversarial review

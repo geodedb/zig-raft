@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2024-2025 CodePros
 
-.PHONY: all build test test-unit test-integration clean check fmt help dev ci
+.PHONY: all build test test-unit test-integration test-scenarios test-chaos clean check fmt help dev ci bench
 .PHONY: test-release-safe test-release-fast test-release-small test-all-optimizations
 .PHONY: pre-commit-install pre-commit pre-commit-run
 
@@ -15,8 +15,8 @@ build:
 	@echo "🔨 Building raft..."
 	@zig build
 
-# Run all tests
-test: test-unit test-integration
+# Run all tests (unit + integration + scenarios + chaos)
+test: test-unit test-integration test-scenarios test-chaos
 	@echo "✅ All tests completed"
 
 # Run unit tests only
@@ -28,6 +28,16 @@ test-unit:
 test-integration:
 	@echo "🔗 Running integration tests..."
 	@zig build test-integration --summary all
+
+# Run scenario tests
+test-scenarios:
+	@echo "🧪 Running scenario tests..."
+	@zig build test-scenarios --summary all
+
+# Run chaos tests
+test-chaos:
+	@echo "🧪 Running chaos tests..."
+	@zig build test-chaos --summary all
 
 # Clean build artifacts
 clean:
@@ -44,13 +54,19 @@ fmt:
 	@echo "📝 Formatting code..."
 	@zig fmt src/ tests/ build.zig
 
-# Quick development iteration loop
-dev: fmt check test-unit
+# Quick development iteration loop (check removed — test-unit compiles the
+# same code, so running both wastes ~2-3s per iteration; PERF-019).
+dev: fmt test-unit
 	@echo "✅ Development checks passed"
 
-# Full CI pipeline (clean slate)
+# Full CI pipeline (clean slate -- includes all test suites)
 ci: clean build test
 	@echo "✅ CI pipeline passed"
+
+# Run benchmarks (ReleaseFast)
+bench:
+	@echo "Running benchmarks (ReleaseFast)..."
+	@zig build bench --summary all
 
 # Release optimization level tests
 test-release-safe:
@@ -94,13 +110,16 @@ help:
 	@echo "  ci                   Full CI: clean + build + test"
 	@echo ""
 	@echo "Testing:"
-	@echo "  test                 Run all tests"
+	@echo "  test                 Run all tests (unit + integration + scenarios + chaos)"
 	@echo "  test-unit            Run unit tests only"
 	@echo "  test-integration     Run integration tests only"
+	@echo "  test-scenarios       Run scenario tests"
+	@echo "  test-chaos           Run chaos tests"
 	@echo "  test-release-safe    Test with ReleaseSafe"
 	@echo "  test-release-fast    Test with ReleaseFast"
 	@echo "  test-release-small   Test with ReleaseSmall"
 	@echo "  test-all-optimizations  Test all optimization levels"
+	@echo "  bench                Run benchmarks (ReleaseFast)"
 	@echo ""
 	@echo "Code Quality:"
 	@echo "  fmt                  Format source code"

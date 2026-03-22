@@ -6,6 +6,7 @@ const rpc = @import("rpc.zig");
 const raft_log = @import("log.zig");
 const quorum_mod = @import("quorum.zig");
 const stg = @import("storage.zig");
+const node_mod = @import("node.zig");
 
 pub const PeerProgress = struct {
     next_index: u64,
@@ -47,11 +48,6 @@ pub const PeerProgress = struct {
         }
         return changed;
     }
-
-    /// Returns true if this peer needs entries (next_index <= last_index).
-    pub fn needsEntries(self: PeerProgress, last_index: u64) bool {
-        return self.next_index <= last_index;
-    }
 };
 
 pub const ReplicationState = struct {
@@ -76,19 +72,6 @@ pub const ReplicationState = struct {
 
     pub fn deinit(self: *ReplicationState) void {
         self.peers.deinit();
-    }
-
-    /// Reset all peers' next_index to last_index + 1, match_index to 0 (on becoming leader).
-    pub fn resetPeers(self: *ReplicationState, peer_ids: []const u64, last_index: u64) !void {
-        self.peers.clearRetainingCapacity();
-        // Checked overflow: last_index + 1 (SEC-0070).
-        const next_index = std.math.add(u64, last_index, 1) catch last_index;
-        for (peer_ids) |pid| {
-            try self.peers.put(pid, .{
-                .next_index = next_index,
-                .match_index = 0,
-            });
-        }
     }
 
     /// Build an AppendEntries message for a specific peer.
@@ -117,6 +100,22 @@ pub const ReplicationState = struct {
 
         // Compute the range of entries to send (SEC-0070: checked overflow).
         const last = raft_log_ptr.lastIndex();
+
+        // Short-circuit: peer is caught up — send empty heartbeat without
+        // touching log.slice() or log.term() for the entry range (PERF-018).
+        if (next > last) {
+            return rpc.Message{
+                .append_entries = .{
+                    .term = term,
+                    .leader_id = leader_id,
+                    .prev_log_index = prev_log_index,
+                    .prev_log_term = prev_log_term,
+                    .entries = &.{},
+                    .leader_commit = commit_index,
+                },
+            };
+        }
+
         const next_plus = std.math.add(u64, next, @as(u64, max_entries)) catch std.math.maxInt(u64);
         const last_plus = std.math.add(u64, last, 1) catch std.math.maxInt(u64);
         const hi = @min(next_plus, last_plus);
@@ -187,11 +186,20 @@ pub const ReplicationState = struct {
     ) !bool {
         // Build parallel arrays of node_ids and match_indices.
         // Include the leader itself (match = lastIndex).
+        // Use stack buffers for typical cluster sizes (PERF-001).
         const count = self.peers.count() + 1;
-        const node_ids = try self.allocator.alloc(u64, count);
-        defer self.allocator.free(node_ids);
-        const match_indices = try self.allocator.alloc(u64, count);
-        defer self.allocator.free(match_indices);
+        var nid_stack: [node_mod.MAX_STACK_PEERS]u64 = undefined;
+        var mi_stack: [node_mod.MAX_STACK_PEERS]u64 = undefined;
+        const node_ids = if (count <= 16)
+            nid_stack[0..count]
+        else
+            try self.allocator.alloc(u64, count);
+        defer if (count > 16) self.allocator.free(node_ids);
+        const match_indices = if (count <= 16)
+            mi_stack[0..count]
+        else
+            try self.allocator.alloc(u64, count);
+        defer if (count > 16) self.allocator.free(match_indices);
         var n: usize = 0;
 
         // Leader's own match index is its last log index.
@@ -294,7 +302,7 @@ test "buildAppendEntries builds correct message with entries" {
     };
     try mem_store.appendEntriesImpl(&stable_entries);
 
-    var log = try raft_log.RaftLog.init(std.testing.allocator, mem_store.storage());
+    var log = try raft_log.RaftLog.init(std.testing.allocator, mem_store.storage(), 0, 0);
     defer log.deinit();
 
     // Peer 2 needs entries starting at 1.
@@ -331,7 +339,7 @@ test "buildAppendEntries returns null when peer needs snapshot" {
     // Compact up to index 2 so entries 1-2 are gone.
     try mem_store.compactImpl(2);
 
-    var log = try raft_log.RaftLog.init(std.testing.allocator, mem_store.storage());
+    var log = try raft_log.RaftLog.init(std.testing.allocator, mem_store.storage(), 0, 0);
     defer log.deinit();
 
     // Peer 2 with next_index = 1 (needs entries starting before snapshot).
@@ -347,7 +355,7 @@ test "maybeCommit advances commit when majority has replicated" {
     var mem_store = stg.InMemoryStorage.init(std.testing.allocator);
     defer mem_store.deinit();
 
-    var log = try raft_log.RaftLog.init(std.testing.allocator, mem_store.storage());
+    var log = try raft_log.RaftLog.init(std.testing.allocator, mem_store.storage(), 0, 0);
     defer log.deinit();
 
     // Leader (node 1) appends entries at term 3.
@@ -376,7 +384,7 @@ test "maybeCommit does NOT commit entries from prior term (section 5.4.2)" {
     var mem_store = stg.InMemoryStorage.init(std.testing.allocator);
     defer mem_store.deinit();
 
-    var log = try raft_log.RaftLog.init(std.testing.allocator, mem_store.storage());
+    var log = try raft_log.RaftLog.init(std.testing.allocator, mem_store.storage(), 0, 0);
     defer log.deinit();
 
     // Entries from a previous term (term 2), current leader is term 3.
