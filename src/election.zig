@@ -45,7 +45,7 @@ pub const ElectionState = struct {
 
     pub fn resetElectionTimeout(self: *ElectionState) void {
         const lower = self.election_tick;
-        const upper = 2 * self.election_tick;
+        const upper = std.math.mul(u32, 2, self.election_tick) catch std.math.maxInt(u32);
 
         if (self.use_crypto_random) {
             self.election_timeout = std.crypto.random.intRangeLessThan(u32, lower, upper);

@@ -76,7 +76,11 @@ pub const InstallSnapshot = struct {
     offset: u64,
     data: []const u8,
     done: bool,
-    checksum: u32,
+    /// BLAKE3 digest of the full snapshot data (set on final chunk; zero on intermediate chunks).
+    checksum: [32]u8,
+    /// Cluster configuration at the time of the snapshot (SEC-0030).
+    /// Carried on every chunk so the receiver can restore membership state.
+    config: ClusterConfig,
 };
 
 pub const InstallSnapshotResponse = struct {
@@ -117,7 +121,7 @@ test "Message tagged union field access" {
     const aer = Message{ .append_entries_response = .{ .term = 3, .success = true, .match_index = 5, .conflict_index = 0, .conflict_term = 0 } };
     try std.testing.expect(aer.append_entries_response.success);
 
-    const is = Message{ .install_snapshot = .{ .term = 2, .leader_id = 1, .last_included_index = 10, .last_included_term = 2, .offset = 0, .data = "snap", .done = true, .checksum = 0xDEAD } };
+    const is = Message{ .install_snapshot = .{ .term = 2, .leader_id = 1, .last_included_index = 10, .last_included_term = 2, .offset = 0, .data = "snap", .done = true, .checksum = .{0} ** 32, .config = .{ .voters = &.{}, .voters_outgoing = &.{}, .is_joint = false } } };
     try std.testing.expect(is.install_snapshot.done);
 
     const isr = Message{ .install_snapshot_response = .{ .term = 2, .success = true } };

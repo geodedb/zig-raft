@@ -4,6 +4,18 @@
 const std = @import("std");
 const rpc = @import("rpc.zig");
 
+/// Transport interface for sending Raft messages between nodes.
+///
+/// **Security requirement:** Transport implementations MUST authenticate peers
+/// to prevent impersonation attacks. Recommended approaches:
+/// - mTLS with per-node certificates
+/// - HMAC-signed message envelopes with a shared cluster secret
+/// - IPSec or WireGuard tunnels between nodes
+///
+/// The `from` parameter passed to `RaftNode.step()` is validated against the
+/// message's internal sender ID, but this only detects misrouting — it cannot
+/// prevent a malicious node from crafting messages with arbitrary sender fields.
+/// Peer authentication at the transport layer is the only defense.
 pub const Transport = struct {
     ptr: *anyopaque,
     vtable: *const VTable,

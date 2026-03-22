@@ -220,7 +220,7 @@ pub const Network = struct {
         for (self.node_ids.items) |id| {
             if (self.paused_nodes.contains(id)) continue;
             const n = self.nodes.get(id).?;
-            const r = n.ready();
+            const r = try n.ready();
             for (r.committed_entries) |entry| {
                 const list = self.committed.getPtr(id).?;
                 try list.append(self.allocator, entry);

@@ -180,7 +180,7 @@ const TestCluster = struct {
 
         // Phase 3: ready / advance.
         for (self.nodes) |n| {
-            _ = n.ready();
+            _ = try n.ready();
             try n.advance();
         }
     }

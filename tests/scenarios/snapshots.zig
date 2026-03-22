@@ -22,6 +22,15 @@ const Checker = @import("checker").Checker;
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Compute BLAKE3 hash of data (test helper).
+fn blake3Hash(data: []const u8) [32]u8 {
+    var h = std.crypto.hash.Blake3.init(.{});
+    h.update(data);
+    var digest: [32]u8 = undefined;
+    h.final(&digest);
+    return digest;
+}
+
 /// Collect node pointers from the harness into a slice suitable for the Checker.
 fn collectNodes(allocator: std.mem.Allocator, net: *harness.Network) ![]*raft.node.RaftNode {
     const nodes = try allocator.alloc(*raft.node.RaftNode, net.node_ids.items.len);
@@ -68,7 +77,7 @@ test "scenario: should_snapshot flag triggers at threshold" {
     // The harness tickAll already called ready()/advance() for this tick round,
     // so we need one more ready() call. Advance first to reset the pending flag.
     try leader.advance();
-    const r = leader.ready();
+    const r = try leader.ready();
 
     // lastIndex - snapshot_index (0) >= threshold (5) => should_snapshot == true.
     try std.testing.expect(r.should_snapshot);
@@ -224,9 +233,9 @@ test "scenario: buildInstallSnapshotMessages produces correct chunks" {
     try std.testing.expectEqual(@as(u64, 12), msgs[3].install_snapshot.offset);
     try std.testing.expect(msgs[3].install_snapshot.done);
 
-    // Last chunk carries the full-data CRC.
-    const expected_crc = std.hash.Crc32.hash("ABCDEFGHIJKLMNOP");
-    try std.testing.expectEqual(expected_crc, msgs[3].install_snapshot.checksum);
+    // Last chunk carries the full-data BLAKE3 digest.
+    const expected_digest = blake3Hash("ABCDEFGHIJKLMNOP");
+    try std.testing.expectEqualSlices(u8, &expected_digest, &msgs[3].install_snapshot.checksum);
 
     // Reassemble on a follower's snapshot_state and verify round-trip.
     const follower_id: u64 = if (leader_id == 1) 2 else 1;
@@ -409,9 +418,9 @@ test "scenario: chunked_snapshot_transfer" {
     // Last chunk should be done=true.
     try std.testing.expect(msgs[msgs.len - 1].install_snapshot.done);
 
-    // Verify CRC matches on the last chunk.
-    const expected_crc = std.hash.Crc32.hash(snapshot_data);
-    try std.testing.expectEqual(expected_crc, msgs[msgs.len - 1].install_snapshot.checksum);
+    // Verify BLAKE3 digest matches on the last chunk.
+    const expected_digest = blake3Hash(snapshot_data);
+    try std.testing.expectEqualSlices(u8, &expected_digest, &msgs[msgs.len - 1].install_snapshot.checksum);
 
     // Follower's snapshot state should be updated.
     try std.testing.expectEqual(snap.metadata.index, follower.snapshot_state.snapshot_index);

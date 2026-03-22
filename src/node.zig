@@ -14,6 +14,16 @@ const rd = @import("ready.zig");
 const stg = @import("storage.zig");
 const trans = @import("transport.zig");
 
+pub const ConfigError = error{
+    InvalidId,
+    InvalidElectionTick,
+    InvalidHeartbeatTick,
+    HeartbeatNotLessThanElection,
+    InvalidSnapshotChunkSize,
+    DuplicatePeerId,
+    SelfInPeers,
+};
+
 pub const Config = struct {
     id: u64,
     peers: []const u64,
@@ -21,10 +31,28 @@ pub const Config = struct {
     heartbeat_tick: u32 = 1,
     max_entries_per_msg: u32 = 64,
     max_bytes_per_msg: u64 = 1024 * 1024,
+    max_entry_size: u64 = 1024 * 1024, // 1 MiB default; 0 = unlimited
+    max_snapshot_size: u64 = 256 * 1024 * 1024, // 256 MiB default; 0 = unlimited
     snapshot_chunk_size: usize = 64 * 1024,
     snapshot_threshold: u32 = 1000,
     pre_vote: bool = true,
     rng_seed: ?u64 = null,
+
+    pub fn validate(self: Config) ConfigError!void {
+        if (self.id == 0) return ConfigError.InvalidId;
+        if (self.election_tick == 0) return ConfigError.InvalidElectionTick;
+        if (self.heartbeat_tick == 0) return ConfigError.InvalidHeartbeatTick;
+        if (self.heartbeat_tick >= self.election_tick) return ConfigError.HeartbeatNotLessThanElection;
+        if (self.snapshot_chunk_size == 0) return ConfigError.InvalidSnapshotChunkSize;
+
+        // Reject self-inclusion and duplicate peer IDs (SEC-0033).
+        for (self.peers, 0..) |peer, i| {
+            if (peer == self.id) return ConfigError.SelfInPeers;
+            for (self.peers[0..i]) |prev| {
+                if (peer == prev) return ConfigError.DuplicatePeerId;
+            }
+        }
+    }
 };
 
 pub const RaftNode = struct {
@@ -51,6 +79,8 @@ pub const RaftNode = struct {
     // -----------------------------------------------------------------------
 
     pub fn init(allocator: std.mem.Allocator, config: Config, storage_impl: stg.Storage) !RaftNode {
+        try config.validate();
+
         var all_voters = std.ArrayList(u64){};
         defer all_voters.deinit(allocator);
         try all_voters.append(allocator, config.id);
@@ -89,6 +119,7 @@ pub const RaftNode = struct {
                 allocator,
                 config.snapshot_threshold,
                 config.snapshot_chunk_size,
+                config.max_snapshot_size,
             ),
             .ready_state = rd.ReadyState.init(allocator, st.HardState.initial),
             .config = config,
@@ -114,12 +145,64 @@ pub const RaftNode = struct {
         self.transport = t;
     }
 
+    /// Return the current dynamic voter set excluding self (SEC-0044).
+    /// Uses membership_state.voters (which tracks config changes) instead
+    /// of the static config.peers. Caller must free the returned slice.
+    fn dynamicPeers(self: *RaftNode) ![]u64 {
+        const voters = self.membership_state.voters.items;
+        // Count peers (voters minus self).
+        var count: usize = 0;
+        for (voters) |v| {
+            if (v != self.id) count += 1;
+        }
+        // Also include voters_outgoing (joint consensus) minus self and minus duplicates.
+        const outgoing = self.membership_state.voters_outgoing.items;
+        for (outgoing) |v| {
+            if (v == self.id) continue;
+            var already = false;
+            for (voters) |iv| {
+                if (iv == v) {
+                    already = true;
+                    break;
+                }
+            }
+            if (!already) count += 1;
+        }
+
+        if (count == 0) return &.{};
+        const result = try self.allocator.alloc(u64, count);
+        var i: usize = 0;
+        for (voters) |v| {
+            if (v != self.id) {
+                result[i] = v;
+                i += 1;
+            }
+        }
+        for (outgoing) |v| {
+            if (v == self.id) continue;
+            var already = false;
+            for (voters) |iv| {
+                if (iv == v) {
+                    already = true;
+                    break;
+                }
+            }
+            if (!already) {
+                result[i] = v;
+                i += 1;
+            }
+        }
+        return result;
+    }
+
     /// Propose a command to the replicated log.
     /// Returns `error.NotLeader` if this node is not the current leader.
     /// On error, the caller can read `self.leader_id` to discover the
     /// current known leader (may be `null` if unknown, e.g. during election).
-    pub fn propose(self: *RaftNode, data: []const u8) error{NotLeader}!void {
+    pub fn propose(self: *RaftNode, data: []const u8) !void {
         if (self.role != .leader) return error.NotLeader;
+        if (self.config.max_entry_size > 0 and data.len > self.config.max_entry_size)
+            return error.EntryTooLarge;
 
         const entry = rpc.Entry{
             .index = self.log.lastIndex() + 1,
@@ -128,17 +211,31 @@ pub const RaftNode = struct {
             .data = data,
         };
         // log.append internally duplicates data, no need to pre-copy.
-        self.log.append(&.{entry}) catch {};
+        try self.log.append(&.{entry});
     }
 
     pub fn proposeConfigChange(self: *RaftNode, new_peers: []const u64) !void {
         if (self.role != .leader) return error.NotLeader;
+
+        // Pre-validate serialized size against max_entry_size BEFORE mutating
+        // membership state (SEC-0029). Joint config format:
+        //   [0x01][new_count: u32][new u64s...][old_count: u32][old u64s...]
+        if (self.config.max_entry_size > 0) {
+            const current_voter_count = self.membership_state.voters.items.len;
+            const new_size = std.math.mul(usize, new_peers.len, 8) catch return error.EntryTooLarge;
+            const old_size = std.math.mul(usize, current_voter_count, 8) catch return error.EntryTooLarge;
+            const total = std.math.add(usize, 1 + 4 + 4, std.math.add(usize, new_size, old_size) catch return error.EntryTooLarge) catch return error.EntryTooLarge;
+            if (total > self.config.max_entry_size) {
+                return error.EntryTooLarge;
+            }
+        }
 
         const entry = try self.membership_state.proposeChange(
             new_peers,
             self.current_term,
             self.log.lastIndex() + 1,
         );
+
         try self.log.append(&.{entry});
         self.pending_config_index = entry.index;
     }
@@ -146,8 +243,40 @@ pub const RaftNode = struct {
     /// Process an inbound RPC message from another node.
     /// When `task` is non-null, spice parallelism may be used for
     /// read-only operations (e.g. building AppendEntries responses).
+    ///
+    /// NOTE: This library validates that `from` matches the sender ID
+    /// embedded in messages (e.g. candidate_id, leader_id) where applicable.
+    /// However, the `from` parameter itself is supplied by the transport layer.
+    /// Transport implementations MUST authenticate peers (e.g. via mTLS or
+    /// HMAC-signed messages) to prevent impersonation attacks.
     pub fn step(self: *RaftNode, from: u64, msg: rpc.Message, task: ?*spice.Task) !void {
         _ = task; // Reserved for future parallel response construction.
+
+        // Validate that the transport-provided sender matches the message's
+        // internal sender field to prevent spoofed/misrouted messages.
+        switch (msg) {
+            .request_vote => |rv| {
+                if (rv.candidate_id != from) {
+                    std.log.warn("raft: sender mismatch in RequestVote: from={d} candidate_id={d}", .{ from, rv.candidate_id });
+                    return;
+                }
+            },
+            .append_entries => |ae| {
+                if (ae.leader_id != from) {
+                    std.log.warn("raft: sender mismatch in AppendEntries: from={d} leader_id={d}", .{ from, ae.leader_id });
+                    return;
+                }
+            },
+            .install_snapshot => |is| {
+                if (is.leader_id != from) {
+                    std.log.warn("raft: sender mismatch in InstallSnapshot: from={d} leader_id={d}", .{ from, is.leader_id });
+                    return;
+                }
+            },
+            // Response messages don't carry a sender ID — rely on transport.
+            .request_vote_response, .append_entries_response, .install_snapshot_response => {},
+        }
+
         switch (msg) {
             .request_vote => |rv| try self.handleRequestVote(from, rv),
             .request_vote_response => |rvr| try self.handleRequestVoteResponse(from, rvr),
@@ -171,12 +300,12 @@ pub const RaftNode = struct {
 
             // Check if joint config committed and needs phase-2.
             if (self.membership_state.is_joint and self.pending_config_index > 0 and self.log.committed >= self.pending_config_index) {
-                const final_entry = self.membership_state.finalizeChange(
+                const final_entry = try self.membership_state.finalizeChange(
                     self.current_term,
                     self.log.lastIndex() + 1,
                 );
                 if (final_entry) |entry| {
-                    self.log.append(&.{entry}) catch {};
+                    try self.log.append(&.{entry});
                     self.pending_config_index = 0;
                 }
             }
@@ -197,15 +326,15 @@ pub const RaftNode = struct {
         }
     }
 
-    pub fn ready(self: *RaftNode) rd.Ready {
+    pub fn ready(self: *RaftNode) !rd.Ready {
         // Collect committed entries.
         if (self.log.committed > self.log.applied) {
-            const entries = self.log.slice(
+            const entries = try self.log.slice(
                 self.log.applied + 1,
                 self.log.committed + 1,
-            ) catch &[_]rpc.Entry{};
+            );
 
-            self.ready_state.addCommittedEntries(entries) catch {};
+            try self.ready_state.addCommittedEntries(entries);
 
             // Free the slice allocated by log.slice() — entries have been copied into ready_state.
             if (entries.len > 0) {
@@ -218,7 +347,7 @@ pub const RaftNode = struct {
             self.ready_state.setShouldSnapshot(true);
         }
 
-        return self.ready_state.ready(self.currentHardState());
+        return try self.ready_state.ready(self.currentHardState());
     }
 
     pub fn advance(self: *RaftNode) !void {
@@ -237,7 +366,7 @@ pub const RaftNode = struct {
 
         // Mark committed entries as applied.
         if (self.log.committed > self.log.applied) {
-            self.log.appliedTo(self.log.committed);
+            try self.log.appliedTo(self.log.committed);
         }
 
         // Advance ready state.
@@ -292,10 +421,12 @@ pub const RaftNode = struct {
         self.leader_id = self.id;
         self.is_pre_vote_election = false;
 
-        // Initialize replication_state with all peers.
+        // Initialize replication_state with dynamic voters (SEC-0044).
+        const peers = try self.dynamicPeers();
+        defer if (peers.len > 0) self.allocator.free(peers);
         self.replication_state = try repl.ReplicationState.init(
             self.allocator,
-            self.config.peers,
+            peers,
             self.log.lastIndex(),
         );
 
@@ -329,8 +460,12 @@ pub const RaftNode = struct {
         self.election_state.resetVotes();
         try self.election_state.recordVote(self.id, true);
 
+        // Use dynamic voters for election (SEC-0044).
+        const peers = try self.dynamicPeers();
+        defer if (peers.len > 0) self.allocator.free(peers);
+
         // Single-node cluster: become leader immediately.
-        if (self.config.peers.len == 0) {
+        if (peers.len == 0) {
             if (pre_vote) {
                 // Pre-vote succeeded (self-only), start real election.
                 try self.startElection(false, task);
@@ -350,7 +485,7 @@ pub const RaftNode = struct {
             .pre_vote = pre_vote,
         } };
 
-        for (self.config.peers) |peer| {
+        for (peers) |peer| {
             self.sendMsg(peer, msg);
         }
     }
@@ -434,6 +569,22 @@ pub const RaftNode = struct {
 
         self.election_state.resetElectionElapsed();
 
+        // Reject if any entry exceeds max_entry_size.
+        if (self.config.max_entry_size > 0) {
+            for (msg.entries) |entry| {
+                if (entry.data.len > self.config.max_entry_size) {
+                    self.sendMsg(msg.leader_id, rpc.Message{ .append_entries_response = .{
+                        .term = self.current_term,
+                        .success = false,
+                        .match_index = 0,
+                        .conflict_index = 0,
+                        .conflict_term = 0,
+                    } });
+                    return;
+                }
+            }
+        }
+
         const result = try self.log.maybeAppend(
             msg.prev_log_index,
             msg.prev_log_term,
@@ -509,7 +660,10 @@ pub const RaftNode = struct {
         self.becomeFollower(msg.term, msg.leader_id);
         self.election_state.resetElectionElapsed();
 
-        const result = self.snapshot_state.receiveChunk(msg) catch {
+        const result = self.snapshot_state.receiveChunk(msg) catch |err| {
+            std.log.warn("InstallSnapshot from leader {d} failed: {s}", .{
+                msg.leader_id, @errorName(err),
+            });
             self.sendMsg(msg.leader_id, rpc.Message{ .install_snapshot_response = .{
                 .term = self.current_term,
                 .success = false,
@@ -541,11 +695,14 @@ pub const RaftNode = struct {
     fn sendHeartbeats(self: *RaftNode, task: ?*spice.Task) !void {
         var rs = &(self.replication_state orelse return);
 
+        // Use dynamic voters instead of static config.peers (SEC-0044).
+        const peers = try self.dynamicPeers();
+        defer if (peers.len > 0) self.allocator.free(peers);
+
         if (task) |t| {
             // Parallel path: fork one Future per peer, then join and send.
             // Results are written into a shared array because rpc.Message
             // exceeds spice's 32-byte Future return slot.
-            const peers = self.config.peers;
             const futures = try self.allocator.alloc(BuildAEFuture, peers.len);
             defer self.allocator.free(futures);
             const results = try self.allocator.alloc(?rpc.Message, peers.len);
@@ -592,7 +749,7 @@ pub const RaftNode = struct {
             }
         } else {
             // Sequential path: build and send one at a time.
-            for (self.config.peers) |peer| {
+            for (peers) |peer| {
                 const msg = rs.buildAppendEntries(
                     peer,
                     &self.log,
@@ -661,7 +818,7 @@ pub const RaftNode = struct {
                 cfg.voters_outgoing,
                 self.current_term,
                 self.id,
-            );
+            ) catch return;
         }
     }
 
@@ -847,4 +1004,59 @@ test "step with higher term becomes follower" {
     try std.testing.expectEqual(st.Role.follower, node.role);
     try std.testing.expectEqual(leader_term + 5, node.current_term);
     try std.testing.expectEqual(@as(?u64, 2), node.leader_id);
+}
+
+test "proposeConfigChange rejects oversized entry without corrupting state (SEC-0029)" {
+    var mem_store = stg.InMemoryStorage.init(std.testing.allocator);
+    defer mem_store.deinit();
+
+    // Set max_entry_size very small so that a joint config entry exceeds it.
+    var node = try RaftNode.init(std.testing.allocator, .{
+        .id = 1,
+        .peers = &.{},
+        .election_tick = 5,
+        .rng_seed = 42,
+        .pre_vote = false,
+        .max_entry_size = 10, // Tiny: joint config for {1}+{2,3,4} = 1+4+8+4+3*8 = 41 bytes
+    }, mem_store.storage());
+    defer node.deinit();
+
+    // Become leader.
+    var i: u32 = 0;
+    while (i < 20) : (i += 1) {
+        try node.tick(null);
+        if (node.role == .leader) break;
+    }
+    try std.testing.expectEqual(st.Role.leader, node.role);
+
+    // Capture state before the rejected proposal.
+    const voters_before = node.membership_state.voters.items.len;
+    const is_joint_before = node.membership_state.is_joint;
+    const pending_before = node.membership_state.pending_config_change;
+    const log_last_before = node.log.lastIndex();
+
+    // This should fail with EntryTooLarge, NOT corrupt membership state.
+    const result = node.proposeConfigChange(&.{ 2, 3, 4 });
+    try std.testing.expectError(error.EntryTooLarge, result);
+
+    // Verify membership state is unchanged (SEC-0029: no corruption).
+    try std.testing.expectEqual(voters_before, node.membership_state.voters.items.len);
+    try std.testing.expectEqual(is_joint_before, node.membership_state.is_joint);
+    try std.testing.expectEqual(pending_before, node.membership_state.pending_config_change);
+    try std.testing.expectEqual(log_last_before, node.log.lastIndex());
+}
+
+test "Config.validate rejects duplicate peer IDs (SEC-0033)" {
+    const cfg = Config{ .id = 1, .peers = &.{ 2, 3, 2 } };
+    try std.testing.expectError(ConfigError.DuplicatePeerId, cfg.validate());
+}
+
+test "Config.validate rejects self in peers (SEC-0033)" {
+    const cfg = Config{ .id = 1, .peers = &.{ 1, 2, 3 } };
+    try std.testing.expectError(ConfigError.SelfInPeers, cfg.validate());
+}
+
+test "Config.validate accepts valid unique peers (SEC-0033)" {
+    const cfg = Config{ .id = 1, .peers = &.{ 2, 3, 4 } };
+    try cfg.validate();
 }

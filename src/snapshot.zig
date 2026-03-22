@@ -5,9 +5,14 @@ const std = @import("std");
 const rpc = @import("rpc.zig");
 const stg = @import("storage.zig");
 
+const zero_checksum: [32]u8 = .{0} ** 32;
+
 pub const SnapshotError = error{
     ChecksumMismatch,
     UnexpectedOffset,
+    StaleSnapshot,
+    SnapshotTooLarge,
+    InvalidSnapshotConfig,
 };
 
 const PendingSnapshot = struct {
@@ -15,6 +20,15 @@ const PendingSnapshot = struct {
     last_included_index: u64,
     last_included_term: u64,
     expected_offset: u64,
+    /// Owned copy of voter IDs from the snapshot config (SEC-0030).
+    config_voters: std.ArrayList(u64),
+    config_voters_outgoing: std.ArrayList(u64),
+    config_is_joint: bool,
+
+    fn deinitConfig(self: *PendingSnapshot, allocator: std.mem.Allocator) void {
+        self.config_voters.deinit(allocator);
+        self.config_voters_outgoing.deinit(allocator);
+    }
 };
 
 pub const SnapshotState = struct {
@@ -22,6 +36,7 @@ pub const SnapshotState = struct {
     snapshot_term: u64,
     snapshot_threshold: u32,
     chunk_size: usize,
+    max_snapshot_size: u64,
     pending_snapshot: ?PendingSnapshot,
     allocator: std.mem.Allocator,
 
@@ -29,12 +44,14 @@ pub const SnapshotState = struct {
         allocator: std.mem.Allocator,
         threshold: u32,
         chunk_size: usize,
+        max_snapshot_size: u64,
     ) SnapshotState {
         return .{
             .snapshot_index = 0,
             .snapshot_term = 0,
             .snapshot_threshold = threshold,
             .chunk_size = chunk_size,
+            .max_snapshot_size = max_snapshot_size,
             .pending_snapshot = null,
             .allocator = allocator,
         };
@@ -43,6 +60,7 @@ pub const SnapshotState = struct {
     pub fn deinit(self: *SnapshotState) void {
         if (self.pending_snapshot) |*pending| {
             pending.data.deinit(self.allocator);
+            pending.deinitConfig(self.allocator);
             self.pending_snapshot = null;
         }
     }
@@ -77,6 +95,8 @@ pub const SnapshotState = struct {
 
     /// Build InstallSnapshot messages (chunks) for sending to a lagging follower.
     /// Returns a list of Message values, each containing one chunk.
+    const Blake3 = std.crypto.hash.Blake3;
+
     pub fn buildInstallSnapshotMessages(
         self: *SnapshotState,
         snapshot: rpc.Snapshot,
@@ -84,7 +104,12 @@ pub const SnapshotState = struct {
         leader_id: u64,
     ) ![]rpc.Message {
         const data = snapshot.data;
-        const crc = std.hash.Crc32.hash(data);
+
+        // Compute BLAKE3 digest of the full snapshot data.
+        var hasher = Blake3.init(.{});
+        hasher.update(data);
+        var digest: [32]u8 = undefined;
+        hasher.final(&digest);
 
         const num_chunks = if (data.len == 0) 1 else (data.len + self.chunk_size - 1) / self.chunk_size;
         const messages = try self.allocator.alloc(rpc.Message, num_chunks);
@@ -103,7 +128,8 @@ pub const SnapshotState = struct {
                 .offset = @intCast(offset),
                 .data = chunk_data,
                 .done = is_last,
-                .checksum = if (is_last) crc else 0,
+                .checksum = if (is_last) digest else zero_checksum,
+                .config = snapshot.metadata.config,
             } };
 
             offset = end;
@@ -117,15 +143,37 @@ pub const SnapshotState = struct {
     /// Returns error on CRC mismatch or out-of-order chunk.
     pub fn receiveChunk(self: *SnapshotState, msg: rpc.InstallSnapshot) !?rpc.Snapshot {
         if (msg.offset == 0) {
+            // Reject snapshots that would move us backwards.
+            if (msg.last_included_index <= self.snapshot_index) {
+                return SnapshotError.StaleSnapshot;
+            }
+
             // Start a new pending snapshot (reset existing if any).
             if (self.pending_snapshot) |*pending| {
                 pending.data.deinit(self.allocator);
+                pending.deinitConfig(self.allocator);
             }
+
+            // Validate incoming config (SEC-0043): reject empty voter sets and duplicates.
+            try validateSnapshotConfig(msg.config);
+
+            // Copy config voter IDs into owned storage (SEC-0030).
+            var config_voters = std.ArrayList(u64){};
+            errdefer config_voters.deinit(self.allocator);
+            try config_voters.appendSlice(self.allocator, msg.config.voters);
+
+            var config_voters_outgoing = std.ArrayList(u64){};
+            errdefer config_voters_outgoing.deinit(self.allocator);
+            try config_voters_outgoing.appendSlice(self.allocator, msg.config.voters_outgoing);
+
             self.pending_snapshot = .{
                 .data = .{},
                 .last_included_index = msg.last_included_index,
                 .last_included_term = msg.last_included_term,
                 .expected_offset = 0,
+                .config_voters = config_voters,
+                .config_voters_outgoing = config_voters_outgoing,
+                .config_is_joint = msg.config.is_joint,
             };
         }
 
@@ -137,24 +185,37 @@ pub const SnapshotState = struct {
 
         try pending.data.appendSlice(self.allocator, msg.data);
 
+        // Enforce max_snapshot_size (0 = unlimited).
+        if (self.max_snapshot_size > 0 and pending.data.items.len > self.max_snapshot_size) {
+            self.clearPending();
+            return SnapshotError.SnapshotTooLarge;
+        }
+
         if (msg.done) {
             const assembled = pending.data.items;
-            const crc = std.hash.Crc32.hash(assembled);
-            if (crc != msg.checksum) {
+            var hasher = Blake3.init(.{});
+            hasher.update(assembled);
+            var digest: [32]u8 = undefined;
+            hasher.final(&digest);
+            if (!std.mem.eql(u8, &digest, &msg.checksum)) {
+                self.clearPending();
                 return SnapshotError.ChecksumMismatch;
             }
 
-            // Transfer ownership of the buffer to the caller via toOwnedSlice.
+            // Transfer ownership of buffers to the caller via toOwnedSlice.
             const owned_data = try pending.data.toOwnedSlice(self.allocator);
+            const owned_voters = try pending.config_voters.toOwnedSlice(self.allocator);
+            const owned_voters_outgoing = try pending.config_voters_outgoing.toOwnedSlice(self.allocator);
 
+            // Use the owned config copied from the first chunk (SEC-0030).
             const snapshot = rpc.Snapshot{
                 .metadata = .{
                     .index = pending.last_included_index,
                     .term = pending.last_included_term,
                     .config = .{
-                        .voters = &.{},
-                        .voters_outgoing = &.{},
-                        .is_joint = false,
+                        .voters = owned_voters,
+                        .voters_outgoing = owned_voters_outgoing,
+                        .is_joint = pending.config_is_joint,
                     },
                 },
                 .data = owned_data,
@@ -175,15 +236,56 @@ pub const SnapshotState = struct {
     pub fn clearPending(self: *SnapshotState) void {
         if (self.pending_snapshot) |*pending| {
             pending.data.deinit(self.allocator);
+            pending.deinitConfig(self.allocator);
             self.pending_snapshot = null;
         }
     }
 };
 
+/// Validate a snapshot config received from a peer (SEC-0043).
+/// Rejects empty voter sets and duplicate voter IDs, matching the
+/// checks in Config.validate() (SEC-0033).
+fn validateSnapshotConfig(cfg: rpc.ClusterConfig) SnapshotError!void {
+    // Must have at least one voter.
+    if (cfg.voters.len == 0) return SnapshotError.InvalidSnapshotConfig;
+
+    // Check for duplicates in voters.
+    for (cfg.voters, 0..) |v, i| {
+        if (v == 0) return SnapshotError.InvalidSnapshotConfig;
+        for (cfg.voters[0..i]) |prev| {
+            if (v == prev) return SnapshotError.InvalidSnapshotConfig;
+        }
+    }
+
+    // Check for duplicates in voters_outgoing.
+    for (cfg.voters_outgoing, 0..) |v, i| {
+        if (v == 0) return SnapshotError.InvalidSnapshotConfig;
+        for (cfg.voters_outgoing[0..i]) |prev| {
+            if (v == prev) return SnapshotError.InvalidSnapshotConfig;
+        }
+    }
+}
+
 // --- Tests ---
 
+/// Test helper: default config for snapshot test messages.
+const test_config = rpc.ClusterConfig{
+    .voters = &[_]u64{ 1, 2, 3 },
+    .voters_outgoing = &.{},
+    .is_joint = false,
+};
+
+/// Test helper: compute BLAKE3 hash of data.
+fn blake3Hash(data: []const u8) [32]u8 {
+    var hasher = std.crypto.hash.Blake3.init(.{});
+    hasher.update(data);
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
 test "shouldSnapshot returns true when threshold exceeded" {
-    const ss = SnapshotState.init(std.testing.allocator, 100, 1024);
+    const ss = SnapshotState.init(std.testing.allocator, 100, 1024, 0);
     try std.testing.expect(!ss.shouldSnapshot(50));
     try std.testing.expect(!ss.shouldSnapshot(99));
     try std.testing.expect(ss.shouldSnapshot(100));
@@ -191,7 +293,7 @@ test "shouldSnapshot returns true when threshold exceeded" {
 }
 
 test "createLocalSnapshot creates correct metadata and updates state" {
-    var ss = SnapshotState.init(std.testing.allocator, 100, 1024);
+    var ss = SnapshotState.init(std.testing.allocator, 100, 1024, 0);
     const data = "snapshot-payload";
     const config = rpc.ClusterConfig{
         .voters = &[_]u64{ 1, 2, 3 },
@@ -209,7 +311,7 @@ test "createLocalSnapshot creates correct metadata and updates state" {
 }
 
 test "buildInstallSnapshotMessages single chunk for small data" {
-    var ss = SnapshotState.init(std.testing.allocator, 100, 1024);
+    var ss = SnapshotState.init(std.testing.allocator, 100, 1024, 0);
     defer ss.deinit();
 
     const snap = rpc.Snapshot{
@@ -230,12 +332,12 @@ test "buildInstallSnapshotMessages single chunk for small data" {
     try std.testing.expectEqual(@as(u64, 1), is.leader_id);
     try std.testing.expectEqual(@as(u64, 0), is.offset);
     try std.testing.expect(is.done);
-    try std.testing.expectEqual(std.hash.Crc32.hash("small"), is.checksum);
+    try std.testing.expectEqualSlices(u8, &blake3Hash("small"), &is.checksum);
     try std.testing.expectEqualStrings("small", is.data);
 }
 
 test "buildInstallSnapshotMessages multiple chunks with correct offsets and CRC" {
-    var ss = SnapshotState.init(std.testing.allocator, 100, 4);
+    var ss = SnapshotState.init(std.testing.allocator, 100, 4, 0);
     defer ss.deinit();
 
     const snap = rpc.Snapshot{
@@ -256,7 +358,7 @@ test "buildInstallSnapshotMessages multiple chunks with correct offsets and CRC"
     try std.testing.expectEqual(@as(u64, 0), msgs[0].install_snapshot.offset);
     try std.testing.expectEqualStrings("Hell", msgs[0].install_snapshot.data);
     try std.testing.expect(!msgs[0].install_snapshot.done);
-    try std.testing.expectEqual(@as(u32, 0), msgs[0].install_snapshot.checksum);
+    try std.testing.expectEqualSlices(u8, &zero_checksum, &msgs[0].install_snapshot.checksum);
 
     // Chunk 1
     try std.testing.expectEqual(@as(u64, 4), msgs[1].install_snapshot.offset);
@@ -267,15 +369,15 @@ test "buildInstallSnapshotMessages multiple chunks with correct offsets and CRC"
     try std.testing.expectEqual(@as(u64, 8), msgs[2].install_snapshot.offset);
     try std.testing.expectEqualStrings("ld!", msgs[2].install_snapshot.data);
     try std.testing.expect(msgs[2].install_snapshot.done);
-    try std.testing.expectEqual(std.hash.Crc32.hash("HelloWorld!"), msgs[2].install_snapshot.checksum);
+    try std.testing.expectEqualSlices(u8, &blake3Hash("HelloWorld!"), &msgs[2].install_snapshot.checksum);
 }
 
-test "receiveChunk assembles multiple chunks and verifies CRC" {
-    var ss = SnapshotState.init(std.testing.allocator, 100, 1024);
+test "receiveChunk assembles multiple chunks and verifies BLAKE3" {
+    var ss = SnapshotState.init(std.testing.allocator, 100, 1024, 0);
     defer ss.deinit();
 
     const full_data = "HelloWorld!";
-    const crc = std.hash.Crc32.hash(full_data);
+    const digest = blake3Hash(full_data);
 
     // Chunk 1: offset 0, not done
     const r1 = try ss.receiveChunk(.{
@@ -286,7 +388,8 @@ test "receiveChunk assembles multiple chunks and verifies CRC" {
         .offset = 0,
         .data = "Hello",
         .done = false,
-        .checksum = 0,
+        .checksum = zero_checksum,
+        .config = test_config,
     });
     try std.testing.expect(r1 == null);
 
@@ -299,11 +402,12 @@ test "receiveChunk assembles multiple chunks and verifies CRC" {
         .offset = 5,
         .data = "World",
         .done = false,
-        .checksum = 0,
+        .checksum = zero_checksum,
+        .config = test_config,
     });
     try std.testing.expect(r2 == null);
 
-    // Chunk 3: offset 10, done with CRC
+    // Chunk 3: offset 10, done with BLAKE3 digest
     const r3 = try ss.receiveChunk(.{
         .term = 1,
         .leader_id = 1,
@@ -312,7 +416,8 @@ test "receiveChunk assembles multiple chunks and verifies CRC" {
         .offset = 10,
         .data = "!",
         .done = true,
-        .checksum = crc,
+        .checksum = digest,
+        .config = test_config,
     });
     try std.testing.expect(r3 != null);
     const snap = r3.?;
@@ -322,13 +427,23 @@ test "receiveChunk assembles multiple chunks and verifies CRC" {
     try std.testing.expectEqual(@as(u64, 10), ss.snapshot_index);
     try std.testing.expectEqual(@as(u64, 2), ss.snapshot_term);
 
+    // Verify config is preserved through chunked transfer (SEC-0030).
+    try std.testing.expectEqual(@as(usize, 3), snap.metadata.config.voters.len);
+    try std.testing.expectEqual(@as(u64, 1), snap.metadata.config.voters[0]);
+    try std.testing.expectEqual(@as(u64, 2), snap.metadata.config.voters[1]);
+    try std.testing.expectEqual(@as(u64, 3), snap.metadata.config.voters[2]);
+    try std.testing.expect(!snap.metadata.config.is_joint);
+
     // The assembled data buffer is owned by the ArrayList that was moved
     // into the snapshot. We need to free it manually since pending was cleared.
     defer ss.allocator.free(snap.data);
+    // Free owned config voter slices transferred from PendingSnapshot.
+    defer if (snap.metadata.config.voters.len > 0) ss.allocator.free(snap.metadata.config.voters);
+    defer if (snap.metadata.config.voters_outgoing.len > 0) ss.allocator.free(snap.metadata.config.voters_outgoing);
 }
 
-test "receiveChunk CRC mismatch returns error" {
-    var ss = SnapshotState.init(std.testing.allocator, 100, 1024);
+test "receiveChunk checksum mismatch returns error" {
+    var ss = SnapshotState.init(std.testing.allocator, 100, 1024, 0);
     defer ss.deinit();
 
     _ = try ss.receiveChunk(.{
@@ -339,9 +454,13 @@ test "receiveChunk CRC mismatch returns error" {
         .offset = 0,
         .data = "data",
         .done = false,
-        .checksum = 0,
+        .checksum = zero_checksum,
+        .config = test_config,
     });
 
+    // Send a bad checksum (all 0xFF bytes).
+    var bad_checksum: [32]u8 = .{0xFF} ** 32;
+    _ = &bad_checksum;
     const result = ss.receiveChunk(.{
         .term = 1,
         .leader_id = 1,
@@ -350,7 +469,8 @@ test "receiveChunk CRC mismatch returns error" {
         .offset = 4,
         .data = "more",
         .done = true,
-        .checksum = 0xDEADBEEF,
+        .checksum = bad_checksum,
+        .config = test_config,
     });
 
     try std.testing.expectError(SnapshotError.ChecksumMismatch, result);
@@ -360,7 +480,7 @@ test "receiveChunk CRC mismatch returns error" {
 }
 
 test "receiveChunk out-of-order offset returns error" {
-    var ss = SnapshotState.init(std.testing.allocator, 100, 1024);
+    var ss = SnapshotState.init(std.testing.allocator, 100, 1024, 0);
     defer ss.deinit();
 
     _ = try ss.receiveChunk(.{
@@ -371,7 +491,8 @@ test "receiveChunk out-of-order offset returns error" {
         .offset = 0,
         .data = "hello",
         .done = false,
-        .checksum = 0,
+        .checksum = zero_checksum,
+        .config = test_config,
     });
 
     // Offset should be 5, but we send 10
@@ -383,7 +504,8 @@ test "receiveChunk out-of-order offset returns error" {
         .offset = 10,
         .data = "bad",
         .done = false,
-        .checksum = 0,
+        .checksum = zero_checksum,
+        .config = test_config,
     });
 
     try std.testing.expectError(SnapshotError.UnexpectedOffset, result);
@@ -391,7 +513,7 @@ test "receiveChunk out-of-order offset returns error" {
 }
 
 test "clearPending resets receive state" {
-    var ss = SnapshotState.init(std.testing.allocator, 100, 1024);
+    var ss = SnapshotState.init(std.testing.allocator, 100, 1024, 0);
     defer ss.deinit();
 
     _ = try ss.receiveChunk(.{
@@ -402,10 +524,138 @@ test "clearPending resets receive state" {
         .offset = 0,
         .data = "partial",
         .done = false,
-        .checksum = 0,
+        .checksum = zero_checksum,
+        .config = test_config,
     });
 
     try std.testing.expect(ss.pending_snapshot != null);
     ss.clearPending();
     try std.testing.expect(ss.pending_snapshot == null);
+}
+
+test "receiveChunk rejects stale snapshot" {
+    var ss = SnapshotState.init(std.testing.allocator, 100, 1024, 0);
+    defer ss.deinit();
+
+    // Simulate an existing snapshot at index 10.
+    ss.snapshot_index = 10;
+    ss.snapshot_term = 2;
+
+    // Attempt to receive a snapshot with index <= current snapshot_index.
+    const result = ss.receiveChunk(.{
+        .term = 2,
+        .leader_id = 1,
+        .last_included_index = 10,
+        .last_included_term = 2,
+        .offset = 0,
+        .data = "stale",
+        .done = true,
+        .checksum = zero_checksum,
+        .config = test_config,
+    });
+    try std.testing.expectError(SnapshotError.StaleSnapshot, result);
+
+    // A newer snapshot should be accepted.
+    const digest = blake3Hash("fresh");
+    const snap = try ss.receiveChunk(.{
+        .term = 3,
+        .leader_id = 1,
+        .last_included_index = 15,
+        .last_included_term = 3,
+        .offset = 0,
+        .data = "fresh",
+        .done = true,
+        .checksum = digest,
+        .config = test_config,
+    });
+    try std.testing.expect(snap != null);
+    try std.testing.expectEqual(@as(u64, 15), ss.snapshot_index);
+    defer ss.allocator.free(snap.?.data);
+    defer if (snap.?.metadata.config.voters.len > 0) ss.allocator.free(snap.?.metadata.config.voters);
+    defer if (snap.?.metadata.config.voters_outgoing.len > 0) ss.allocator.free(snap.?.metadata.config.voters_outgoing);
+}
+
+test "receiveChunk rejects invalid snapshot config (SEC-0043)" {
+    var ss = SnapshotState.init(std.testing.allocator, 100, 1024, 0);
+    defer ss.deinit();
+
+    // Empty voter set should be rejected.
+    const empty_config = rpc.ClusterConfig{
+        .voters = &.{},
+        .voters_outgoing = &.{},
+        .is_joint = false,
+    };
+    const empty_result = ss.receiveChunk(.{
+        .term = 1,
+        .leader_id = 1,
+        .last_included_index = 5,
+        .last_included_term = 1,
+        .offset = 0,
+        .data = "data",
+        .done = true,
+        .checksum = zero_checksum,
+        .config = empty_config,
+    });
+    try std.testing.expectError(SnapshotError.InvalidSnapshotConfig, empty_result);
+
+    // Duplicate voter IDs should be rejected.
+    const dup_config = rpc.ClusterConfig{
+        .voters = &[_]u64{ 1, 2, 1 },
+        .voters_outgoing = &.{},
+        .is_joint = false,
+    };
+    const dup_result = ss.receiveChunk(.{
+        .term = 1,
+        .leader_id = 1,
+        .last_included_index = 5,
+        .last_included_term = 1,
+        .offset = 0,
+        .data = "data",
+        .done = true,
+        .checksum = zero_checksum,
+        .config = dup_config,
+    });
+    try std.testing.expectError(SnapshotError.InvalidSnapshotConfig, dup_result);
+
+    // Zero voter ID should be rejected.
+    const zero_id_config = rpc.ClusterConfig{
+        .voters = &[_]u64{ 0, 2, 3 },
+        .voters_outgoing = &.{},
+        .is_joint = false,
+    };
+    const zero_result = ss.receiveChunk(.{
+        .term = 1,
+        .leader_id = 1,
+        .last_included_index = 5,
+        .last_included_term = 1,
+        .offset = 0,
+        .data = "data",
+        .done = true,
+        .checksum = zero_checksum,
+        .config = zero_id_config,
+    });
+    try std.testing.expectError(SnapshotError.InvalidSnapshotConfig, zero_result);
+
+    // Valid config should be accepted.
+    const valid_config = rpc.ClusterConfig{
+        .voters = &[_]u64{ 1, 2, 3 },
+        .voters_outgoing = &.{},
+        .is_joint = false,
+    };
+    const digest = blake3Hash("valid-data");
+    const valid_result = try ss.receiveChunk(.{
+        .term = 1,
+        .leader_id = 1,
+        .last_included_index = 5,
+        .last_included_term = 1,
+        .offset = 0,
+        .data = "valid-data",
+        .done = true,
+        .checksum = digest,
+        .config = valid_config,
+    });
+    try std.testing.expect(valid_result != null);
+    defer ss.allocator.free(valid_result.?.data);
+    defer if (valid_result.?.metadata.config.voters.len > 0) ss.allocator.free(valid_result.?.metadata.config.voters);
+    defer if (valid_result.?.metadata.config.voters_outgoing.len > 0) ss.allocator.free(valid_result.?.metadata.config.voters_outgoing);
 }

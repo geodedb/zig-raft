@@ -56,6 +56,7 @@ pub const MembershipState = struct {
     /// Start a config change: creates a joint config Entry.
     /// Returns error.ConfigChangePending if one is already in progress.
     pub fn proposeChange(self: *MembershipState, new_voters: []const u64, current_term: u64, index: u64) !rpc.Entry {
+        if (new_voters.len == 0) return error.InvalidData;
         if (self.pending_config_change) return MembershipError.ConfigChangePending;
 
         self.pending_config_change = true;
@@ -81,14 +82,15 @@ pub const MembershipState = struct {
 
     /// After joint config commits, produce the phase-2 (new-only) config entry.
     /// Returns null if not in joint consensus.
-    pub fn finalizeChange(self: *MembershipState, current_term: u64, index: u64) ?rpc.Entry {
+    /// Propagates serialization errors (including OOM) instead of swallowing (SEC-0034).
+    pub fn finalizeChange(self: *MembershipState, current_term: u64, index: u64) !?rpc.Entry {
         if (!self.is_joint) return null;
 
         self.voters_outgoing.clearAndFree(self.allocator);
         self.is_joint = false;
         self.pending_config_change = false;
 
-        const data = serializeFinal(self.allocator, self.voters.items) catch return null;
+        const data = try serializeFinal(self.allocator, self.voters.items);
         return .{
             .index = index,
             .term = current_term,
@@ -126,7 +128,11 @@ pub const MembershipState = struct {
 
     /// Serialize a joint config: [0x01][new_count: u32 LE][new u64s...][old_count: u32 LE][old u64s...]
     fn serializeJoint(allocator: std.mem.Allocator, new_voters: []const u64, old_voters: []const u64) ![]u8 {
-        const size = 1 + 4 + (new_voters.len * 8) + 4 + (old_voters.len * 8);
+        if (new_voters.len > std.math.maxInt(u32) or old_voters.len > std.math.maxInt(u32))
+            return error.InvalidData;
+        const new_size = std.math.mul(usize, new_voters.len, 8) catch return error.InvalidData;
+        const old_size = std.math.mul(usize, old_voters.len, 8) catch return error.InvalidData;
+        const size = 1 + 4 + new_size + 4 + old_size;
         const buf = try allocator.alloc(u8, size);
         var offset: usize = 0;
 
@@ -152,7 +158,10 @@ pub const MembershipState = struct {
 
     /// Serialize a final config: [0x00][count: u32 LE][voter u64s...]
     fn serializeFinal(allocator: std.mem.Allocator, voters: []const u64) ![]u8 {
-        const size = 1 + 4 + (voters.len * 8);
+        if (voters.len > std.math.maxInt(u32))
+            return error.InvalidData;
+        const voters_size = std.math.mul(usize, voters.len, 8) catch return error.InvalidData;
+        const size = 1 + 4 + voters_size;
         const buf = try allocator.alloc(u8, size);
         var offset: usize = 0;
 
@@ -192,17 +201,19 @@ pub const MembershipState = struct {
         const new_count: usize = @intCast(std.mem.readInt(u32, data[offset..][0..4], .little));
         offset += 4;
 
-        if (data.len < offset + new_count * 8) return error.InvalidData;
+        const new_bytes = std.math.mul(usize, new_count, 8) catch return error.InvalidData;
+        if (data.len < offset + new_bytes) return error.InvalidData;
         const new_voters = try readU64Slice(allocator, data[offset..], new_count);
         errdefer if (new_voters.len > 0) allocator.free(new_voters);
-        offset += new_count * 8;
+        offset += new_bytes;
 
         if (is_joint) {
             if (data.len < offset + 4) return error.InvalidData;
             const old_count: usize = @intCast(std.mem.readInt(u32, data[offset..][0..4], .little));
             offset += 4;
 
-            if (data.len < offset + old_count * 8) return error.InvalidData;
+            const old_bytes = std.math.mul(usize, old_count, 8) catch return error.InvalidData;
+            if (data.len < offset + old_bytes) return error.InvalidData;
             const old_voters = try readU64Slice(allocator, data[offset..], old_count);
 
             return .{ .voters = new_voters, .voters_outgoing = old_voters, .is_joint = true, .allocator = allocator };
@@ -223,6 +234,38 @@ pub const MembershipState = struct {
 
     pub fn serializeVoters(allocator: std.mem.Allocator, voters: []const u64) ![]u8 {
         return serializeFinal(allocator, voters);
+    }
+
+    /// Serialize a ClusterConfig to bytes. Uses the same format as proposeChange/finalizeChange:
+    /// joint: [0x01][new_count: u32 LE][new u64s...][old_count: u32 LE][old u64s...]
+    /// final: [0x00][count: u32 LE][voter u64s...]
+    /// Caller must free the returned slice.
+    pub fn serializeConfig(allocator: std.mem.Allocator, cfg: rpc.ClusterConfig) ![]u8 {
+        if (cfg.is_joint) {
+            return serializeJoint(allocator, cfg.voters, cfg.voters_outgoing);
+        } else {
+            return serializeFinal(allocator, cfg.voters);
+        }
+    }
+
+    /// Deserialize a ClusterConfig from bytes produced by serializeConfig.
+    /// Returns owned slices for voters/voters_outgoing that must be freed by the caller.
+    pub fn deserializeConfig(allocator: std.mem.Allocator, data: []const u8) !struct {
+        config: rpc.ClusterConfig,
+        voters_buf: []u64,
+        voters_outgoing_buf: []u64,
+    } {
+        const parsed = try deserializeVoters(allocator, data);
+        // Don't defer deinit — caller takes ownership of the buffers.
+        return .{
+            .config = .{
+                .voters = parsed.voters,
+                .voters_outgoing = parsed.voters_outgoing,
+                .is_joint = parsed.is_joint,
+            },
+            .voters_buf = parsed.voters,
+            .voters_outgoing_buf = parsed.voters_outgoing,
+        };
     }
 };
 
@@ -288,7 +331,7 @@ test "finalizeChange — produces final config entry, clears outgoing" {
     const joint_entry = try ms.proposeChange(&new_voters, 5, 10);
     defer allocator.free(joint_entry.data);
 
-    const final_entry = ms.finalizeChange(5, 11).?;
+    const final_entry = (try ms.finalizeChange(5, 11)).?;
     defer allocator.free(final_entry.data);
 
     try std.testing.expectEqual(rpc.EntryKind.config, final_entry.kind);
@@ -305,7 +348,7 @@ test "finalizeChange — returns null when not in joint consensus" {
     var ms = try MembershipState.init(allocator, &initial);
     defer ms.deinit();
 
-    try std.testing.expect(ms.finalizeChange(1, 1) == null);
+    try std.testing.expect((try ms.finalizeChange(1, 1)) == null);
 }
 
 test "shouldLeaderStepDown — true when leader not in new voters after finalize" {
@@ -318,7 +361,7 @@ test "shouldLeaderStepDown — true when leader not in new voters after finalize
     const joint_entry = try ms.proposeChange(&new_voters, 5, 10);
     defer allocator.free(joint_entry.data);
 
-    const final_entry = ms.finalizeChange(5, 11).?;
+    const final_entry = (try ms.finalizeChange(5, 11)).?;
     defer allocator.free(final_entry.data);
 
     // Leader 1 is not in new voters {2,3,4}, should step down.

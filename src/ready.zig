@@ -70,9 +70,9 @@ pub const ReadyState = struct {
     }
 
     /// Build Ready from accumulated state.
-    /// In debug mode, asserts that advance() was called on any previous Ready.
-    pub fn ready(self: *ReadyState, current_hs: state.HardState) Ready {
-        std.debug.assert(!self.has_pending_ready);
+    /// Returns error if advance() was not called on the previous Ready.
+    pub fn ready(self: *ReadyState, current_hs: state.HardState) error{ReadyNotAdvanced}!Ready {
+        if (self.has_pending_ready) return error.ReadyNotAdvanced;
 
         self.has_pending_ready = true;
 
@@ -147,7 +147,7 @@ test "ready/advance handshake" {
     try rs.addCommittedEntry(testEntry(1));
 
     const hs1 = state.HardState{ .current_term = 1, .voted_for = null };
-    const r = rs.ready(hs1);
+    const r = try rs.ready(hs1);
 
     try std.testing.expectEqual(@as(usize, 1), r.messages.len);
     try std.testing.expectEqual(@as(usize, 1), r.committed_entries.len);
@@ -157,7 +157,7 @@ test "ready/advance handshake" {
 
     // Second round with no changes.
     try rs.addMessage(testMsg(2));
-    const r2 = rs.ready(hs1);
+    const r2 = try rs.ready(hs1);
     try std.testing.expectEqual(@as(usize, 1), r2.messages.len);
     try std.testing.expect(r2.hard_state == null); // unchanged
     rs.advance(hs1);
@@ -170,13 +170,13 @@ test "hard_state only included when changed" {
     defer rs.deinit();
 
     try rs.addMessage(testMsg(1));
-    const r = rs.ready(hs);
+    const r = try rs.ready(hs);
     try std.testing.expect(r.hard_state == null);
     rs.advance(hs);
 
     const hs2 = state.HardState{ .current_term = 4, .voted_for = 1 };
     try rs.addMessage(testMsg(1));
-    const r2 = rs.ready(hs2);
+    const r2 = try rs.ready(hs2);
     try std.testing.expect(r2.hard_state != null);
     try std.testing.expectEqual(@as(u64, 4), r2.hard_state.?.current_term);
     rs.advance(hs2);
@@ -219,7 +219,7 @@ test "advance clears all pending state" {
     rs.setSnapshot(testSnapshot());
     rs.setShouldSnapshot(true);
 
-    _ = rs.ready(hs);
+    _ = try rs.ready(hs);
     rs.advance(hs);
 
     try std.testing.expectEqual(@as(usize, 0), rs.pending_messages.items.len);
@@ -244,7 +244,7 @@ test "setSnapshot and setShouldSnapshot" {
     rs.setSnapshot(testSnapshot());
     try std.testing.expect(rs.hasReady(hs));
 
-    const r = rs.ready(hs);
+    const r = try rs.ready(hs);
     try std.testing.expect(r.should_snapshot == false);
     try std.testing.expect(r.snapshot != null);
     try std.testing.expectEqual(@as(u64, 5), r.snapshot.?.metadata.index);

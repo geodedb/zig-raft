@@ -101,6 +101,9 @@ pub const RaftLog = struct {
         if (lo >= first_unstable) {
             const start = lo - first_unstable;
             const end = hi - first_unstable;
+            if (end > self.unstable_entries.items.len or start > self.unstable_entries.items.len) {
+                return error.OutOfRange;
+            }
             const unstable_slice = self.unstable_entries.items[start..end];
             const result = try self.allocator.alloc(rpc.Entry, unstable_slice.len);
             @memcpy(result, unstable_slice);
@@ -112,6 +115,9 @@ pub const RaftLog = struct {
         defer self.allocator.free(stable);
 
         const unstable_end = hi - first_unstable;
+        if (unstable_end > self.unstable_entries.items.len) {
+            return error.OutOfRange;
+        }
         const unstable_slice = self.unstable_entries.items[0..unstable_end];
 
         const result = try self.allocator.alloc(rpc.Entry, stable.len + unstable_slice.len);
@@ -129,12 +135,12 @@ pub const RaftLog = struct {
     ) !?u64 {
         if (!self.matchTerm(prev_log_index, prev_log_term)) return null;
 
-        const last_new_index = prev_log_index + entries.len;
+        const last_new_index = std.math.add(u64, prev_log_index, entries.len) catch return error.Overflow;
 
         // Find the first conflicting entry.
         var conflict_idx: u64 = 0;
         for (entries, 0..) |entry, i| {
-            const idx = prev_log_index + 1 + i;
+            const idx = std.math.add(u64, std.math.add(u64, prev_log_index, 1) catch return error.Overflow, i) catch return error.Overflow;
             const existing_term = self.term(idx) catch {
                 // Entry doesn't exist, append from here.
                 conflict_idx = idx;
@@ -154,6 +160,7 @@ pub const RaftLog = struct {
         try self.truncateUnstable(conflict_idx);
 
         // Append remaining entries starting from the conflict point.
+        // Safe: conflict_idx >= prev_log_index + 1 by construction.
         const offset = conflict_idx - prev_log_index - 1;
         try self.append(entries[offset..]);
 
@@ -176,8 +183,8 @@ pub const RaftLog = struct {
         }
     }
 
-    pub fn appliedTo(self: *RaftLog, index: u64) void {
-        std.debug.assert(index <= self.committed);
+    pub fn appliedTo(self: *RaftLog, index: u64) error{AppliedBeyondCommitted}!void {
+        if (index > self.committed) return error.AppliedBeyondCommitted;
         self.applied = index;
     }
 

@@ -127,11 +127,12 @@ pub const ReplicationState = struct {
 
         const trimmed = entries[0..count];
 
-        // Free excess if we trimmed.
+        // Free excess if we trimmed — allocate result BEFORE freeing source
+        // to avoid use-after-free (trimmed points into entries).
         if (count < entries.len) {
-            self.allocator.free(entries);
             const result = try self.allocator.alloc(rpc.Entry, trimmed.len);
             @memcpy(result, trimmed);
+            self.allocator.free(entries);
             return rpc.Message{ .append_entries = .{
                 .term = term,
                 .leader_id = leader_id,
@@ -161,11 +162,14 @@ pub const ReplicationState = struct {
         voters_outgoing: []const u64,
         current_term: u64,
         leader_id: u64,
-    ) bool {
+    ) !bool {
         // Build parallel arrays of node_ids and match_indices.
         // Include the leader itself (match = lastIndex).
-        var node_ids: [16]u64 = undefined;
-        var match_indices: [16]u64 = undefined;
+        const count = self.peers.count() + 1;
+        const node_ids = try self.allocator.alloc(u64, count);
+        defer self.allocator.free(node_ids);
+        const match_indices = try self.allocator.alloc(u64, count);
+        defer self.allocator.free(match_indices);
         var n: usize = 0;
 
         // Leader's own match index is its last log index.
@@ -180,7 +184,8 @@ pub const ReplicationState = struct {
             n += 1;
         }
 
-        const new_commit = quorum_mod.committedIndex(
+        const new_commit = try quorum_mod.committedIndex(
+            self.allocator,
             voters,
             voters_outgoing,
             match_indices[0..n],
@@ -336,7 +341,7 @@ test "maybeCommit advances commit when majority has replicated" {
     _ = rs.peers.getPtr(3).?.maybeUpdate(1);
 
     const voters = [_]u64{ 1, 2, 3 };
-    const committed = rs.maybeCommit(&log, &voters, &.{}, 3, 1);
+    const committed = try rs.maybeCommit(&log, &voters, &.{}, 3, 1);
     try std.testing.expect(committed);
     try std.testing.expectEqual(@as(u64, 3), log.committed);
 }
@@ -365,7 +370,7 @@ test "maybeCommit does NOT commit entries from prior term (section 5.4.2)" {
 
     const voters = [_]u64{ 1, 2, 3 };
     // Current term is 3, but all entries are from term 2 -- must NOT commit.
-    const committed = rs.maybeCommit(&log, &voters, &.{}, 3, 1);
+    const committed = try rs.maybeCommit(&log, &voters, &.{}, 3, 1);
     try std.testing.expect(!committed);
     try std.testing.expectEqual(@as(u64, 0), log.committed);
 }
