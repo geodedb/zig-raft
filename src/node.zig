@@ -2,6 +2,7 @@
 // Copyright (c) 2024-2025 CodePros
 
 const std = @import("std");
+const spice = @import("spice");
 const st = @import("state.zig");
 const rpc = @import("rpc.zig");
 const raft_log = @import("log.zig");
@@ -26,10 +27,6 @@ pub const Config = struct {
     rng_seed: ?u64 = null,
 };
 
-pub const NotLeader = struct {
-    leader_id: ?u64,
-};
-
 pub const RaftNode = struct {
     id: u64,
     role: st.Role,
@@ -37,7 +34,7 @@ pub const RaftNode = struct {
     current_term: u64,
     voted_for: ?u64,
     is_pre_vote_election: bool,
-    pending_config_index: u64,  // index of the joint config entry, 0 = none
+    pending_config_index: u64, // index of the joint config entry, 0 = none
     log: raft_log.RaftLog,
     election_state: elect.ElectionState,
     replication_state: ?repl.ReplicationState,
@@ -117,6 +114,10 @@ pub const RaftNode = struct {
         self.transport = t;
     }
 
+    /// Propose a command to the replicated log.
+    /// Returns `error.NotLeader` if this node is not the current leader.
+    /// On error, the caller can read `self.leader_id` to discover the
+    /// current known leader (may be `null` if unknown, e.g. during election).
     pub fn propose(self: *RaftNode, data: []const u8) error{NotLeader}!void {
         if (self.role != .leader) return error.NotLeader;
 
@@ -142,7 +143,11 @@ pub const RaftNode = struct {
         self.pending_config_index = entry.index;
     }
 
-    pub fn step(self: *RaftNode, from: u64, msg: rpc.Message) !void {
+    /// Process an inbound RPC message from another node.
+    /// When `task` is non-null, spice parallelism may be used for
+    /// read-only operations (e.g. building AppendEntries responses).
+    pub fn step(self: *RaftNode, from: u64, msg: rpc.Message, task: ?*spice.Task) !void {
+        _ = task; // Reserved for future parallel response construction.
         switch (msg) {
             .request_vote => |rv| try self.handleRequestVote(from, rv),
             .request_vote_response => |rvr| try self.handleRequestVoteResponse(from, rvr),
@@ -153,12 +158,15 @@ pub const RaftNode = struct {
         }
     }
 
-    pub fn tick(self: *RaftNode) !void {
+    /// Advance internal timers and trigger leader/follower actions.
+    /// When `task` is non-null, spice parallelism is used for building
+    /// AppendEntries payloads and broadcasting votes in parallel.
+    pub fn tick(self: *RaftNode, task: ?*spice.Task) !void {
         if (self.role == .leader) {
             self.election_state.tickHeartbeat();
             if (self.election_state.heartbeatTimeoutElapsed()) {
                 self.election_state.resetHeartbeatElapsed();
-                try self.sendHeartbeats();
+                try self.sendHeartbeats(task);
             }
 
             // Check if joint config committed and needs phase-2.
@@ -184,7 +192,7 @@ pub const RaftNode = struct {
         } else {
             self.election_state.tickElection();
             if (self.election_state.electionTimeoutElapsed()) {
-                try self.startElection(self.config.pre_vote);
+                try self.startElection(self.config.pre_vote, task);
             }
         }
     }
@@ -303,7 +311,7 @@ pub const RaftNode = struct {
         try self.log.append(&.{noop});
     }
 
-    fn startElection(self: *RaftNode, pre_vote: bool) !void {
+    fn startElection(self: *RaftNode, pre_vote: bool, task: ?*spice.Task) !void {
         if (pre_vote) {
             self.is_pre_vote_election = true;
             // Don't increment term or set voted_for for pre-vote.
@@ -325,7 +333,7 @@ pub const RaftNode = struct {
         if (self.config.peers.len == 0) {
             if (pre_vote) {
                 // Pre-vote succeeded (self-only), start real election.
-                try self.startElection(false);
+                try self.startElection(false, task);
             } else {
                 try self.becomeLeader();
             }
@@ -399,7 +407,7 @@ pub const RaftNode = struct {
         const cfg = self.membership_state.config();
         if (self.election_state.hasJointQuorum(cfg.voters, cfg.voters_outgoing)) {
             if (self.is_pre_vote_election) {
-                try self.startElection(false);
+                try self.startElection(false, null);
             } else {
                 try self.becomeLeader();
             }
@@ -527,9 +535,64 @@ pub const RaftNode = struct {
         }
     }
 
-    fn sendHeartbeats(self: *RaftNode) !void {
-        for (self.config.peers) |peer| {
-            if (self.replication_state) |*rs| {
+    /// Build and send AppendEntries heartbeats to all peers.
+    /// When `task` is non-null, AppendEntries payloads for each peer
+    /// are constructed in parallel using spice fork/join.
+    fn sendHeartbeats(self: *RaftNode, task: ?*spice.Task) !void {
+        var rs = &(self.replication_state orelse return);
+
+        if (task) |t| {
+            // Parallel path: fork one Future per peer, then join and send.
+            // Results are written into a shared array because rpc.Message
+            // exceeds spice's 32-byte Future return slot.
+            const peers = self.config.peers;
+            const futures = try self.allocator.alloc(BuildAEFuture, peers.len);
+            defer self.allocator.free(futures);
+            const results = try self.allocator.alloc(?rpc.Message, peers.len);
+            defer self.allocator.free(results);
+
+            for (peers, 0..) |peer, i| {
+                results[i] = null;
+                futures[i] = BuildAEFuture.init();
+                futures[i].fork(t, parallelBuildAE, .{
+                    .rs = rs,
+                    .peer = peer,
+                    .log = &self.log,
+                    .current_term = self.current_term,
+                    .leader_id = self.id,
+                    .committed = self.log.committed,
+                    .max_entries_per_msg = self.config.max_entries_per_msg,
+                    .max_bytes_per_msg = self.config.max_bytes_per_msg,
+                    .out = &results[i],
+                });
+            }
+
+            for (peers, 0..) |peer, i| {
+                // join returns ?void — null means the future wasn't executed
+                // (was popped before a worker got to it).
+                const did_run = futures[i].join(t);
+                if (did_run == null) {
+                    // Future didn't execute; build sequentially.
+                    results[i] = rs.buildAppendEntries(
+                        peer,
+                        &self.log,
+                        self.current_term,
+                        self.id,
+                        self.log.committed,
+                        self.config.max_entries_per_msg,
+                        self.config.max_bytes_per_msg,
+                    ) catch null;
+                }
+
+                if (results[i]) |m| {
+                    self.sendMsg(peer, m);
+                } else {
+                    self.sendMsg(peer, emptyHeartbeat(self.current_term, self.id, self.log.committed));
+                }
+            }
+        } else {
+            // Sequential path: build and send one at a time.
+            for (self.config.peers) |peer| {
                 const msg = rs.buildAppendEntries(
                     peer,
                     &self.log,
@@ -543,18 +606,50 @@ pub const RaftNode = struct {
                 if (msg) |m| {
                     self.sendMsg(peer, m);
                 } else {
-                    // Peer needs snapshot; send empty heartbeat.
-                    self.sendMsg(peer, rpc.Message{ .append_entries = .{
-                        .term = self.current_term,
-                        .leader_id = self.id,
-                        .prev_log_index = 0,
-                        .prev_log_term = 0,
-                        .entries = &.{},
-                        .leader_commit = self.log.committed,
-                    } });
+                    self.sendMsg(peer, emptyHeartbeat(self.current_term, self.id, self.log.committed));
                 }
             }
         }
+    }
+
+    /// Input for parallel AppendEntries construction.
+    /// Results are written to `out` rather than returned through the Future
+    /// (rpc.Message is too large for spice's 32-byte return slot).
+    const BuildAEInput = struct {
+        rs: *repl.ReplicationState,
+        peer: u64,
+        log: *raft_log.RaftLog,
+        current_term: u64,
+        leader_id: u64,
+        committed: u64,
+        max_entries_per_msg: u32,
+        max_bytes_per_msg: u64,
+        out: *?rpc.Message,
+    };
+
+    const BuildAEFuture = spice.Future(BuildAEInput, void);
+
+    fn parallelBuildAE(_: *spice.Task, input: BuildAEInput) void {
+        input.out.* = input.rs.buildAppendEntries(
+            input.peer,
+            input.log,
+            input.current_term,
+            input.leader_id,
+            input.committed,
+            input.max_entries_per_msg,
+            input.max_bytes_per_msg,
+        ) catch null;
+    }
+
+    fn emptyHeartbeat(term: u64, leader_id: u64, leader_commit: u64) rpc.Message {
+        return rpc.Message{ .append_entries = .{
+            .term = term,
+            .leader_id = leader_id,
+            .prev_log_index = 0,
+            .prev_log_term = 0,
+            .entries = &.{},
+            .leader_commit = leader_commit,
+        } };
     }
 
     fn maybeCommit(self: *RaftNode) void {
@@ -638,7 +733,7 @@ test "single node becomes leader" {
     // Tick until election timeout fires.
     var i: u32 = 0;
     while (i < 20) : (i += 1) {
-        try node.tick();
+        try node.tick(null);
         if (node.role == .leader) break;
     }
 
@@ -664,7 +759,7 @@ test "leader appends noop on election" {
     // Tick until election.
     var i: u32 = 0;
     while (i < 20) : (i += 1) {
-        try node.tick();
+        try node.tick(null);
         if (node.role == .leader) break;
     }
 
@@ -699,7 +794,7 @@ test "propose on leader succeeds" {
     // Become leader.
     var i: u32 = 0;
     while (i < 20) : (i += 1) {
-        try node.tick();
+        try node.tick(null);
         if (node.role == .leader) break;
     }
     try std.testing.expectEqual(st.Role.leader, node.role);
@@ -732,7 +827,7 @@ test "step with higher term becomes follower" {
     // Become leader first.
     var i: u32 = 0;
     while (i < 20) : (i += 1) {
-        try node.tick();
+        try node.tick(null);
         if (node.role == .leader) break;
     }
     try std.testing.expectEqual(st.Role.leader, node.role);
@@ -747,7 +842,7 @@ test "step with higher term becomes follower" {
         .prev_log_term = 0,
         .entries = &.{},
         .leader_commit = 0,
-    } });
+    } }, null);
 
     try std.testing.expectEqual(st.Role.follower, node.role);
     try std.testing.expectEqual(leader_term + 5, node.current_term);

@@ -84,6 +84,28 @@ test-release-safe:
   needs:
     - build
 
+# Scenario tests (election, replication, snapshots, membership, persistence, file_storage)
+test-scenarios:
+  stage: test
+  image: debian:bookworm-slim
+  before_script:
+    - *install-zig
+  script:
+    - zig build test-scenarios --summary all
+  needs:
+    - build
+
+# Chaos tests (randomized fault injection with deterministic replay)
+test-chaos:
+  stage: test
+  image: debian:bookworm-slim
+  before_script:
+    - *install-zig
+  script:
+    - zig build test-chaos --summary all
+  needs:
+    - build
+
 # Cross-compilation tests
 test-cross-build:
   stage: test

@@ -182,7 +182,7 @@ pub const Network = struct {
         for (self.node_ids.items) |id| {
             if (self.paused_nodes.contains(id)) continue;
             const n = self.nodes.get(id).?;
-            try n.tick();
+            try n.tick(null);
         }
 
         // Phase 2: deliver messages.
@@ -197,7 +197,7 @@ pub const Network = struct {
             if (self.paused_nodes.contains(pm.to)) continue;
             if (self.dropped_routes.contains(.{ .from = pm.from, .to = pm.to })) continue;
             if (self.nodes.get(pm.to)) |n| {
-                try n.step(pm.from, pm.msg);
+                try n.step(pm.from, pm.msg, null);
             }
         }
 
@@ -212,7 +212,7 @@ pub const Network = struct {
             if (self.paused_nodes.contains(pm.to)) continue;
             if (self.dropped_routes.contains(.{ .from = pm.from, .to = pm.to })) continue;
             if (self.nodes.get(pm.to)) |n| {
-                try n.step(pm.from, pm.msg);
+                try n.step(pm.from, pm.msg, null);
             }
         }
 

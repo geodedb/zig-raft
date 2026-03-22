@@ -11,6 +11,17 @@
 const std = @import("std");
 const raft = @import("raft");
 const harness = @import("harness");
+const Checker = @import("checker").Checker;
+
+/// Run all Raft invariant checks against the current network state.
+fn runChecker(net: *harness.Network) !void {
+    const nodes = try net.allocator.alloc(*raft.node.RaftNode, net.node_ids.items.len);
+    defer net.allocator.free(nodes);
+    for (net.node_ids.items, 0..) |id, i| {
+        nodes[i] = net.nodes.get(id).?;
+    }
+    try Checker.checkAll(nodes);
+}
 
 // ============================================================================
 // Scenario 1: hard_state_survives_restart
@@ -37,6 +48,8 @@ test "persistence: hard state survives restart" {
     // At least one node must have voted_for set (the leader voted for itself).
     // Check the leader's storage directly.
     try std.testing.expectEqual(leader_node.voted_for, hs.voted_for);
+
+    try runChecker(&net);
 }
 
 // ============================================================================
@@ -74,6 +87,8 @@ test "persistence: log survives restart" {
         }
     }
     try std.testing.expect(found);
+
+    try runChecker(&net);
 }
 
 // ============================================================================
@@ -106,6 +121,8 @@ test "persistence: snapshot survives restart" {
     try std.testing.expectEqualStrings("my-snapshot", snapshot.data);
     try std.testing.expect(snapshot.metadata.index > 0);
     try std.testing.expect(snapshot.metadata.term > 0);
+
+    try runChecker(&net);
 }
 
 // ============================================================================

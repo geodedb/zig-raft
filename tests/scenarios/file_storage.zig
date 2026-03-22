@@ -24,6 +24,7 @@
 
 const std = @import("std");
 const raft = @import("raft");
+const Checker = @import("checker").Checker;
 
 const FileStorage = raft.FileStorage;
 const RaftNode = raft.RaftNode;
@@ -152,7 +153,7 @@ const TestCluster = struct {
     fn tickAll(self: *TestCluster) !void {
         // Phase 1: tick.
         for (self.nodes) |n| {
-            try n.tick();
+            try n.tick(null);
         }
 
         // Phase 2: deliver messages.
@@ -163,7 +164,7 @@ const TestCluster = struct {
 
         for (snapshot) |pm| {
             const node = self.getNode(pm.to) orelse continue;
-            try node.step(pm.from, pm.msg);
+            try node.step(pm.from, pm.msg, null);
         }
 
         // Drain extra messages from step responses.
@@ -174,7 +175,7 @@ const TestCluster = struct {
 
         for (extra) |pm| {
             const node = self.getNode(pm.to) orelse continue;
-            try node.step(pm.from, pm.msg);
+            try node.step(pm.from, pm.msg, null);
         }
 
         // Phase 3: ready / advance.
@@ -206,6 +207,11 @@ const TestCluster = struct {
         }
         return error.NoLeaderElected;
     }
+
+    /// Run all Raft invariant checks against the cluster's nodes.
+    fn checkInvariants(self: *TestCluster) !void {
+        try Checker.checkAll(&self.nodes);
+    }
 };
 
 // ============================================================================
@@ -224,6 +230,8 @@ test "file_storage integration: cluster elects leader with file-backed storage" 
     const leader_idx = leader_id - 1;
     const store = cluster.storages[leader_idx];
     try std.testing.expect(store.hard_state.current_term > 0);
+
+    try cluster.checkInvariants();
 }
 
 test "file_storage integration: propose and commit entries to disk" {
@@ -265,6 +273,8 @@ test "file_storage integration: propose and commit entries to disk" {
         }
     }
     try std.testing.expect(found);
+
+    try cluster.checkInvariants();
 }
 
 test "file_storage integration: entries replicated to followers on disk" {
@@ -307,6 +317,8 @@ test "file_storage integration: entries replicated to followers on disk" {
 
     // At least a quorum (2 out of 3) should have it.
     try std.testing.expect(nodes_with_entry >= 2);
+
+    try cluster.checkInvariants();
 }
 
 test "file_storage integration: hard state persists across restarts" {
@@ -327,6 +339,8 @@ test "file_storage integration: hard state persists across restarts" {
         for (cluster.storages) |store| {
             try std.testing.expect(store.hard_state.current_term > 0);
         }
+
+        try cluster.checkInvariants();
     }
 
     // Re-open the storage directories and verify state survived.
@@ -374,6 +388,8 @@ test "file_storage integration: snapshot save and load in cluster" {
     try std.testing.expect(loaded != null);
     defer std.heap.page_allocator.free(loaded.?.data);
     try std.testing.expectEqualStrings("test-snapshot-data", loaded.?.data);
+
+    try cluster.checkInvariants();
 }
 
 test "file_storage integration: multiple proposals commit in order" {
@@ -418,4 +434,93 @@ test "file_storage integration: multiple proposals commit in order" {
     }
 
     try std.testing.expect(found[0] and found[1] and found[2]);
+
+    try cluster.checkInvariants();
+}
+
+// ============================================================================
+// torn_write_recovery — CRC validation detects and truncates corrupted WAL
+// ============================================================================
+
+test "file_storage: torn_write_recovery" {
+    const base = "/tmp/raft-fs-torn-write";
+
+    // Clean up from prior runs.
+    std.fs.cwd().deleteTree(base) catch {};
+
+    const allocator = std.heap.page_allocator;
+
+    // Phase 1: Write valid entries to FileStorage.
+    {
+        var store = try FileStorage.init(allocator, base);
+        defer store.deinit();
+
+        const entries = [_]raft.Entry{
+            .{ .index = 1, .term = 1, .kind = .normal, .data = "entry-one" },
+            .{ .index = 2, .term = 1, .kind = .normal, .data = "entry-two" },
+            .{ .index = 3, .term = 2, .kind = .normal, .data = "entry-three" },
+        };
+        try store.appendEntriesImpl(&entries);
+
+        // Verify all 3 entries are readable.
+        const last_idx = try store.lastIndexImpl();
+        try std.testing.expectEqual(@as(u64, 3), last_idx);
+    }
+
+    // Phase 2: Corrupt the WAL by appending garbage bytes (simulating a torn write).
+    {
+        var dir = try std.fs.cwd().openDir(base, .{});
+        defer dir.close();
+
+        var wal_file = try dir.openFile("wal", .{ .mode = .read_write });
+        defer wal_file.close();
+
+        // Seek to end and append garbage.
+        const end_pos = try wal_file.getEndPos();
+        try wal_file.seekTo(end_pos);
+
+        // Write a partial header + random garbage (simulates a torn write
+        // where the process crashed mid-write).
+        const garbage = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00, 0x00, 0x03, 0xFF, 0xFF };
+        try wal_file.writeAll(&garbage);
+    }
+
+    // Phase 3: Re-open the storage. recoverWal should detect the CRC mismatch
+    // on the garbage bytes and truncate the WAL to the last valid record.
+    {
+        var store = try FileStorage.init(allocator, base);
+        defer store.deinit();
+
+        // All 3 valid entries should still be readable.
+        const last_idx = try store.lastIndexImpl();
+        try std.testing.expectEqual(@as(u64, 3), last_idx);
+
+        // Read each entry and verify contents survived.
+        const entries = try store.entriesImpl(1, 4);
+        defer {
+            for (entries) |e| {
+                if (e.data.len > 0) allocator.free(e.data);
+            }
+            allocator.free(entries);
+        }
+
+        try std.testing.expectEqual(@as(usize, 3), entries.len);
+        try std.testing.expectEqualStrings("entry-one", entries[0].data);
+        try std.testing.expectEqualStrings("entry-two", entries[1].data);
+        try std.testing.expectEqualStrings("entry-three", entries[2].data);
+        try std.testing.expectEqual(@as(u64, 1), entries[0].term);
+        try std.testing.expectEqual(@as(u64, 2), entries[2].term);
+
+        // Verify we can still append new entries after recovery.
+        const new_entry = [_]raft.Entry{
+            .{ .index = 4, .term = 2, .kind = .normal, .data = "after-recovery" },
+        };
+        try store.appendEntriesImpl(&new_entry);
+
+        const final_idx = try store.lastIndexImpl();
+        try std.testing.expectEqual(@as(u64, 4), final_idx);
+    }
+
+    // Clean up.
+    std.fs.cwd().deleteTree(base) catch {};
 }

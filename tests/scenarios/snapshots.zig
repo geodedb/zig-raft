@@ -246,3 +246,176 @@ test "scenario: buildInstallSnapshotMessages produces correct chunks" {
 
     try checkInvariants(allocator, &net);
 }
+
+// ---------------------------------------------------------------------------
+// 5. snapshot_catches_up_laggard
+// ---------------------------------------------------------------------------
+
+test "scenario: snapshot_catches_up_laggard" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var net = try harness.Network.init(allocator, 3);
+    defer net.deinit();
+
+    const leader_id = try net.waitForLeader(50);
+    const leader = net.nodes.get(leader_id).?;
+
+    // Propose entries and wait for full replication.
+    var i: u32 = 0;
+    while (i < 5) : (i += 1) {
+        try net.propose("pre-snapshot");
+    }
+    try net.waitForCommit(leader.log.lastIndex(), 50);
+
+    // Pick a follower to partition (the "laggard").
+    var laggard_id: u64 = 0;
+    for (net.node_ids.items) |id| {
+        if (id != leader_id) {
+            laggard_id = id;
+            break;
+        }
+    }
+
+    // Partition the laggard from all other nodes.
+    for (net.node_ids.items) |id| {
+        if (id != laggard_id) {
+            try net.partition(laggard_id, id);
+        }
+    }
+
+    // Propose more entries (committed on leader + remaining follower).
+    i = 0;
+    while (i < 5) : (i += 1) {
+        try net.propose("post-partition");
+    }
+    try net.waitForCommit(leader.log.lastIndex(), 50);
+
+    // Take a snapshot on the leader and compact the log.
+    try leader.reportSnapshot("laggard-snapshot-data");
+    try leader.advance();
+
+    // The leader's log is now compacted — the laggard cannot catch up via
+    // AppendEntries. Build InstallSnapshot messages and deliver manually.
+    const snap = raft.Snapshot{
+        .metadata = .{
+            .index = leader.snapshot_state.snapshot_index,
+            .term = leader.snapshot_state.snapshot_term,
+            .config = leader.membership_state.config(),
+        },
+        .data = "laggard-snapshot-data",
+    };
+
+    leader.snapshot_state.chunk_size = 1024;
+    const msgs = try leader.snapshot_state.buildInstallSnapshotMessages(
+        snap,
+        leader.current_term,
+        leader.id,
+    );
+
+    // Deliver each chunk to the laggard.
+    const laggard = net.nodes.get(laggard_id).?;
+    for (msgs) |m| {
+        try laggard.step(leader_id, m, null);
+    }
+
+    // The laggard's snapshot_state should reflect the received snapshot.
+    try std.testing.expectEqual(snap.metadata.index, laggard.snapshot_state.snapshot_index);
+    try std.testing.expectEqual(snap.metadata.term, laggard.snapshot_state.snapshot_term);
+
+    // Heal the partition and let the cluster converge.
+    for (net.node_ids.items) |id| {
+        if (id != laggard_id) {
+            net.heal(laggard_id, id);
+        }
+    }
+
+    i = 0;
+    while (i < 50) : (i += 1) {
+        try net.tickAll();
+    }
+
+    try checkInvariants(allocator, &net);
+}
+
+// ---------------------------------------------------------------------------
+// 6. chunked_snapshot_transfer
+// ---------------------------------------------------------------------------
+
+test "scenario: chunked_snapshot_transfer" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var net = try harness.Network.init(allocator, 3);
+    defer net.deinit();
+
+    const leader_id = try net.waitForLeader(50);
+    const leader = net.nodes.get(leader_id).?;
+
+    // Propose entries so we have something to snapshot.
+    var i: u32 = 0;
+    while (i < 3) : (i += 1) {
+        try net.propose("chunk-data");
+    }
+    try net.waitForCommit(leader.log.lastIndex(), 50);
+
+    // Create a large snapshot payload to force multiple chunks.
+    const snapshot_data = "A" ** 100; // 100 bytes
+    try leader.reportSnapshot(snapshot_data);
+    try leader.advance();
+
+    // Use a small chunk size to force many chunks.
+    leader.snapshot_state.chunk_size = 7; // 100 / 7 = ~15 chunks
+
+    const snap = raft.Snapshot{
+        .metadata = .{
+            .index = leader.snapshot_state.snapshot_index,
+            .term = leader.snapshot_state.snapshot_term,
+            .config = leader.membership_state.config(),
+        },
+        .data = snapshot_data,
+    };
+
+    const msgs = try leader.snapshot_state.buildInstallSnapshotMessages(
+        snap,
+        leader.current_term,
+        leader.id,
+    );
+
+    // Should produce ceil(100/7) = 15 chunks.
+    try std.testing.expectEqual(@as(usize, 15), msgs.len);
+
+    // Pick a follower and deliver all chunks via step().
+    var follower_id: u64 = 0;
+    for (net.node_ids.items) |id| {
+        if (id != leader_id) {
+            follower_id = id;
+            break;
+        }
+    }
+    const follower = net.nodes.get(follower_id).?;
+
+    // Deliver each chunk in order.
+    for (msgs, 0..) |m, idx| {
+        const is_chunk = m.install_snapshot;
+        // Verify offset progression.
+        try std.testing.expectEqual(@as(u64, idx * 7), is_chunk.offset);
+
+        try follower.step(leader_id, m, null);
+    }
+
+    // Last chunk should be done=true.
+    try std.testing.expect(msgs[msgs.len - 1].install_snapshot.done);
+
+    // Verify CRC matches on the last chunk.
+    const expected_crc = std.hash.Crc32.hash(snapshot_data);
+    try std.testing.expectEqual(expected_crc, msgs[msgs.len - 1].install_snapshot.checksum);
+
+    // Follower's snapshot state should be updated.
+    try std.testing.expectEqual(snap.metadata.index, follower.snapshot_state.snapshot_index);
+    try std.testing.expectEqual(snap.metadata.term, follower.snapshot_state.snapshot_term);
+
+    try checkInvariants(allocator, &net);
+}

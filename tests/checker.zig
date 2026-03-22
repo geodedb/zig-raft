@@ -9,7 +9,6 @@ const std = @import("std");
 const raft = @import("raft");
 
 pub const Checker = struct {
-
     /// Election Safety: at most one leader per term across all nodes.
     pub fn checkElectionSafety(nodes: []*raft.node.RaftNode) !void {
         for (nodes, 0..) |a, i| {

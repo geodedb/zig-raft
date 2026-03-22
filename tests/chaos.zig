@@ -11,6 +11,7 @@
 const std = @import("std");
 const raft = @import("raft");
 const harness = @import("harness");
+const Checker = @import("checker").Checker;
 const chaos_options = @import("chaos_options");
 
 /// Deterministic seed from `-Dseed=N`, or a random one for exploration runs.
@@ -140,6 +141,20 @@ const ChaosRunner = struct {
         return error.NoLeaderElected;
     }
 
+    /// Run all four Raft invariant checks (Election Safety, Log Matching,
+    /// Leader Completeness, State Machine Safety) via the Checker module.
+    fn checkAllInvariants(self: *ChaosRunner) !void {
+        const nodes = try self.net.allocator.alloc(*raft.node.RaftNode, self.net.node_ids.items.len);
+        defer self.net.allocator.free(nodes);
+        for (self.net.node_ids.items, 0..) |id, i| {
+            nodes[i] = self.net.nodes.get(id).?;
+        }
+        Checker.checkAll(nodes) catch |err| {
+            std.log.err("Invariant violation at tick {d} (seed={d})", .{ self.tick_count, self.seed });
+            return err;
+        };
+    }
+
     /// Check that at most one leader exists per term.
     fn checkSingleLeader(self: *ChaosRunner) !void {
         var leaders = std.AutoHashMap(u64, u64).init(self.net.allocator);
@@ -186,7 +201,7 @@ test "chaos: flaky_network" {
     var t: u32 = 0;
     while (t < 200) : (t += 1) {
         try runner.tickWithFaults();
-        try runner.checkSingleLeader();
+        try runner.checkAllInvariants();
     }
 
     // Stabilize and verify.
@@ -214,7 +229,7 @@ test "chaos: message_reorder" {
     var t: u32 = 0;
     while (t < 200) : (t += 1) {
         try runner.tickWithFaults();
-        try runner.checkSingleLeader();
+        try runner.checkAllInvariants();
     }
 
     _ = try runner.stabilize(100);
@@ -313,7 +328,7 @@ test "chaos: rolling_restart" {
         }
 
         // A leader should still exist (4/5 nodes active at worst).
-        try runner.checkSingleLeader();
+        try runner.checkAllInvariants();
     }
 
     _ = try runner.stabilize(100);
@@ -373,7 +388,7 @@ test "chaos: flapping_connection" {
     var t: u32 = 0;
     while (t < 300) : (t += 1) {
         try runner.tickWithFaults();
-        try runner.checkSingleLeader();
+        try runner.checkAllInvariants();
     }
 
     // Must recover when faults stop.
@@ -482,11 +497,66 @@ test "chaos: combined_chaos" {
 
         // Check election safety periodically.
         if (t % 50 == 0) {
-            try runner.checkSingleLeader();
+            try runner.checkAllInvariants();
         }
     }
 
     // Must recover when faults stop.
     _ = try runner.stabilize(300);
     try runner.checkSingleLeader();
+}
+
+// ---------------------------------------------------------------------------
+// 11. membership_under_chaos — add/remove servers under message loss
+// ---------------------------------------------------------------------------
+test "chaos: membership_under_chaos" {
+    const seed = getSeed();
+    var net = try harness.Network.init(std.testing.allocator, 5);
+    defer net.deinit();
+
+    var runner = ChaosRunner.init(&net, seed, .{
+        .drop_rate = 0.10,
+        .partition_rate = 0.0,
+        .heal_rate = 0.0,
+        .crash_rate = 0.0,
+        .restart_rate = 0.0,
+    });
+
+    // Elect a stable leader first.
+    const leader_id = try runner.stabilize(100);
+    const leader = net.nodes.get(leader_id).?;
+
+    // Add a new server (node 6 doesn't exist in network but tests protocol).
+    leader.proposeConfigChange(&.{ 1, 2, 3, 4, 5, 6 }) catch {};
+
+    // Tick under message drops until the config change resolves.
+    var t: u32 = 0;
+    while (t < 300) : (t += 1) {
+        try runner.tickWithFaults();
+        if (t % 50 == 0) {
+            try runner.checkAllInvariants();
+        }
+    }
+
+    // Stabilize and verify joint consensus resolved.
+    _ = try runner.stabilize(200);
+    try runner.checkAllInvariants();
+
+    // Now remove a server (revert to 5 voters) under message drops.
+    if (net.getLeader()) |lid| {
+        const l = net.nodes.get(lid).?;
+        l.proposeConfigChange(&.{ 1, 2, 3, 4, 5 }) catch {};
+
+        t = 0;
+        while (t < 300) : (t += 1) {
+            try runner.tickWithFaults();
+            if (t % 50 == 0) {
+                try runner.checkAllInvariants();
+            }
+        }
+    }
+
+    // Final stabilization — must recover to a healthy state.
+    _ = try runner.stabilize(300);
+    try runner.checkAllInvariants();
 }

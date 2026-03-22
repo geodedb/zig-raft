@@ -177,7 +177,7 @@ test "scenario: leader_steps_down_on_stale_term" {
         .last_log_index = 0,
         .last_log_term = 0,
         .pre_vote = false,
-    } });
+    } }, null);
 
     // The leader must have stepped down to follower.
     try std.testing.expectEqual(raft.Role.follower, leader.role);
@@ -210,7 +210,7 @@ test "scenario: no_double_vote_same_term" {
         .last_log_index = follower.log.lastIndex(),
         .last_log_term = follower.log.lastTerm(),
         .pre_vote = false,
-    } });
+    } }, null);
 
     // The follower must NOT have changed its vote.
     try std.testing.expect(follower.voted_for.? != 99);

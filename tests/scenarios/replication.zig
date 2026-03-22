@@ -10,7 +10,7 @@
 const std = @import("std");
 const raft = @import("raft");
 const harness = @import("harness");
-const Checker = @import("../checker.zig").Checker;
+const Checker = @import("checker").Checker;
 
 /// Build a slice of `*raft.node.RaftNode` suitable for the Checker from
 /// the network's node map. Caller must free the returned slice.

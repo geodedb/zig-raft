@@ -10,12 +10,6 @@ const std = @import("std");
 const raft = @import("raft");
 const harness = @import("harness");
 
-// Pull in scenario test files so they are discovered by the test runner.
-comptime {
-    _ = @import("scenarios/replication.zig");
-    _ = @import("scenarios/membership.zig");
-}
-
 // ============================================================================
 // Integration Tests
 // ============================================================================

@@ -279,25 +279,40 @@ test "receiveChunk assembles multiple chunks and verifies CRC" {
 
     // Chunk 1: offset 0, not done
     const r1 = try ss.receiveChunk(.{
-        .term = 1, .leader_id = 1,
-        .last_included_index = 10, .last_included_term = 2,
-        .offset = 0, .data = "Hello", .done = false, .checksum = 0,
+        .term = 1,
+        .leader_id = 1,
+        .last_included_index = 10,
+        .last_included_term = 2,
+        .offset = 0,
+        .data = "Hello",
+        .done = false,
+        .checksum = 0,
     });
     try std.testing.expect(r1 == null);
 
     // Chunk 2: offset 5, not done
     const r2 = try ss.receiveChunk(.{
-        .term = 1, .leader_id = 1,
-        .last_included_index = 10, .last_included_term = 2,
-        .offset = 5, .data = "World", .done = false, .checksum = 0,
+        .term = 1,
+        .leader_id = 1,
+        .last_included_index = 10,
+        .last_included_term = 2,
+        .offset = 5,
+        .data = "World",
+        .done = false,
+        .checksum = 0,
     });
     try std.testing.expect(r2 == null);
 
     // Chunk 3: offset 10, done with CRC
     const r3 = try ss.receiveChunk(.{
-        .term = 1, .leader_id = 1,
-        .last_included_index = 10, .last_included_term = 2,
-        .offset = 10, .data = "!", .done = true, .checksum = crc,
+        .term = 1,
+        .leader_id = 1,
+        .last_included_index = 10,
+        .last_included_term = 2,
+        .offset = 10,
+        .data = "!",
+        .done = true,
+        .checksum = crc,
     });
     try std.testing.expect(r3 != null);
     const snap = r3.?;
@@ -317,15 +332,25 @@ test "receiveChunk CRC mismatch returns error" {
     defer ss.deinit();
 
     _ = try ss.receiveChunk(.{
-        .term = 1, .leader_id = 1,
-        .last_included_index = 5, .last_included_term = 1,
-        .offset = 0, .data = "data", .done = false, .checksum = 0,
+        .term = 1,
+        .leader_id = 1,
+        .last_included_index = 5,
+        .last_included_term = 1,
+        .offset = 0,
+        .data = "data",
+        .done = false,
+        .checksum = 0,
     });
 
     const result = ss.receiveChunk(.{
-        .term = 1, .leader_id = 1,
-        .last_included_index = 5, .last_included_term = 1,
-        .offset = 4, .data = "more", .done = true, .checksum = 0xDEADBEEF,
+        .term = 1,
+        .leader_id = 1,
+        .last_included_index = 5,
+        .last_included_term = 1,
+        .offset = 4,
+        .data = "more",
+        .done = true,
+        .checksum = 0xDEADBEEF,
     });
 
     try std.testing.expectError(SnapshotError.ChecksumMismatch, result);
@@ -339,16 +364,26 @@ test "receiveChunk out-of-order offset returns error" {
     defer ss.deinit();
 
     _ = try ss.receiveChunk(.{
-        .term = 1, .leader_id = 1,
-        .last_included_index = 5, .last_included_term = 1,
-        .offset = 0, .data = "hello", .done = false, .checksum = 0,
+        .term = 1,
+        .leader_id = 1,
+        .last_included_index = 5,
+        .last_included_term = 1,
+        .offset = 0,
+        .data = "hello",
+        .done = false,
+        .checksum = 0,
     });
 
     // Offset should be 5, but we send 10
     const result = ss.receiveChunk(.{
-        .term = 1, .leader_id = 1,
-        .last_included_index = 5, .last_included_term = 1,
-        .offset = 10, .data = "bad", .done = false, .checksum = 0,
+        .term = 1,
+        .leader_id = 1,
+        .last_included_index = 5,
+        .last_included_term = 1,
+        .offset = 10,
+        .data = "bad",
+        .done = false,
+        .checksum = 0,
     });
 
     try std.testing.expectError(SnapshotError.UnexpectedOffset, result);
@@ -360,9 +395,14 @@ test "clearPending resets receive state" {
     defer ss.deinit();
 
     _ = try ss.receiveChunk(.{
-        .term = 1, .leader_id = 1,
-        .last_included_index = 5, .last_included_term = 1,
-        .offset = 0, .data = "partial", .done = false, .checksum = 0,
+        .term = 1,
+        .leader_id = 1,
+        .last_included_index = 5,
+        .last_included_term = 1,
+        .offset = 0,
+        .data = "partial",
+        .done = false,
+        .checksum = 0,
     });
 
     try std.testing.expect(ss.pending_snapshot != null);

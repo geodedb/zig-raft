@@ -115,6 +115,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "raft", .module = module },
                 .{ .name = "harness", .module = harness_module },
+                .{ .name = "checker", .module = checker_module },
             },
         }),
     });
@@ -128,11 +129,42 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "raft", .module = module },
+                .{ .name = "checker", .module = checker_module },
             },
         }),
     });
     const run_file_storage_tests = b.addRunArtifact(file_storage_tests);
     scenarios_step.dependOn(&run_file_storage_tests.step);
+
+    const membership_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/scenarios/membership.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "raft", .module = module },
+                .{ .name = "harness", .module = harness_module },
+                .{ .name = "checker", .module = checker_module },
+            },
+        }),
+    });
+    const run_membership_tests = b.addRunArtifact(membership_tests);
+    scenarios_step.dependOn(&run_membership_tests.step);
+
+    const replication_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/scenarios/replication.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "raft", .module = module },
+                .{ .name = "harness", .module = harness_module },
+                .{ .name = "checker", .module = checker_module },
+            },
+        }),
+    });
+    const run_replication_tests = b.addRunArtifact(replication_tests);
+    scenarios_step.dependOn(&run_replication_tests.step);
 
     // Chaos tests with optional seed for deterministic replay
     const chaos_step = b.step("test-chaos", "Run chaos tests");
@@ -145,6 +177,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "raft", .module = module },
                 .{ .name = "harness", .module = harness_module },
+                .{ .name = "checker", .module = checker_module },
             },
         }),
     });

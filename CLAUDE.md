@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A standalone Raft consensus library in Zig 0.15.1+. Implements the full Raft paper (Ongaro & Ousterhout, 2014) plus pre-vote (§9.6), joint consensus membership changes (§6), snapshotting/log compaction (§7), and chunked snapshot transfer. Extracted from the Geode distributed database for general reuse.
 
-The library depends on `spice` (fork/join parallelism, local path dependency at `../spice`).
+The library depends on `spice` (fork/join parallelism). The `build.zig.zon` uses a URL+hash dependency for reproducible builds.
 
 ## Build & Test Commands
 
@@ -14,7 +14,7 @@ The library depends on `spice` (fork/join parallelism, local path dependency at 
 zig build                                    # build the library
 zig build test --summary all                 # unit tests (in-module tests)
 zig build test-integration --summary all     # integration tests (tests/integration.zig)
-zig build test-scenarios --summary all       # scenario tests (election, snapshots, persistence, file_storage)
+zig build test-scenarios --summary all       # scenario tests (election, snapshots, persistence, file_storage, membership, replication)
 zig build test-chaos --summary all           # chaos tests (optional: -Dseed=N for deterministic replay)
 zig build check                              # fast compilation check, no codegen
 zig fmt src/ tests/ build.zig                # format all source
@@ -30,7 +30,9 @@ make ci      # clean + build + all tests
 
 The library is consumer-driven, not event-loop-driven. The consumer calls `tick()`, `step()`, and `propose()` on `RaftNode`; the library produces a `Ready` struct each round describing what to persist, send, and apply. The Raft core is a pure deterministic state machine — it never does I/O directly.
 
-Consumer loop: `tick()` -> `step(from, msg)` -> `propose(data)` -> `ready()` -> persist/send/apply -> `advance()`
+Consumer loop: `tick(task)` -> `step(from, msg, task)` -> `propose(data)` -> `ready()` -> persist/send/apply -> `advance()`
+
+The `task` parameter is an optional `*spice.Task` for parallel execution. Pass `null` for sequential behavior.
 
 ### Pluggable Interfaces (vtable pattern)
 

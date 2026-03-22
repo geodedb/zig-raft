@@ -2,15 +2,13 @@
 
 ## Overview
 
-A Zig library for raft
+A standalone Raft consensus library in Zig 0.15.1+. Implements the full Raft paper (Ongaro & Ousterhout, 2014) plus pre-vote, joint consensus membership changes, snapshotting, and chunked snapshot transfer.
 
-## Table of Contents
+## Resources
 
-- [Getting Started](getting-started.md)
-- [API Reference](api-reference.md)
-- [Examples](examples.md)
-- [Architecture](architecture.md)
-- [FAQ](faq.md)
+- [Design Spec](superpowers/specs/2026-03-21-raft-design.md) — full requirements, data types, and architecture
+- [Implementation Plan](superpowers/plans/2026-03-21-raft-implementation.md) — phased build plan
+- [CLAUDE.md](../CLAUDE.md) — build commands, module layout, and design constraints
 
 ## Quick Links
 
