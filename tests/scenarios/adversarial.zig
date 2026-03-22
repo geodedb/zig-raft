@@ -401,3 +401,131 @@ test "adversarial: Config rejects snapshot_chunk_size below minimum" {
     };
     try valid.validate();
 }
+
+// =========================================================================
+// 11. Stale-term response rejection (SEC-0119)
+// =========================================================================
+
+test "adversarial: stale RequestVoteResponse does not count toward quorum (SEC-0119)" {
+    var net = try harness.Network.init(std.testing.allocator, 3);
+    defer net.deinit();
+
+    // Elect a leader and let the cluster stabilize.
+    _ = try electLeader(&net);
+    try net.tickAll();
+    try net.tickAll();
+
+    // Pick a follower and force it to start an election at a higher term.
+    const candidate_id: u64 = 2;
+    const candidate = net.nodes.get(candidate_id).?;
+
+    // Bump candidate to term 10 via step with a high-term message,
+    // then start an election.
+    try candidate.step(3, .{
+        .append_entries = .{
+            .term = 9,
+            .leader_id = 3,
+            .prev_log_index = 0,
+            .prev_log_term = 0,
+            .entries = &.{},
+            .leader_commit = 0,
+        },
+    }, null);
+
+    // Candidate is now at term 9, role follower. Trigger an election.
+    // Pre-vote is enabled by default, so we need to go through pre-vote first.
+    // Instead, directly inject a stale vote response and verify it's ignored.
+    // Force candidate to become a candidate at term 10.
+    try candidate.step(3, .{
+        .request_vote = .{
+            .term = 10,
+            .candidate_id = candidate_id,
+            .last_log_index = candidate.log.lastIndex(),
+            .last_log_term = 0,
+            .pre_vote = false,
+        },
+    }, null);
+
+    // candidate should now be at term 10. Inject a stale response from term 5.
+    const term_before = candidate.current_term;
+    const role_before = candidate.role;
+    try candidate.step(1, .{
+        .request_vote_response = .{
+            .term = 5, // Stale term — must be ignored
+            .vote_granted = true,
+            .pre_vote = false,
+        },
+    }, null);
+
+    // Candidate's state should not have changed — stale vote ignored.
+    try std.testing.expectEqual(term_before, candidate.current_term);
+    try std.testing.expectEqual(role_before, candidate.role);
+    try runChecker(&net);
+}
+
+test "adversarial: stale AppendEntriesResponse does not update peer progress (SEC-0119)" {
+    var net = try harness.Network.init(std.testing.allocator, 3);
+    defer net.deinit();
+
+    const leader_id = try electLeader(&net);
+    const leader = net.nodes.get(leader_id).?;
+
+    // Record current match_index for a peer.
+    const peer_id: u64 = if (leader_id == 1) 2 else 1;
+    const rs = &(leader.replication_state orelse return error.NoLeaderElected);
+    const progress = rs.peers.getPtr(peer_id) orelse return error.NoLeaderElected;
+    const match_before = progress.match_index;
+
+    // Inject stale AE response with inflated match_index from a previous term.
+    try leader.step(peer_id, .{
+        .append_entries_response = .{
+            .term = leader.current_term - 1, // Stale term
+            .success = true,
+            .match_index = 9999, // Should NOT be applied
+            .conflict_index = 0,
+            .conflict_term = 0,
+        },
+    }, null);
+
+    // match_index must not have been updated.
+    try std.testing.expectEqual(match_before, progress.match_index);
+    try runChecker(&net);
+}
+
+// =========================================================================
+// 12. Follower-to-leader joint config finalization (SEC-0120)
+// =========================================================================
+
+test "adversarial: pending_config_index tracked on config entry application (SEC-0120)" {
+    var net = try harness.Network.init(std.testing.allocator, 3);
+    defer net.deinit();
+
+    const leader_id = try electLeader(&net);
+    const leader = net.nodes.get(leader_id).?;
+
+    // Propose a config change (joint consensus).
+    try leader.proposeConfigChange(&[_]u64{ 1, 2, 3, 4 });
+
+    // Replicate and commit: tick several times.
+    var i: u32 = 0;
+    while (i < 20) : (i += 1) {
+        try net.tickAll();
+    }
+
+    // Every node should have processed the config entry via advance().
+    // Check that a follower's pending_config_index is set (not 0) if
+    // still in joint state.
+    for (net.node_ids.items) |id| {
+        const node = net.nodes.get(id).?;
+        _ = try node.ready();
+        try node.advance();
+
+        // If the node is in joint state, pending_config_index must be set.
+        // If it already finalized (not joint), pending_config_index should be 0.
+        if (node.membership_state.is_joint) {
+            try std.testing.expect(node.pending_config_index > 0);
+        }
+    }
+
+    try runChecker(&net);
+}

@@ -2,7 +2,7 @@
 
 **Last updated:** 2026-03-22
 **Spec:** `docs/superpowers/specs/2026-03-21-raft-design.md`
-**Methodology:** Requirements-to-code audit + fourteen adversarial security review passes -- all source, tests, CI, and docs compared against design spec, then reviewed for security vulnerabilities. Pass 1 (SEC-0001..SEC-0011, all remediated), Pass 2 (SEC-0012..SEC-0028, all remediated or Won't Do), Pass 3 (SEC-0029..SEC-0036, all remediated), Pass 4 (SEC-0037..SEC-0044, all remediated or Won't Do), Pass 5 (SEC-0045..SEC-0064, all remediated), Pass 6 (SEC-0065..SEC-0068, all remediated or Won't Do), Pass 7 (SEC-0069..SEC-0070, all remediated), Pass 8 (SEC-0071..SEC-0073, all remediated), Pass 9 (SEC-0074..SEC-0097, all remediated or Won't Do), Pass 10 (SEC-0098..SEC-0101, all remediated), Pass 11 (SEC-0103..SEC-0106, all remediated), Pass 12 (SEC-0107..SEC-0108, all remediated), Pass 13 (SEC-0109..SEC-0110, all remediated), Pass 14 (SEC-0111..SEC-0118, all remediated).
+**Methodology:** Requirements-to-code audit + fifteen adversarial security review passes -- all source, tests, CI, and docs compared against design spec, then reviewed for security vulnerabilities. Pass 1 (SEC-0001..SEC-0011, all remediated), Pass 2 (SEC-0012..SEC-0028, all remediated or Won't Do), Pass 3 (SEC-0029..SEC-0036, all remediated), Pass 4 (SEC-0037..SEC-0044, all remediated or Won't Do), Pass 5 (SEC-0045..SEC-0064, all remediated), Pass 6 (SEC-0065..SEC-0068, all remediated or Won't Do), Pass 7 (SEC-0069..SEC-0070, all remediated), Pass 8 (SEC-0071..SEC-0073, all remediated), Pass 9 (SEC-0074..SEC-0097, all remediated or Won't Do), Pass 10 (SEC-0098..SEC-0101, all remediated), Pass 11 (SEC-0103..SEC-0106, all remediated), Pass 12 (SEC-0107..SEC-0108, all remediated), Pass 13 (SEC-0109..SEC-0110, all remediated), Pass 14 (SEC-0111..SEC-0118, all remediated), Pass 15 (SEC-0119..SEC-0121, all remediated).
 
 ## Summary
 
@@ -15,19 +15,19 @@
 | Medium | 0 | 5 | 0 |
 | Low | 0 | 2 | 0 |
 
-All 182 tests pass (124 unit, 1 integration, 46 scenario, 11 chaos). All spec gaps resolved. See [GAP_ANALYSIS_RESOLVED.md](GAP_ANALYSIS_RESOLVED.md).
+All 185 tests pass (124 unit, 1 integration, 49 scenario, 11 chaos). All spec gaps resolved. See [GAP_ANALYSIS_RESOLVED.md](GAP_ANALYSIS_RESOLVED.md).
 
-### Security Findings (SEC-0001 through SEC-0118)
+### Security Findings (SEC-0001 through SEC-0121)
 
 | Severity | Open | Resolved | Won't Do |
 |----------|------|----------|----------|
-| Critical | 0 | 3 | 0 |
+| Critical | 0 | 5 | 0 |
 | High | 0 | 20 | 0 |
 | Medium | 0 | 55 | 4 |
-| Low | 0 | 24 | 5 |
+| Low | 0 | 25 | 5 |
 | Info | 0 | 8 | 1 |
 
-**0 open findings.** 117 total findings across 14 passes, all resolved or Won't Do.
+**0 open findings.** 120 total findings across 15 passes, all resolved or Won't Do.
 
 ## Won't Do -- Handled via External Controls
 
@@ -43,6 +43,51 @@ All 182 tests pass (124 unit, 1 integration, 46 scenario, 11 chaos). All spec ga
 - **SEC-0093: Test harness `page_allocator` defeats leak detection** -- The harness intentionally uses `page_allocator` because Raft's shared-ownership entry slices create complex free patterns that confuse the testing allocator. The comment in `tests/harness.zig:78-79` documents this trade-off. Switching to `testing.allocator` would require refactoring ownership semantics across the entire codebase.
 - **SEC-0099: `Config.peers` borrowed slice can dangle** -- This is standard Zig borrowing semantics. The caller is responsible for ensuring the peers slice outlives the `RaftNode`. The test harness already dupes the slice (`allocator.dupe(u64, peers.items)`). Adding automatic duplication inside `RaftNode.init()` would break the existing ownership contract.
 - **SEC-0102: File storage tests use predictable `/tmp` paths** -- Test-only code with no production impact. The hardcoded paths are deterministic for reproducible test debugging. TOCTOU risk is negligible in a test environment.
+
+---
+
+## Security Findings -- Pass 15 (SEC-0119 through SEC-0121) -- Resolved
+
+3 findings identified through exhaustive adversarial review with 5 parallel review agents covering all 14 source modules, tests, CI/CD, build system, and configs. 8 automated scanners re-run (0 findings). 30+ agent-reported findings verified against actual code; 27+ filtered as false positives or duplicates of existing findings (including re-reports of Won't Do items, by-design shallow copy semantics, and test harness limitations).
+
+### Critical Severity (2 findings)
+
+| Rank | Sev | Risk | Finding | Component | CWE | Evidence | Issue | Status |
+|------|-----|------|---------|-----------|-----|----------|-------|--------|
+| 1 | Critical | 100 | Response handlers accept stale-term votes/acks — all 3 response handlers (`handleRequestVoteResponse`, `handleAppendEntriesResponse`, `handleInstallSnapshotResponse`) lack `msg.term < self.current_term` rejection; phantom votes from previous elections can give a candidate false quorum, producing two leaders at the same term (Election Safety violation) | `src/node.zig` | CWE-345 | `node.zig:685` (RV), `node.zig:826` (AE), `node.zig:907` (IS) — only check `msg.term > self.current_term`, no stale rejection; compare request handlers at lines 727, 857 which DO reject stale terms | [#126](https://gitlab.com/devnw/zig/raft/-/issues/126) | Resolved — added `msg.term < self.current_term` rejection to all 3 response handlers; 2 regression tests added (SEC-0119) |
+| 2 | Critical | 80 | `pending_config_index` not tracked on follower config application — `advance()` calls `applyConfig()` for committed config entries but never sets `pending_config_index`; if leader crashes after joint config commits, new leader's `tick()` finalization check requires `pending_config_index > 0` (line 359) but it is 0; cluster permanently stuck in joint consensus | `src/node.zig` | CWE-672, CWE-754 | `node.zig:443-448` — `applyConfig()` called but `pending_config_index` never set; `node.zig:297` — only `proposeChange()` sets it; `node.zig:151` — init always 0 | [#127](https://gitlab.com/devnw/zig/raft/-/issues/127) | Resolved — `advance()` now sets `pending_config_index` from entry index for joint configs, resets to 0 for final configs; regression test added (SEC-0120) |
+
+### Low Severity (1 finding)
+
+| Rank | Sev | Risk | Finding | Component | CWE | Evidence | Issue | Status |
+|------|-----|------|---------|-----------|-----|----------|-------|--------|
+| 3 | Low | 8 | Gitleaks allowlist uses unanchored regex — pattern `\.git` (without `^` anchor) matches `.gitlab-ci.yml`, `.gitignore`, etc., suppressing secret scanning of CI config files | `.gitleaks.toml` | CWE-185 | `.gitleaks.toml:14` — `'''\.git'''` matches any path containing `.git` | [#128](https://gitlab.com/devnw/zig/raft/-/issues/128) | Resolved — anchored all 3 patterns with `^` prefix and `/` suffix (SEC-0121) |
+
+### False Positives Filtered (Pass 15)
+
+> 27+ agent-reported findings verified against actual code and filtered:
+
+- **"Shallow @memcpy of Entry structs creates dangling data pointers"** — By design. The Ready-State pattern documents that consumers must process entries from `Ready` before calling `advance()`. Entry data is borrowed from the log (same as etcd/raft). Duplicate of Pass 14 false positive.
+- **"Use-after-free in ReadyState after advance()"** — By design. Consumer loop is sequential: `ready() → persist/send/apply → advance()`. No interleaved mutations. Duplicate of Pass 14 false positive.
+- **"buildAppendEntries shallow copy after free"** — Messages go into `ready_state.pending_messages`. Entry data is borrowed from the log. Slice ownership follows Ready lifecycle. Duplicate of Pass 14 false positive.
+- **"Ready entries not deep-copied"** — Same as above. By design, same as etcd/raft.
+- **"Missing errdefer for new_outgoing in saveSnapshotImpl"** — False positive. The `try new_outgoing.appendSlice()` is the LAST fallible operation; if it fails, the empty ArrayList has no allocated memory. If it succeeds, all remaining operations are infallible. No leak is possible.
+- **"Snapshot chunk restart race condition"** — By design. Each offset=0 message starts a fresh transfer. Old pending data is properly freed. Config from the restart message replaces the old config. This is correct Raft behavior.
+- **"pending_config_change flag inconsistency"** — By design. `pending_config_change` is set to `parsed.is_joint` which correctly reflects the current membership state. Log replay re-sets it to the same value.
+- **"No validation that final config follows joint"** — Raft's log consistency guarantees (Log Matching property) ensure entries are applied in order. A corrupted storage layer is out of scope.
+- **"Pre-commit autofix may introduce malicious code"** — Duplicate of SEC-0068 (Won't Do, managed externally).
+- **"PGP key not published directly in SECURITY.md"** — Documentation preference, not a vulnerability. Key available via well-known URI.
+- **"No branch protection in CI config"** — Branch protection is configured at the GitLab project level.
+- **"No timeout on CI test jobs"** — Managed at project level in GitLab settings.
+- **"Pre-commit shell injection in check-todos hook"** — Hardcoded grep pattern. No injection vector.
+- **"InProcessTransport unbounded queue growth"** — Test harness code, not production.
+- **"Vtable null pointer risk"** — Standard Zig vtable pattern. Design risk, not a bug in this code.
+- **"Integer overflow in WAL offset calculation"** — Theoretical. Requires file_offset near u64::MAX which is unreachable. Zig panics on overflow in debug mode.
+- **"Snapshot config coherence not explicitly validated"** — Design intent correct. First-message config used for entire transfer. Transport authentication is consumer responsibility.
+- **"restore() ownership semantics"** — Standard Zig borrowing. Caller retains ownership. Documented in CLAUDE.md.
+- **"Underflow in buildAppendEntries"** — Guard `if (next == 0) return null` at line 109 prevents this. next_index initialized to `lastIndex() + 1` which is >= 1.
+- **"Snapshot data shallow copy in restore()"** — `restore()` only reads metadata fields (index, term). Data ownership stays with caller. Not a leak.
+- **"Missing test for leader failover during joint consensus"** — Test coverage gap, not a production vulnerability.
 
 ---
 

@@ -439,9 +439,51 @@ All 11 findings remediated in-place with code changes and tests. Key fixes:
 - "compact() fallback term" — defensive saturation behind valid range guard
 - "Election timeout overflow" — consumer config responsibility
 
+### Pass 15: Deep Adversarial Review (SEC-0119..SEC-0121)
+
+3 new findings identified through exhaustive adversarial review with 5 parallel agents. Focus on protocol-level safety properties (Election Safety, joint consensus liveness), response handler correctness, and CI config scanning coverage. 8 automated scanners re-run (0 findings). 30+ agent-reported findings verified; 27+ filtered as false positives or Won't Do duplicates.
+
+**3 findings filed as GitLab issues (#126-#128). All resolved.** Key findings:
+- Response handlers accept stale-term votes/acks — Election Safety violation via phantom votes (SEC-0119, CRITICAL)
+- `pending_config_index` not tracked on follower config application — joint consensus deadlock on leader failover (SEC-0120, CRITICAL)
+- Gitleaks allowlist unanchored regex suppresses `.gitlab-ci.yml` scanning (SEC-0121, LOW)
+
+**Scanner results (Pass 15):**
+
+| Tool | Version | Result |
+|------|---------|--------|
+| gitleaks | 8.30.0 | 0 findings |
+| trufflehog | 3.92.5 | 0 findings |
+| osv-scanner | 2.3.2 | No package sources |
+| trivy (fs) | 0.69.0 | 0 vulns, 0 secrets |
+| trivy (config) | 0.69.0 | 0 misconfigs |
+| syft + grype | 1.41.1 / 0.107.0 | 0 vulns |
+| semgrep | 1.150.0 | 0 findings (p/default config) |
+| checkov | 3.2.499 | 10 passed, 0 failed |
+
+**False positives filtered (27+):**
+- "Shallow @memcpy creates dangling data pointers" — by design, consumer loop protocol (duplicate of Pass 14)
+- "Use-after-free in ReadyState after advance()" — by design, sequential consumer loop (duplicate of Pass 14)
+- "buildAppendEntries shallow copy after free" — ownership follows Ready lifecycle (duplicate of Pass 14)
+- "Missing errdefer for new_outgoing in saveSnapshotImpl" — false positive: appendSlice is last fallible op, empty ArrayList on failure
+- "Snapshot chunk restart race" — by design, offset=0 starts fresh transfer
+- "pending_config_change flag inconsistency" — by design, set from parsed.is_joint
+- "Final config doesn't validate prior joint" — log consistency guarantees order
+- "Pre-commit autofix" — duplicate of SEC-0068 Won't Do
+- "PGP key not in SECURITY.md" — documentation preference
+- "No branch protection in CI" — project-level GitLab setting
+- "No CI job timeouts" — project-level GitLab setting
+- "Pre-commit shell injection" — hardcoded pattern, no vector
+- "InProcessTransport unbounded queue" — test harness, not production
+- "Vtable null pointer risk" — standard Zig pattern, not a bug
+- "WAL offset integer overflow" — theoretical, requires u64::MAX offset
+- "restore() ownership" — standard Zig borrowing, caller retains
+- "Underflow in buildAppendEntries" — guard at line 109 prevents this
+- "Missing leader failover test during joint" — test gap, not vulnerability
+
 ## Notes
 
-- No secrets detected in repo history (10 commits scanned)
+- No secrets detected in repo history (12 commits scanned)
 - Zig ecosystem lacks lockfile/SBOM tooling -- osv-scanner found no package sources
 - No Dockerfiles, Helm charts, Terraform, or other IaC in repo
 - CI uses component includes from `gitlab.com/devnw/ci-catalog` at `@v1.7.1` (mutable tag) and `@v1.2.1` -- Won't Do (managed at CI catalog level)

@@ -444,6 +444,14 @@ pub const RaftNode = struct {
                 if (entry.kind == .config and entry.data.len > 0) {
                     try self.membership_state.applyConfig(entry);
                     had_config = true;
+                    // Track joint config index so a new leader can finalize
+                    // the membership change if the original leader crashes
+                    // after the joint entry commits (SEC-0120).
+                    if (self.membership_state.is_joint) {
+                        self.pending_config_index = entry.index;
+                    } else {
+                        self.pending_config_index = 0;
+                    }
                 }
             }
             // If config changed and we are leader, sync replication_state
@@ -687,6 +695,10 @@ pub const RaftNode = struct {
             return;
         }
 
+        // Reject stale-term responses to prevent phantom votes from
+        // previous elections counting toward current quorum (SEC-0119).
+        if (msg.term < self.current_term) return;
+
         // Validate sender is a known voter before recording (SEC-0083).
         const cfg = self.membership_state.config();
         var is_voter = false;
@@ -828,6 +840,10 @@ pub const RaftNode = struct {
             return;
         }
 
+        // Reject stale-term responses to prevent incorrect peer progress
+        // updates from previous terms (SEC-0119).
+        if (msg.term < self.current_term) return;
+
         if (msg.success) {
             _ = progress.maybeUpdate(msg.match_index);
             self.maybeCommit();
@@ -910,6 +926,10 @@ pub const RaftNode = struct {
             self.becomeFollower(msg.term, null);
             return;
         }
+
+        // Reject stale-term responses to prevent incorrect peer progress
+        // updates from previous terms (SEC-0119).
+        if (msg.term < self.current_term) return;
 
         // Update peer progress on successful snapshot install (SEC-0074).
         if (msg.success) {
