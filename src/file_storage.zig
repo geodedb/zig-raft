@@ -338,8 +338,14 @@ pub const FileStorage = struct {
             self.wal_end += payload_size + WAL_CRC_SIZE;
         }
 
-        // Sync to disk.
-        try file.sync();
+        // Sync to disk — rollback on failure so in-memory index stays
+        // consistent with what actually reached the disk (SEC-0115).
+        file.sync() catch |err| {
+            self.index.shrinkRetainingCapacity(saved_index_len);
+            self.wal_end = saved_wal_end;
+            file.setEndPos(saved_wal_end) catch {};
+            return err;
+        };
     }
 
     pub fn entriesImpl(self: *FileStorage, lo: u64, hi: u64) ![]rpc.Entry {
@@ -452,11 +458,20 @@ pub const FileStorage = struct {
         self.snapshot_term = snap.metadata.term;
         self.snapshot_data_digest = data_digest;
 
-        // Update cached config (SEC-0039).
-        self.snapshot_config_voters.clearRetainingCapacity();
-        self.snapshot_config_voters_outgoing.clearRetainingCapacity();
-        try self.snapshot_config_voters.appendSlice(self.allocator, snap.metadata.config.voters);
-        try self.snapshot_config_voters_outgoing.appendSlice(self.allocator, snap.metadata.config.voters_outgoing);
+        // Update cached config — build new lists before mutating state so a
+        // failed allocation does not leave voters partially cleared (SEC-0114).
+        var new_voters = std.ArrayList(u64){};
+        try new_voters.appendSlice(self.allocator, snap.metadata.config.voters);
+        errdefer new_voters.deinit(self.allocator);
+
+        var new_outgoing = std.ArrayList(u64){};
+        try new_outgoing.appendSlice(self.allocator, snap.metadata.config.voters_outgoing);
+
+        // All allocations succeeded — swap (infallible).
+        self.snapshot_config_voters.deinit(self.allocator);
+        self.snapshot_config_voters = new_voters;
+        self.snapshot_config_voters_outgoing.deinit(self.allocator);
+        self.snapshot_config_voters_outgoing = new_outgoing;
         self.snapshot_config_is_joint = snap.metadata.config.is_joint;
     }
 
@@ -495,18 +510,22 @@ pub const FileStorage = struct {
     fn finishLoadSnapshot(self: *FileStorage, meta: SnapshotMeta, data_file: std.fs.File) !?rpc.Snapshot {
         var m = meta;
         defer data_file.close();
+        // Clean up meta config on any error return path (SEC-0116).
+        errdefer m.freeConfig(self.allocator);
 
         const size = try data_file.getEndPos();
         // Cap allocation to prevent unbounded memory usage from corrupted
         // or malicious snapshot data files (SEC-0086). Default 256 MiB.
         const max_snap_size: u64 = 256 * 1024 * 1024;
         if (size > max_snap_size) {
-            m.freeConfig(self.allocator);
             return stg.StorageError.Unavailable;
         }
         const data = try self.allocator.alloc(u8, size);
+        // Clean up snapshot data on any error return path (SEC-0116).
+        errdefer self.allocator.free(data);
         const bytes_read = try data_file.readAll(data);
         if (bytes_read != size) {
+            // Not an error return — manual cleanup needed (errdefer won't trigger).
             self.allocator.free(data);
             m.freeConfig(self.allocator);
             return null;
@@ -520,8 +539,6 @@ pub const FileStorage = struct {
             var actual_digest: [32]u8 = undefined;
             hasher.final(&actual_digest);
             if (!std.mem.eql(u8, &actual_digest, &expected_digest)) {
-                self.allocator.free(data);
-                m.freeConfig(self.allocator);
                 return stg.StorageError.Unavailable;
             }
         }

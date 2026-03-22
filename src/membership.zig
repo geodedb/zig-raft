@@ -120,6 +120,10 @@ pub const MembershipState = struct {
                 if (v == prev) return error.InvalidData;
             }
         }
+        // Joint configs must have a non-empty outgoing voter set; non-joint
+        // configs must NOT have one (SEC-0111).
+        if (parsed.is_joint and parsed.voters_outgoing.len == 0) return error.InvalidData;
+        if (!parsed.is_joint and parsed.voters_outgoing.len > 0) return error.InvalidData;
         if (parsed.is_joint) {
             for (parsed.voters_outgoing, 0..) |v, i| {
                 if (v == 0) return error.InvalidData;
@@ -191,6 +195,9 @@ pub const MembershipState = struct {
         self.voters_outgoing.deinit(self.allocator);
         self.voters_outgoing = new_outgoing;
         self.is_joint = cfg.is_joint;
+        // Snapshot replaces the entire membership state, so clear any
+        // pending config change flag (SEC-0112).
+        self.pending_config_change = cfg.is_joint;
     }
 
     /// Check if leader should step down (leader ID not in current voters).

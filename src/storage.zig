@@ -150,7 +150,8 @@ pub const InMemoryStorage = struct {
 
     pub fn entriesImpl(self: *InMemoryStorage, lo: u64, hi: u64) anyerror![]rpc.Entry {
         if (lo <= self.snapshot_index) return StorageError.Compacted;
-        if (lo == hi) return &[_]rpc.Entry{};
+        // Guard: lo >= hi returns empty, matching FileStorage (SEC-0118).
+        if (lo >= hi) return &[_]rpc.Entry{};
 
         const start = lo - self.snapshot_index - 1;
         const end = hi - self.snapshot_index - 1;

@@ -13,7 +13,7 @@
 4. **Automated Scanning** -- 12 tools (see below)
 5. **Manual Adversarial Review** -- full source audit of all 12 src modules, test infra, CI config, pre-commit config
 6. **Scoring** -- CVSS-inspired risk scoring (0-100) based on severity, exploitability, impact
-7. **Issue Filing** -- 93 GitLab issues (#9-#30, #31-#36, #37-#44, #45-#52, #53-#72, #73-#76, #77-#78, #79-#81, #82-#105, #106-#109, #114-#117), labels for severity/type/confidence/status
+7. **Issue Filing** -- 101 GitLab issues (#9-#30, #31-#36, #37-#44, #45-#52, #53-#72, #73-#76, #77-#78, #79-#81, #82-#105, #106-#109, #114-#125), labels for severity/type/confidence/status
 8. **GAP_ANALYSIS.md** -- updated with full stack-ranked findings table
 
 ## Tool Versions
@@ -395,6 +395,49 @@ All 11 findings remediated in-place with code changes and tests. Key fixes:
 - "Integer overflow in trim_count" — `first_unstable >= 1` prevents underflow
 - "Off-by-one in max_bytes entry count" — intentional (matches etcd/raft: always include at least one entry)
 - "Snapshot term validation gap" — `node.zig` rejects stale terms before reaching `SnapshotState`
+
+### Pass 14: Deep Adversarial Review (SEC-0111..SEC-0118)
+
+8 new findings identified through exhaustive adversarial review with 5 parallel agents. Focus on state mutation ordering, error-path resource management, protocol correctness, and vtable consistency. 7 automated scanners re-run (0 findings). 20+ agent-reported findings verified and filtered as false positives or Won't Do duplicates.
+
+**8 findings filed as GitLab issues (#118-#125). All resolved.** Key findings:
+- `applyConfig()` missing is_joint/voters_outgoing consistency check — SEC-0110 gap (SEC-0111, MEDIUM)
+- `pending_config_change`/`pending_config_index` not reset on snapshot application — blocks future config changes (SEC-0112, MEDIUM)
+- `handleInstallSnapshotResponse` uses stale `snapshot_state.snapshot_index` — can inflate match_index (SEC-0113, MEDIUM)
+- `saveSnapshotImpl` config corruption on OOM after clearing cached arrays (SEC-0114, MEDIUM)
+- `appendEntriesImpl` missing rollback on `file.sync()` failure — state inconsistency (SEC-0115, MEDIUM)
+- `finishLoadSnapshot` missing errdefer for config buffers on try error paths (SEC-0116, LOW)
+- `ready()` missing errdefer on `log.slice()` result when `addCommittedEntries` OOMs (SEC-0117, LOW)
+- `InMemoryStorage.entriesImpl` panics on inverted range — `lo == hi` should be `lo >= hi` (SEC-0118, LOW)
+
+**Scanner results (Pass 14):**
+
+| Tool | Version | Result |
+|------|---------|--------|
+| gitleaks | 8.30.0 | 0 findings |
+| trufflehog | 3.92.5 | 0 findings |
+| osv-scanner | 2.3.2 | No package sources |
+| trivy (fs) | 0.69.0 | 0 vulns, 0 secrets |
+| trivy (config) | 0.69.0 | 0 misconfigs |
+| syft + grype | 1.41.1 / 0.107.0 | 0 vulns |
+| semgrep | 1.150.0 | 0 findings (81 rules, 44 files) |
+| checkov | 3.2.499 | 10 passed, 0 failed |
+
+**False positives filtered (20+):**
+- "handleAppendEntries calls becomeFollower before entry validation" — correct Raft behavior per Figure 2
+- "Shallow @memcpy in log.slice() creates dangling data pointers" — by design, same as etcd/raft
+- "committed_entries in Ready are borrowed slices" — consumer loop protocol documented
+- "ready/advance TOCTOU on committed entries" — consumer loop is sequential, no interleaved mutations
+- "buildAppendEntries entries leaked after sendMsg" — ownership follows Ready lifecycle
+- "CI Zig download without checksum" — duplicate of SEC-0008/SEC-0042 Won't Do
+- "check-yaml --unsafe" — duplicate of SEC-0019 Won't Do
+- "CODEOWNERS granularity" — hardening suggestion, not vulnerability
+- "leader_commit trusted" — clamped by commitTo, transport integrity is consumer responsibility
+- "Deserialization trailing bytes" — unreachable, entry data length exact
+- "BLAKE3 does not cover config" — config validated independently
+- "maybeDecrTo ignores conflict_term" — design choice, not vulnerability
+- "compact() fallback term" — defensive saturation behind valid range guard
+- "Election timeout overflow" — consumer config responsibility
 
 ## Notes
 

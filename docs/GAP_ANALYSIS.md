@@ -2,7 +2,7 @@
 
 **Last updated:** 2026-03-22
 **Spec:** `docs/superpowers/specs/2026-03-21-raft-design.md`
-**Methodology:** Requirements-to-code audit + thirteen adversarial security review passes -- all source, tests, CI, and docs compared against design spec, then reviewed for security vulnerabilities. Pass 1 (SEC-0001..SEC-0011, all remediated), Pass 2 (SEC-0012..SEC-0028, all remediated or Won't Do), Pass 3 (SEC-0029..SEC-0036, all remediated), Pass 4 (SEC-0037..SEC-0044, all remediated or Won't Do), Pass 5 (SEC-0045..SEC-0064, all remediated), Pass 6 (SEC-0065..SEC-0068, all remediated or Won't Do), Pass 7 (SEC-0069..SEC-0070, all remediated), Pass 8 (SEC-0071..SEC-0073, all remediated), Pass 9 (SEC-0074..SEC-0097, all remediated or Won't Do), Pass 10 (SEC-0098..SEC-0101, all remediated), Pass 11 (SEC-0103..SEC-0106, all remediated), Pass 12 (SEC-0107..SEC-0108, all remediated), Pass 13 (SEC-0109..SEC-0110, all remediated).
+**Methodology:** Requirements-to-code audit + fourteen adversarial security review passes -- all source, tests, CI, and docs compared against design spec, then reviewed for security vulnerabilities. Pass 1 (SEC-0001..SEC-0011, all remediated), Pass 2 (SEC-0012..SEC-0028, all remediated or Won't Do), Pass 3 (SEC-0029..SEC-0036, all remediated), Pass 4 (SEC-0037..SEC-0044, all remediated or Won't Do), Pass 5 (SEC-0045..SEC-0064, all remediated), Pass 6 (SEC-0065..SEC-0068, all remediated or Won't Do), Pass 7 (SEC-0069..SEC-0070, all remediated), Pass 8 (SEC-0071..SEC-0073, all remediated), Pass 9 (SEC-0074..SEC-0097, all remediated or Won't Do), Pass 10 (SEC-0098..SEC-0101, all remediated), Pass 11 (SEC-0103..SEC-0106, all remediated), Pass 12 (SEC-0107..SEC-0108, all remediated), Pass 13 (SEC-0109..SEC-0110, all remediated), Pass 14 (SEC-0111..SEC-0118, all remediated).
 
 ## Summary
 
@@ -17,17 +17,17 @@
 
 All 182 tests pass (124 unit, 1 integration, 46 scenario, 11 chaos). All spec gaps resolved. See [GAP_ANALYSIS_RESOLVED.md](GAP_ANALYSIS_RESOLVED.md).
 
-### Security Findings (SEC-0001 through SEC-0110)
+### Security Findings (SEC-0001 through SEC-0118)
 
 | Severity | Open | Resolved | Won't Do |
 |----------|------|----------|----------|
 | Critical | 0 | 3 | 0 |
 | High | 0 | 20 | 0 |
-| Medium | 0 | 50 | 4 |
-| Low | 0 | 21 | 5 |
+| Medium | 0 | 55 | 4 |
+| Low | 0 | 24 | 5 |
 | Info | 0 | 8 | 1 |
 
-**0 open findings**. 109 total findings across 13 passes: all resolved or Won't Do.
+**0 open findings.** 117 total findings across 14 passes, all resolved or Won't Do.
 
 ## Won't Do -- Handled via External Controls
 
@@ -43,6 +43,56 @@ All 182 tests pass (124 unit, 1 integration, 46 scenario, 11 chaos). All spec ga
 - **SEC-0093: Test harness `page_allocator` defeats leak detection** -- The harness intentionally uses `page_allocator` because Raft's shared-ownership entry slices create complex free patterns that confuse the testing allocator. The comment in `tests/harness.zig:78-79` documents this trade-off. Switching to `testing.allocator` would require refactoring ownership semantics across the entire codebase.
 - **SEC-0099: `Config.peers` borrowed slice can dangle** -- This is standard Zig borrowing semantics. The caller is responsible for ensuring the peers slice outlives the `RaftNode`. The test harness already dupes the slice (`allocator.dupe(u64, peers.items)`). Adding automatic duplication inside `RaftNode.init()` would break the existing ownership contract.
 - **SEC-0102: File storage tests use predictable `/tmp` paths** -- Test-only code with no production impact. The hardcoded paths are deterministic for reproducible test debugging. TOCTOU risk is negligible in a test environment.
+
+---
+
+## Security Findings -- Pass 14 (SEC-0111 through SEC-0118) -- Resolved
+
+8 findings identified through exhaustive adversarial review with 5 parallel review agents covering all 14 source modules, tests, CI/CD, build system, and configs. 7 automated scanners re-run (0 findings). 30+ agent-reported findings verified against actual code; 20+ filtered as false positives or duplicates of existing findings (including re-reports of Won't Do items SEC-0008/SEC-0019/SEC-0042).
+
+### Medium Severity (5 findings)
+
+| Rank | Sev | Risk | Finding | Component | CWE | Evidence | Issue | Status |
+|------|-----|------|---------|-----------|-----|----------|-------|--------|
+| 1 | Medium | 36 | `applyConfig()` missing `is_joint/voters_outgoing` consistency check — SEC-0110 added check to `validateSnapshotConfig` and `applySnapshotConfig` but missed `applyConfig` | `src/membership.zig` | CWE-20 | `membership.zig:123` enters joint validation without checking outgoing non-empty; line 149 sets `is_joint=true` with empty outgoing | [#118](https://gitlab.com/devnw/zig/raft/-/issues/118) | Resolved — added bidirectional is_joint/voters_outgoing consistency check (SEC-0111) |
+| 2 | Medium | 36 | `pending_config_change` and `pending_config_index` not reset on snapshot application — stale flags block future config changes or trigger spurious finalization | `src/membership.zig`, `src/node.zig` | CWE-672 | `membership.zig:189` sets `is_joint` but not `pending_config_change`; `node.zig:877-892` never resets `pending_config_index` | [#119](https://gitlab.com/devnw/zig/raft/-/issues/119) | Resolved — reset `pending_config_change` in `applySnapshotConfig()` and `pending_config_index` in `handleInstallSnapshot()` (SEC-0112) |
+| 3 | Medium | 24 | `handleInstallSnapshotResponse` uses potentially stale `snapshot_state.snapshot_index` — can inflate follower match_index if leader took new snapshot since sending | `src/node.zig` | CWE-672, CWE-682 | `node.zig:915` — `progress.maybeUpdate(self.snapshot_state.snapshot_index)`; `InstallSnapshotResponse` does not carry installed index | [#120](https://gitlab.com/devnw/zig/raft/-/issues/120) | Resolved — use `log.snapshot_index` (persisted) instead of `snapshot_state.snapshot_index` (SEC-0113) |
+| 4 | Medium | 24 | `saveSnapshotImpl` config corruption on OOM — clears cached config ArrayLists before fallible `appendSlice`, leaving partial config on failure | `src/file_storage.zig` | CWE-460, CWE-662 | `file_storage.zig:456-457` clears arrays; lines 458-459 `try appendSlice` can fail; `compactImpl:558` reads stale config | [#121](https://gitlab.com/devnw/zig/raft/-/issues/121) | Resolved — build new lists before mutating, swap on success (SEC-0114) |
+| 5 | Medium | 24 | `appendEntriesImpl` missing rollback on `file.sync()` failure — in-memory state diverges from durability guarantee | `src/file_storage.zig` | CWE-460 | `file_storage.zig:342` — `try file.sync()` with no rollback; per-entry rollback at lines 280-335 does not cover post-loop sync | [#122](https://gitlab.com/devnw/zig/raft/-/issues/122) | Resolved — added sync failure rollback using saved_wal_end/saved_index_len (SEC-0115) |
+
+### Low Severity (3 findings)
+
+| Rank | Sev | Risk | Finding | Component | CWE | Evidence | Issue | Status |
+|------|-----|------|---------|-----------|-----|----------|-------|--------|
+| 6 | Low | 12 | `finishLoadSnapshot` missing errdefer for config buffers — `try` at lines 499, 507, 508 leak `meta.voters_buf`/`voters_outgoing_buf` on error | `src/file_storage.zig` | CWE-401 | `file_storage.zig:496-508` — no `errdefer m.freeConfig()` covering `try` expressions | [#123](https://gitlab.com/devnw/zig/raft/-/issues/123) | Resolved — added `errdefer m.freeConfig()` and `errdefer self.allocator.free(data)` (SEC-0116) |
+| 7 | Low | 12 | `ready()` missing errdefer for `log.slice()` allocation — OOM in `addCommittedEntries` leaks entries slice | `src/node.zig` | CWE-401 | `node.zig:396-405` — `entries` allocated by `log.slice()` at line 396, freed at line 405 (unreachable on error at line 401) | [#124](https://gitlab.com/devnw/zig/raft/-/issues/124) | Resolved — added errdefer to free entries on addCommittedEntries failure (SEC-0117) |
+| 8 | Low | 8 | `InMemoryStorage.entriesImpl` uses `lo == hi` instead of `lo >= hi` — inverted range panics (inconsistent with FileStorage) | `src/storage.zig` | CWE-20, CWE-617 | `storage.zig:153` — `if (lo == hi)` vs `file_storage.zig:347` — `if (lo >= hi)` | [#125](https://gitlab.com/devnw/zig/raft/-/issues/125) | Resolved — changed to `lo >= hi` matching FileStorage (SEC-0118) |
+
+### False Positives Filtered (Pass 14)
+
+> 20+ agent-reported findings verified against actual code and filtered:
+
+- **"handleAppendEntries calls becomeFollower before entry validation"** — Per Raft paper Figure 2, followers MUST accept a leader with `term >= currentTerm` and update their term. Entry size limits are library-specific rate limiting, not protocol-level acceptance. Term update before entry validation is correct Raft behavior.
+- **"Shallow @memcpy of Entry structs in log.slice() creates dangling data pointers"** — By design. The Ready-State pattern documents that consumers must process entries from `Ready` before calling `advance()`. Entry data is borrowed from the log (same as etcd/raft). Not a bug.
+- **"committed_entries in Ready struct are borrowed ArrayList.items slices"** — By design. The consumer must not call `tick()`/`step()` between `ready()` and `advance()`. Documented in CLAUDE.md consumer loop pattern.
+- **"ready() and advance() both call log.slice() over same committed range — TOCTOU"** — The consumer loop is sequential: `ready() → persist/send/apply → advance()`. No interleaved mutations occur. `advance()` re-reads for config application which is correct.
+- **"buildAppendEntries entries slice leaked after sendMsg"** — Messages go into `ready_state.pending_messages` (ArrayList). The consumer receives them in `Ready.messages` and sends via their transport. Entry data is borrowed from the log. Slice ownership follows the Ready lifecycle — cleared on `advance()`.
+- **"CI downloads Zig toolchain without checksum"** — Duplicate of SEC-0008/SEC-0042 (Won't Do, managed at CI catalog level).
+- **"check-yaml --unsafe in pre-commit"** — Duplicate of SEC-0019 (Won't Do, managed externally).
+- **"CODEOWNERS lacks granular security-critical path coverage"** — SEC-0010 resolved with `@devnw`. Granular paths are a hardening suggestion, not a vulnerability.
+- **"leader_commit trusted without upper bound"** — `commitTo` clamps to `@min(leader_commit, last_new_index)` then `@min(result, lastIndex())`. Defense-in-depth already present. Transport integrity is consumer responsibility.
+- **"Deserialization accepts trailing garbage bytes"** — The deserializer parses exactly the declared structure. Trailing bytes are unreachable: entry data length is stored in the log/WAL and matches exactly. Not exploitable.
+- **"BLAKE3 checksum does not cover config metadata"** — Config is validated independently via `validateSnapshotConfig`. Snapshot integrity covers data; config integrity is checked on application. Defense-in-depth.
+- **"maybeDecrTo ignores rejected_index and conflict_term"** — Design decision matching simplified Raft implementations. The `conflict_index` is the effective backtrack target. Performance optimization (term-based skipping) is not implemented but not a security vulnerability.
+- **"compact() uses fallback snapshot_term on term lookup failure"** — The `compact_index > snapshot_index` guard at line 226 ensures the index is in a valid range. The fallback is a safety net for theoretical I/O errors, not a vulnerability.
+- **"Election timeout overflow produces degenerate range"** — `election_tick` is a u32 config value set by the consumer. Values > 2^31 are unreasonable (billions of ticks). Consumer responsibility.
+- **"firstUnstableIndex silently saturates at lastIndex() on overflow"** — `lastIndex()` reaching u64::MAX is unreachable in any practical deployment. Defensive saturation is correct.
+- **"Checker claims data verification but only compares terms"** — The SEC-0089 reference in the doc comment is aspirational. Test gap, not a security vulnerability in production code.
+- **"Integration test suite has only 1 test"** — Test coverage gap, not a production vulnerability.
+- **"Chaos tests don't exercise snapshot transfer under faults"** — Test coverage gap, not a production vulnerability.
+- **"Harness tickAll two-round delivery limitation"** — Test design choice for deterministic behavior, not a vulnerability.
+- **"InstallSnapshotResponse lacks error discrimination"** — Protocol limitation. Leader safely restarts from chunk 0 on any failure. Correctness preserved.
+- **"Zero-length slice ownership ambiguity (heap vs comptime literal)"** — The `len > 0` guard consistently prevents freeing zero-length slices. Safe by construction.
 
 ---
 

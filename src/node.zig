@@ -397,6 +397,8 @@ pub const RaftNode = struct {
                 slice_lo,
                 slice_hi,
             );
+            // Free slice on error so addCommittedEntries failure doesn't leak (SEC-0117).
+            errdefer if (entries.len > 0) self.allocator.free(entries);
 
             try self.ready_state.addCommittedEntries(entries);
 
@@ -884,6 +886,8 @@ pub const RaftNode = struct {
             if (snapshot_val.metadata.config.voters.len > 0) {
                 try self.membership_state.applySnapshotConfig(snapshot_val.metadata.config);
             }
+            // Snapshot supersedes any in-flight config change (SEC-0112).
+            self.pending_config_index = 0;
             self.ready_state.setSnapshot(snapshot_val);
             self.sendMsg(msg.leader_id, rpc.Message{ .install_snapshot_response = .{
                 .term = self.current_term,
@@ -909,10 +913,10 @@ pub const RaftNode = struct {
 
         // Update peer progress on successful snapshot install (SEC-0074).
         if (msg.success) {
-            // The follower has the snapshot, so its match_index is at least
-            // the snapshot index. Update progress so the leader can resume
-            // normal replication from the snapshot point.
-            _ = progress.maybeUpdate(self.snapshot_state.snapshot_index);
+            // Use log.snapshot_index (persisted) rather than
+            // snapshot_state.snapshot_index which may have advanced since
+            // the snapshot was sent (SEC-0113).
+            _ = progress.maybeUpdate(self.log.snapshot_index);
             self.maybeCommit();
         }
     }
