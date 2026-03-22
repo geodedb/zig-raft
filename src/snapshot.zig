@@ -195,7 +195,11 @@ pub const SnapshotState = struct {
             }
         }
 
-        try pending.data.appendSlice(self.allocator, msg.data);
+        pending.data.appendSlice(self.allocator, msg.data) catch |err| {
+            // On OOM, clean up pending state to prevent leak (SEC-0096).
+            self.clearPending();
+            return err;
+        };
 
         if (msg.done) {
             const assembled = pending.data.items;

@@ -13,6 +13,10 @@ pub const PeerProgress = struct {
 
     /// After rejection with conflict hints, update next_index for fast backtracking.
     /// Returns true if next_index changed.
+    /// After rejection with conflict hints, update next_index for fast backtracking.
+    /// Returns true if next_index changed.
+    /// Only allows backward movement of next_index to prevent a malicious
+    /// conflict_index from jumping next_index forward (SEC-0076).
     pub fn maybeDecrTo(
         self: *PeerProgress,
         rejected_index: u64,
@@ -22,7 +26,8 @@ pub const PeerProgress = struct {
         _ = rejected_index;
         _ = conflict_term;
         const new_next = @max(conflict_index, 1);
-        if (new_next == self.next_index) return false;
+        // Only allow backward movement (SEC-0076).
+        if (new_next >= self.next_index) return false;
         self.next_index = new_next;
         return true;
     }
@@ -58,9 +63,11 @@ pub const ReplicationState = struct {
             .peers = std.AutoHashMap(u64, PeerProgress).init(allocator),
             .allocator = allocator,
         };
+        // Checked overflow: last_index + 1 (SEC-0070).
+        const next_index = std.math.add(u64, last_index, 1) catch last_index;
         for (peer_ids) |pid| {
             try rs.peers.put(pid, .{
-                .next_index = last_index + 1,
+                .next_index = next_index,
                 .match_index = 0,
             });
         }
@@ -74,9 +81,11 @@ pub const ReplicationState = struct {
     /// Reset all peers' next_index to last_index + 1, match_index to 0 (on becoming leader).
     pub fn resetPeers(self: *ReplicationState, peer_ids: []const u64, last_index: u64) !void {
         self.peers.clearRetainingCapacity();
+        // Checked overflow: last_index + 1 (SEC-0070).
+        const next_index = std.math.add(u64, last_index, 1) catch last_index;
         for (peer_ids) |pid| {
             try self.peers.put(pid, .{
-                .next_index = last_index + 1,
+                .next_index = next_index,
                 .match_index = 0,
             });
         }
@@ -96,6 +105,8 @@ pub const ReplicationState = struct {
     ) !?rpc.Message {
         const progress = self.peers.get(peer_id) orelse return null;
         const next = progress.next_index;
+        // Guard against underflow when next_index is 0 (SEC-0092).
+        if (next == 0) return null;
         const prev_log_index = next - 1;
 
         // Get prev_log_term; if compacted, peer needs a snapshot.
@@ -104,9 +115,11 @@ pub const ReplicationState = struct {
             return err;
         };
 
-        // Compute the range of entries to send.
+        // Compute the range of entries to send (SEC-0070: checked overflow).
         const last = raft_log_ptr.lastIndex();
-        const hi = @min(next + @as(u64, max_entries), last + 1);
+        const next_plus = std.math.add(u64, next, @as(u64, max_entries)) catch std.math.maxInt(u64);
+        const last_plus = std.math.add(u64, last, 1) catch std.math.maxInt(u64);
+        const hi = @min(next_plus, last_plus);
 
         // Get entries from the log.
         const entries = raft_log_ptr.slice(next, hi) catch |err| {
@@ -233,16 +246,20 @@ test "PeerProgress.maybeUpdate advances match_index and next_index" {
 test "PeerProgress.maybeDecrTo backs off next_index using conflict hints" {
     var pp = PeerProgress{ .next_index = 10, .match_index = 0 };
 
-    // Conflict at index 5, term 2 -- should jump to 5.
+    // Conflict at index 5, term 2 -- should back off to 5.
     try std.testing.expect(pp.maybeDecrTo(9, 5, 2));
     try std.testing.expectEqual(@as(u64, 5), pp.next_index);
 
-    // Conflict with term 0 (log too short) -- jump to conflict_index.
+    // Conflict with term 0 (log too short) -- back off to conflict_index.
     try std.testing.expect(pp.maybeDecrTo(4, 3, 0));
     try std.testing.expectEqual(@as(u64, 3), pp.next_index);
 
-    // Same value should not change.
+    // Same value should not change (SEC-0076: >= prevents forward jump).
     try std.testing.expect(!pp.maybeDecrTo(2, 3, 0));
+    try std.testing.expectEqual(@as(u64, 3), pp.next_index);
+
+    // Forward jump should be rejected (SEC-0076).
+    try std.testing.expect(!pp.maybeDecrTo(2, 100, 0));
     try std.testing.expectEqual(@as(u64, 3), pp.next_index);
 
     // Never go below 1.

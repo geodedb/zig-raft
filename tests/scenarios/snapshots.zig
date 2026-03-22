@@ -121,6 +121,7 @@ test "scenario: reportSnapshot updates snapshot_state and storage" {
     // Storage should have the snapshot.
     const stored = try leader.storage.loadSnapshot();
     try std.testing.expect(stored != null);
+    defer raft.freeSnapshot(allocator, stored.?);
     try std.testing.expectEqual(applied_before, stored.?.metadata.index);
     try std.testing.expectEqualStrings("test-snapshot-payload", stored.?.data);
 

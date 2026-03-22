@@ -386,7 +386,7 @@ test "file_storage integration: snapshot save and load in cluster" {
     const store = cluster.storages[leader_id - 1];
     const loaded = try store.loadSnapshotImpl();
     try std.testing.expect(loaded != null);
-    defer std.heap.page_allocator.free(loaded.?.data);
+    defer raft.storage.freeSnapshot(std.heap.page_allocator, loaded.?);
     try std.testing.expectEqualStrings("test-snapshot-data", loaded.?.data);
 
     try cluster.checkInvariants();

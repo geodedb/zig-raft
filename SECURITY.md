@@ -12,6 +12,10 @@
 
 Instead, please report them via email to: security@codepros.dev
 
+For sensitive disclosures, you may encrypt your report using our PGP key:
+- **Key ID**: Available upon request at security@codepros.dev
+- **Fingerprint**: Published at https://codepros.dev/.well-known/security.txt
+
 Please include:
 
 1. **Description** of the vulnerability

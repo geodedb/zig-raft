@@ -75,6 +75,7 @@ const WAL_MAX_RECORD_DATA_LEN: u32 = 64 * 1024 * 1024;
 
 pub const FileStorage = struct {
     dir: std.fs.Dir,
+    lock_file: ?std.fs.File,
     wal_file: ?std.fs.File,
     wal_end: u64,
     index: std.ArrayList(IndexEntry),
@@ -89,6 +90,9 @@ pub const FileStorage = struct {
     hard_state: state.HardState,
     allocator: std.mem.Allocator,
 
+    /// Error returned when the data directory is already locked by another process (SEC-0066).
+    pub const DirectoryAlreadyLocked = error.WouldBlock;
+
     /// In-memory index entry for fast lookups.
     const IndexEntry = struct {
         file_offset: u64,
@@ -97,6 +101,15 @@ pub const FileStorage = struct {
         data_len: u32,
     };
 
+    /// Flush directory metadata to disk after a rename (SEC-0065).
+    /// Zig's Dir.fd uses O_PATH which does not support fsync, so we
+    /// open a syncable fd via openat(".", O_DIRECTORY) and fsync it.
+    fn syncDir(self: *FileStorage) !void {
+        const sync_fd = try std.posix.openat(self.dir.fd, ".", .{ .DIRECTORY = true }, 0);
+        defer std.posix.close(sync_fd);
+        try std.posix.fsync(sync_fd);
+    }
+
     /// Open or create a FileStorage at the given directory path.
     /// Recovers existing state from files if present.
     pub fn init(allocator: std.mem.Allocator, dir_path: []const u8) !FileStorage {
@@ -104,8 +117,18 @@ pub const FileStorage = struct {
         var dir = try std.fs.cwd().makeOpenPath(dir_path, .{});
         errdefer dir.close();
 
+        // Acquire exclusive advisory lock on data directory (SEC-0066).
+        // Prevents two processes from corrupting state by writing concurrently.
+        const lock_file = try dir.createFile(".lock", .{
+            .lock = .exclusive,
+            .lock_nonblocking = true,
+            .truncate = false,
+        });
+        errdefer lock_file.close();
+
         var fs = FileStorage{
             .dir = dir,
+            .lock_file = lock_file,
             .wal_file = null,
             .wal_end = 0,
             .index = .{},
@@ -118,6 +141,15 @@ pub const FileStorage = struct {
             .hard_state = state.HardState.initial,
             .allocator = allocator,
         };
+        // Free heap resources on init failure (SEC-0069). Dir and lock_file
+        // are handled by their own errdefers above; these cover ArrayLists
+        // and the WAL file handle that may be opened during recoverWal().
+        errdefer {
+            fs.index.deinit(allocator);
+            fs.snapshot_config_voters.deinit(allocator);
+            fs.snapshot_config_voters_outgoing.deinit(allocator);
+            if (fs.wal_file) |f| f.close();
+        }
 
         // Clean up stale tmp files from interrupted snapshot writes (SEC-0041).
         dir.deleteFile("snapshot.data.tmp") catch {};
@@ -130,6 +162,12 @@ pub const FileStorage = struct {
         // Recover snapshot metadata (config now included in V3 format, SEC-0039).
         const snap_meta = fs.readSnapshotMeta() catch null;
         if (snap_meta) |meta| {
+            // Free the owned buffers from readSnapshotMeta on both success and
+            // error paths (SEC-0069). appendSlice below can fail with OOM,
+            // which would leak meta's config buffers without this defer.
+            var m = meta;
+            defer m.freeConfig(allocator);
+
             fs.snapshot_index = meta.index;
             fs.snapshot_term = meta.term;
             fs.snapshot_data_digest = meta.data_digest orelse (.{0} ** 32);
@@ -139,9 +177,6 @@ pub const FileStorage = struct {
                 try fs.snapshot_config_voters_outgoing.appendSlice(allocator, cfg.voters_outgoing);
                 fs.snapshot_config_is_joint = cfg.is_joint;
             }
-            // Free the owned buffers from readSnapshotMeta — we've copied into ArrayLists.
-            var m = meta;
-            m.freeConfig(allocator);
         }
 
         // Open WAL and rebuild in-memory index with torn write recovery.
@@ -155,6 +190,8 @@ pub const FileStorage = struct {
         self.index.deinit(self.allocator);
         self.snapshot_config_voters.deinit(self.allocator);
         self.snapshot_config_voters_outgoing.deinit(self.allocator);
+        // Release exclusive directory lock (SEC-0066).
+        if (self.lock_file) |lf| lf.close();
         self.dir.close();
     }
 
@@ -168,6 +205,7 @@ pub const FileStorage = struct {
 
     const vtable_inst = stg.Storage.VTable{
         .saveHardState = typeErasedSaveHardState,
+        .loadHardState = typeErasedLoadHardState,
         .appendEntries = typeErasedAppendEntries,
         .entries = typeErasedEntries,
         .term = typeErasedTerm,
@@ -201,6 +239,7 @@ pub const FileStorage = struct {
         tmp.close();
 
         try self.dir.rename("hard_state.tmp", "hard_state");
+        try self.syncDir(); // SEC-0065: flush directory metadata to disk.
         self.hard_state = hs;
     }
 
@@ -237,6 +276,8 @@ pub const FileStorage = struct {
                 // Rollback: trim index entries added in this batch.
                 self.index.shrinkRetainingCapacity(saved_index_len);
                 self.wal_end = saved_wal_end;
+                // Truncate orphaned bytes to prevent ghost entries on recovery (SEC-0081).
+                file.setEndPos(saved_wal_end) catch {};
                 return stg.StorageError.Unavailable;
             }
             const data_len: u32 = @intCast(entry.data.len);
@@ -246,6 +287,7 @@ pub const FileStorage = struct {
             const payload = self.allocator.alloc(u8, payload_size) catch |err| {
                 self.index.shrinkRetainingCapacity(saved_index_len);
                 self.wal_end = saved_wal_end;
+                file.setEndPos(saved_wal_end) catch {};
                 return err;
             };
             defer self.allocator.free(payload);
@@ -267,11 +309,13 @@ pub const FileStorage = struct {
             file.writeAll(payload) catch |err| {
                 self.index.shrinkRetainingCapacity(saved_index_len);
                 self.wal_end = saved_wal_end;
+                file.setEndPos(saved_wal_end) catch {};
                 return err;
             };
             file.writeAll(&crc_buf) catch |err| {
                 self.index.shrinkRetainingCapacity(saved_index_len);
                 self.wal_end = saved_wal_end;
+                file.setEndPos(saved_wal_end) catch {};
                 return err;
             };
 
@@ -284,6 +328,7 @@ pub const FileStorage = struct {
             }) catch |err| {
                 self.index.shrinkRetainingCapacity(saved_index_len);
                 self.wal_end = saved_wal_end;
+                file.setEndPos(saved_wal_end) catch {};
                 return err;
             };
 
@@ -304,13 +349,21 @@ pub const FileStorage = struct {
         const count = end_pos - start_pos + 1;
 
         const result = try self.allocator.alloc(rpc.Entry, count);
-        errdefer self.allocator.free(result);
+        // Track successfully read entries so errdefer frees their .data (SEC-0080).
+        var read_count: usize = 0;
+        errdefer {
+            for (result[0..read_count]) |e| {
+                if (e.data.len > 0) self.allocator.free(@constCast(e.data));
+            }
+            self.allocator.free(result);
+        }
 
         const file = self.wal_file orelse return stg.StorageError.Unavailable;
 
         for (0..count) |i| {
             const ie = self.index.items[start_pos + i];
             result[i] = try self.readEntryAt(file, ie);
+            read_count += 1;
         }
 
         return result;
@@ -390,6 +443,7 @@ pub const FileStorage = struct {
         // stale snapshot.data via BLAKE3 mismatch and snapshot.data.tmp is present.
         try self.dir.rename("snapshot.meta.tmp", "snapshot.meta");
         try self.dir.rename("snapshot.data.tmp", "snapshot.data");
+        try self.syncDir(); // SEC-0065: flush both renames to disk.
 
         self.snapshot_index = snap.metadata.index;
         self.snapshot_term = snap.metadata.term;
@@ -419,6 +473,7 @@ pub const FileStorage = struct {
                     meta.freeConfig(self.allocator);
                     return null;
                 };
+                self.syncDir() catch {}; // SEC-0065: best-effort during recovery.
                 // Retry open after recovery rename.
                 const recovered = self.dir.openFile("snapshot.data", .{}) catch {
                     meta.freeConfig(self.allocator);
@@ -439,6 +494,13 @@ pub const FileStorage = struct {
         defer data_file.close();
 
         const size = try data_file.getEndPos();
+        // Cap allocation to prevent unbounded memory usage from corrupted
+        // or malicious snapshot data files (SEC-0086). Default 256 MiB.
+        const max_snap_size: u64 = 256 * 1024 * 1024;
+        if (size > max_snap_size) {
+            m.freeConfig(self.allocator);
+            return stg.StorageError.Unavailable;
+        }
         const data = try self.allocator.alloc(u8, size);
         const bytes_read = try data_file.readAll(data);
         if (bytes_read != size) {
@@ -514,9 +576,12 @@ pub const FileStorage = struct {
         const file = self.wal_file orelse return;
 
         // Read remaining entries from the old WAL.
+        // Track how many entries were successfully read so the defer only
+        // frees initialized entries, not uninitialized garbage (SEC-0078).
         const entries = try self.allocator.alloc(rpc.Entry, remaining_count);
+        var entries_read: usize = 0;
         defer {
-            for (entries) |e| {
+            for (entries[0..entries_read]) |e| {
                 if (e.data.len > 0) self.allocator.free(@constCast(e.data));
             }
             self.allocator.free(entries);
@@ -524,6 +589,7 @@ pub const FileStorage = struct {
 
         for (0..remaining_count) |i| {
             entries[i] = try self.readEntryAt(file, self.index.items[compact_pos + 1 + i]);
+            entries_read += 1;
         }
 
         // Close old WAL before rewriting.
@@ -579,6 +645,7 @@ pub const FileStorage = struct {
         }
 
         try self.dir.rename("wal.tmp", "wal");
+        try self.syncDir(); // SEC-0065: flush WAL rename to disk.
 
         // Update in-memory state.
         self.index.deinit(self.allocator);
@@ -624,6 +691,7 @@ pub const FileStorage = struct {
         try tmp.sync();
         tmp.close();
         try self.dir.rename("snapshot.meta.tmp", "snapshot.meta");
+        try self.syncDir(); // SEC-0065: flush rename to disk.
     }
 
     pub fn loadHardState(self: *FileStorage) state.HardState {
@@ -914,9 +982,19 @@ pub const FileStorage = struct {
     // Type-erased vtable wrappers
     // ========================================================================
 
+    /// Load persisted hard state (SEC-0077).
+    pub fn loadHardStateImpl(self: *FileStorage) anyerror!state.HardState {
+        return self.hard_state;
+    }
+
     fn typeErasedSaveHardState(ptr: *anyopaque, hs: state.HardState) anyerror!void {
         const self: *FileStorage = @ptrCast(@alignCast(ptr));
         return self.saveHardStateImpl(hs);
+    }
+
+    fn typeErasedLoadHardState(ptr: *anyopaque) anyerror!state.HardState {
+        const self: *FileStorage = @ptrCast(@alignCast(ptr));
+        return self.loadHardStateImpl();
     }
 
     fn typeErasedAppendEntries(ptr: *anyopaque, ents: []const rpc.Entry) anyerror!void {
@@ -1542,4 +1620,25 @@ test "file_storage: snapshot.meta CRC detects corruption (SEC-0036)" {
     // Reading should fail.
     const result = fs.readSnapshotMeta();
     try testing.expectError(error.InvalidSnapshotMeta, result);
+}
+
+test "file_storage: concurrent init on same directory fails with WouldBlock (SEC-0066)" {
+    defer cleanupTestDir("lock-test");
+    var fs1 = try FileStorage.init(testing.allocator, "/tmp/raft-file-storage-test-lock-test");
+    defer fs1.deinit();
+
+    // A second FileStorage on the same directory must fail.
+    const result = FileStorage.init(testing.allocator, "/tmp/raft-file-storage-test-lock-test");
+    try testing.expectError(error.WouldBlock, result);
+}
+
+test "file_storage: lock released after deinit allows re-init (SEC-0066)" {
+    defer cleanupTestDir("lock-reopen");
+    {
+        var fs1 = try FileStorage.init(testing.allocator, "/tmp/raft-file-storage-test-lock-reopen");
+        fs1.deinit();
+    }
+    // After deinit, another init on the same directory should succeed.
+    var fs2 = try FileStorage.init(testing.allocator, "/tmp/raft-file-storage-test-lock-reopen");
+    fs2.deinit();
 }

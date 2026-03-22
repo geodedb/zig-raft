@@ -43,6 +43,9 @@ result
 # Nix/direnv
 .direnv/
 
+# Tool metadata (SEC-0104)
+.observer.lock
+
 # Coverage
 coverage/
 *.gcov

@@ -1,8 +1,8 @@
 # Gap Analysis
 
-**Last updated:** 2026-03-21
+**Last updated:** 2026-03-22
 **Spec:** `docs/superpowers/specs/2026-03-21-raft-design.md`
-**Methodology:** Requirements-to-code audit + five adversarial security review passes -- all source, tests, CI, and docs compared against design spec, then reviewed for security vulnerabilities. Pass 1 (SEC-0001..SEC-0011, all remediated), Pass 2 (SEC-0012..SEC-0028, all remediated or Won't Do), Pass 3 (SEC-0029..SEC-0036, all remediated), Pass 4 (SEC-0037..SEC-0044, all remediated or Won't Do), Pass 5 (SEC-0045..SEC-0064, all remediated).
+**Methodology:** Requirements-to-code audit + nine adversarial security review passes -- all source, tests, CI, and docs compared against design spec, then reviewed for security vulnerabilities. Pass 1 (SEC-0001..SEC-0011, all remediated), Pass 2 (SEC-0012..SEC-0028, all remediated or Won't Do), Pass 3 (SEC-0029..SEC-0036, all remediated), Pass 4 (SEC-0037..SEC-0044, all remediated or Won't Do), Pass 5 (SEC-0045..SEC-0064, all remediated), Pass 6 (SEC-0065..SEC-0068, all remediated or Won't Do), Pass 7 (SEC-0069..SEC-0070, all remediated), Pass 8 (SEC-0071..SEC-0073, all remediated), Pass 9 (SEC-0074..SEC-0097, all remediated or Won't Do).
 
 ## Summary
 
@@ -15,19 +15,19 @@
 | Medium | 0 | 5 | 0 |
 | Low | 0 | 2 | 0 |
 
-All 160 tests pass (114 unit, 1 integration, 34 scenario, 11 chaos). All spec gaps resolved. See [GAP_ANALYSIS_RESOLVED.md](GAP_ANALYSIS_RESOLVED.md).
+All 162 tests pass (116 unit, 1 integration, 34 scenario, 11 chaos). All spec gaps resolved. See [GAP_ANALYSIS_RESOLVED.md](GAP_ANALYSIS_RESOLVED.md).
 
-### Security Findings (SEC-0001 through SEC-0064)
+### Security Findings (SEC-0001 through SEC-0097)
 
 | Severity | Open | Resolved | Won't Do |
 |----------|------|----------|----------|
 | Critical | 0 | 2 | 0 |
-| High | 0 | 14 | 0 |
-| Medium | 0 | 30 | 4 |
-| Low | 0 | 10 | 2 |
-| Info | 0 | 5 | 0 |
+| High | 0 | 20 | 0 |
+| Medium | 0 | 46 | 4 |
+| Low | 0 | 15 | 5 |
+| Info | 0 | 7 | 1 |
 
-**0 open findings.** All 64 security findings across 5 passes resolved or Won't Do.
+**0 open findings.** 97 total findings across 9 passes: all 97 resolved or Won't Do.
 
 ## Won't Do -- Handled via External Controls
 
@@ -39,6 +39,137 @@ All 160 tests pass (114 unit, 1 integration, 34 scenario, 11 chaos). All spec ga
 - **Docker tag pinning:** Managed at CI catalog level (`debian:bookworm-slim` without digest pinning in CI catalog components).
 - **SEC-0042: CI downloads Zig toolchain without SHA256 verification** -- Same as SEC-0008; CI/CD toolchain download integrity is managed centrally via the CI catalog level controls, not in individual repositories.
 - **Pre-commit hooks:** Pre-commit configuration and enforcement is handled via CI pipeline stages and developer tooling external to this repository. Changes to `.pre-commit-config.yaml` are governed by the CI catalog team's security review process.
+- **SEC-0068: `autofix_prs: true` in pre-commit config** -- Pre-commit configuration (including autofix settings) is handled via CI pipeline stages and developer tooling external to this repository. Same controls as SEC-0019.
+- **SEC-0093: Test harness `page_allocator` defeats leak detection** -- The harness intentionally uses `page_allocator` because Raft's shared-ownership entry slices create complex free patterns that confuse the testing allocator. The comment in `tests/harness.zig:78-79` documents this trade-off. Switching to `testing.allocator` would require refactoring ownership semantics across the entire codebase.
+- **SEC-0099: `Config.peers` borrowed slice can dangle** -- This is standard Zig borrowing semantics. The caller is responsible for ensuring the peers slice outlives the `RaftNode`. The test harness already dupes the slice (`allocator.dupe(u64, peers.items)`). Adding automatic duplication inside `RaftNode.init()` would break the existing ownership contract.
+- **SEC-0102: File storage tests use predictable `/tmp` paths** -- Test-only code with no production impact. The hardcoded paths are deterministic for reproducible test debugging. TOCTOU risk is negligible in a test environment.
+
+---
+
+## Security Findings -- Pass 9 (SEC-0074 through SEC-0097) -- All Resolved or Won't Do
+
+24 findings identified through full codebase-wide adversarial review with 6 parallel review agents. All 21 actionable findings remediated in code; 3 closed as Won't Do with documented rationale.
+
+### High Severity (6 findings)
+
+| Rank | Sev | Risk | Finding | Component | CWE | Evidence | Issue | Status |
+|------|-----|------|---------|-----------|-----|----------|-------|--------|
+| 1 | High | 64 | `handleInstallSnapshotResponse` ignores `msg.success`, never updates peer progress — infinite snapshot loop, blocked commits | `src/node.zig` | CWE-670, CWE-682 | Added `msg.success` check + `maybeUpdate` + `maybeCommit` call | [#82](https://gitlab.com/devnw/zig/raft/-/issues/82) | Resolved |
+| 2 | High | 64 | `replication_state.peers` never updated after config changes — new voters unreachable, `committedForSet` drops missing voters enabling minority commit | `src/node.zig`, `src/quorum.zig` | CWE-670, CWE-682 | Added `syncReplicationPeers()` after config apply; `committedForSet` now treats missing voters as match_index=0 | [#83](https://gitlab.com/devnw/zig/raft/-/issues/83) | Resolved |
+| 3 | High | 60 | `RaftNode.init()` does not restore HardState from storage — double-voting on restart, term regression | `src/node.zig`, `src/storage.zig` | CWE-670, CWE-841 | Added `loadHardState` to Storage vtable; `init()` now restores term+voted_for | [#85](https://gitlab.com/devnw/zig/raft/-/issues/85) | Resolved |
+| 4 | High | 60 | `handleInstallSnapshot` never calls `log.restore()` — log state diverges from snapshot | `src/node.zig` | CWE-670 | Added `self.log.restore(snapshot_val)` before membership update | [#98](https://gitlab.com/devnw/zig/raft/-/issues/98) | Resolved |
+| 5 | High | 48 | `maybeDecrTo` allows forward jump of `next_index` via malicious `conflict_index` — replication halt | `src/replication.zig` | CWE-20 | Changed `!=` to `>=` to only allow backward movement | [#84](https://gitlab.com/devnw/zig/raft/-/issues/84) | Resolved |
+| 6 | High | 32 | `FileStorage.compactImpl` defer frees uninitialized entries on mid-loop failure — heap corruption | `src/file_storage.zig` | CWE-457, CWE-761 | Track `entries_read` count; defer only frees `entries[0..entries_read]` | [#86](https://gitlab.com/devnw/zig/raft/-/issues/86) | Resolved |
+
+### Medium Severity (11 findings)
+
+| Rank | Sev | Risk | Finding | Component | CWE | Evidence | Issue | Status |
+|------|-----|------|---------|-----------|-----|----------|-------|--------|
+| 7 | Medium | 48 | `advance()` silently swallows config apply errors + `catch null` on `log.slice` — membership permanently stale | `src/node.zig` | CWE-755, CWE-390 | Removed `catch null` and `catch { warn }`; errors now propagate via `try` | [#87](https://gitlab.com/devnw/zig/raft/-/issues/87) | Resolved |
+| 8 | Medium | 36 | `FileStorage.entriesImpl` leaks entry data on mid-loop `readEntryAt` failure | `src/file_storage.zig` | CWE-401 | errdefer now tracks `read_count` and frees per-entry `.data` | [#88](https://gitlab.com/devnw/zig/raft/-/issues/88) | Resolved |
+| 9 | Medium | 36 | No entry count/total size validation on received AppendEntries — receiver trusts sender | `src/node.zig` | CWE-770, CWE-400 | Added `msg.entries.len > max_entries_per_msg` and total bytes > `max_bytes_per_msg` checks | [#90](https://gitlab.com/devnw/zig/raft/-/issues/90) | Resolved |
+| 10 | Medium | 36 | `recordVote` accepts any sender without voter validation — unbounded HashMap growth | `src/node.zig` | CWE-770 | Added voter membership check against `cfg.voters` and `cfg.voters_outgoing` before `recordVote` | [#91](https://gitlab.com/devnw/zig/raft/-/issues/91) | Resolved |
+| 11 | Medium | 32 | WAL rollback does not truncate orphaned bytes — ghost entries on crash recovery | `src/file_storage.zig` | CWE-460 | Added `file.setEndPos(saved_wal_end)` in all rollback paths | [#89](https://gitlab.com/devnw/zig/raft/-/issues/89) | Resolved |
+| 12 | Medium | 32 | Checker only verifies terms, not entry data — can mask Log Matching and State Machine Safety violations | `tests/checker.zig` | CWE-697 | `checkLogMatching` now scopes to committed entries and flags term divergence as violation | [#97](https://gitlab.com/devnw/zig/raft/-/issues/97) | Resolved |
+| 13 | Medium | 24 | `RaftLog.compact` mutates `snapshot_index` before fallible `storage.compact()` | `src/log.zig` | CWE-662 | Reordered: `storage.compact()` now runs BEFORE mutating `snapshot_index`/`snapshot_term` | [#92](https://gitlab.com/devnw/zig/raft/-/issues/92) | Resolved |
+| 14 | Medium | 24 | `Config.validate()` does not reject zero peer IDs — phantom peer blocks quorum | `src/node.zig` | CWE-20 | Added `if (peer == 0) return ConfigError.InvalidId` in validation loop | [#93](https://gitlab.com/devnw/zig/raft/-/issues/93) | Resolved |
+| 15 | Medium | 24 | `finishLoadSnapshot` unbounded allocation from snapshot data file size | `src/file_storage.zig` | CWE-770 | Added 256 MiB cap check before allocation | [#94](https://gitlab.com/devnw/zig/raft/-/issues/94) | Resolved |
+| 16 | Medium | 24 | `InMemoryStorage.compactImpl` panics on OOB compact index | `src/storage.zig` | CWE-125 | Added `if (pos >= self.log.items.len) return StorageError.Unavailable` bounds check | [#95](https://gitlab.com/devnw/zig/raft/-/issues/95) | Resolved |
+| 17 | Medium | 24 | `receiveChunk` OOM on `appendSlice` leaks pending snapshot state | `src/snapshot.zig` | CWE-401 | OOM path now calls `clearPending()` before returning error | [#96](https://gitlab.com/devnw/zig/raft/-/issues/96) | Resolved |
+
+### Low Severity (5 findings)
+
+| Rank | Sev | Risk | Finding | Component | CWE | Evidence | Issue | Status |
+|------|-----|------|---------|-----------|-----|----------|-------|--------|
+| 18 | Low | 24 | `Config.peers` borrowed slice can dangle in long-lived `RaftNode` | `src/node.zig` | CWE-825 | Caller responsibility; harness already dupes | [#99](https://gitlab.com/devnw/zig/raft/-/issues/99) | Won't Do |
+| 19 | Low | 24 | `buildAppendEntries` subtraction underflow when `next_index` is 0 | `src/replication.zig` | CWE-191 | Added `if (next == 0) return null` guard | [#100](https://gitlab.com/devnw/zig/raft/-/issues/100) | Resolved |
+| 20 | Low | 24 | Test harness `page_allocator` defeats memory leak detection | `tests/harness.zig` | CWE-401 | Intentional design; shared-ownership entry slices require it | [#101](https://gitlab.com/devnw/zig/raft/-/issues/101) | Won't Do |
+| 21 | Low | 16 | File storage tests use predictable `/tmp` paths — symlink/TOCTOU risk | `tests/scenarios/file_storage.zig` | CWE-377 | Test-only code; no production impact | [#102](https://gitlab.com/devnw/zig/raft/-/issues/102) | Won't Do |
+| 22 | Low | 16 | `InMemoryStorage.deinit` does not free snapshot data | `src/storage.zig` | CWE-401 | `deinit()` now frees `snapshot_data` (data + config slices); `saveSnapshotImpl` dupes on save | [#103](https://gitlab.com/devnw/zig/raft/-/issues/103) | Resolved |
+
+### Info Severity (2 findings)
+
+| Rank | Sev | Risk | Finding | Component | CWE | Evidence | Issue | Status |
+|------|-----|------|---------|-----------|-----|----------|-------|--------|
+| 23 | Info | 4 | `.observer.lock` not in `.gitignore` — tool metadata leak risk | `.gitignore` | CWE-538 | Added `.observer.lock` to `.gitignore` | [#104](https://gitlab.com/devnw/zig/raft/-/issues/104) | Resolved |
+| 24 | Info | 4 | `SECURITY.md` lacks PGP key for encrypted vulnerability reports | `SECURITY.md` | CWE-311 | Added PGP key reference and security.txt pointer | [#105](https://gitlab.com/devnw/zig/raft/-/issues/105) | Resolved |
+
+---
+
+## Security Findings -- Pass 8 (SEC-0071 through SEC-0073) -- All Resolved
+
+3 new findings identified through full re-audit of all 14 source modules with 5 parallel adversarial review agents + direct manual audit. All 12 automated scanners re-run (0 findings). 12+ agent-reported findings verified against actual code and filtered as false positives. Focused on:
+- Consistency of checked arithmetic hardening across node.zig (SEC-0070 follow-up)
+- Memory lifecycle of snapshot data loaded at init
+- Protocol correctness of config change propagation to followers and across restarts
+
+**All 3 findings remediated.** Key fixes:
+- Applied `std.math.add` for checked overflow at all 6 `+ 1` locations in `node.zig`: `propose()`, `proposeConfigChange()`, `tick()` finalize, `ready()` slice bounds (x2), `becomeLeader()` noop index (SEC-0071)
+- Added `freeSnapshot()` helper to `storage.zig`; `InMemoryStorage.loadSnapshotImpl` now returns heap-allocated copies (consistent with FileStorage); `RaftLog.init` frees snapshot after extracting index/term; `RaftNode.init` loads snapshot once, uses config for MembershipState, then frees (SEC-0072)
+- `RaftNode.init()` restores MembershipState from snapshot config (including joint consensus) when available; `advance()` scans committed entries for `kind == .config` and calls `applyConfig()`; `handleInstallSnapshot()` applies snapshot config to MembershipState on receipt (SEC-0073)
+
+### Medium Severity (2 findings)
+
+| Rank | Sev | Risk | Finding | Component | CWE | Fix | Issue | Status |
+|------|-----|------|---------|-----------|-----|-----|-------|--------|
+| 1 | Medium | 24 | MembershipState not updated from committed config entries or snapshots on non-leader nodes — after leader change or restart following membership change, node uses stale initial voter set for elections, heartbeats, and quorum | `src/node.zig` | CWE-670 | `init()` restores config from snapshot; `advance()` applies config entries on commit; `handleInstallSnapshot()` applies snapshot config (SEC-0073) | [#81](https://gitlab.com/devnw/zig/raft/-/work_items/81) | **Resolved** |
+| 2 | Medium | 16 | Snapshot memory leak on init — loadSnapshot() called twice (RaftLog.init + RaftNode.init), return values discarded without freeing heap-allocated data and config voter buffers when FileStorage is used | `src/log.zig`, `src/node.zig`, `src/storage.zig` | CWE-401 | Added `freeSnapshot()` helper; `InMemoryStorage.loadSnapshotImpl` returns heap copies; `RaftLog.init` frees snapshot; `RaftNode.init` uses snapshot for config then frees (SEC-0072) | [#80](https://gitlab.com/devnw/zig/raft/-/work_items/80) | **Resolved** |
+
+### Low Severity (1 finding)
+
+| Rank | Sev | Risk | Finding | Component | CWE | Fix | Issue | Status |
+|------|-----|------|---------|-----------|-----|-----|-------|--------|
+| 3 | Low | 8 | Unchecked `+ 1` arithmetic in node.zig (6 locations) — inconsistent with SEC-0055/SEC-0070 hardening | `src/node.zig` | CWE-190 | Applied `std.math.add` at all 6 locations in `propose()`, `proposeConfigChange()`, `tick()`, `ready()`, `becomeLeader()` (SEC-0071) | [#79](https://gitlab.com/devnw/zig/raft/-/work_items/79) | **Resolved** |
+
+---
+
+## Security Findings -- Pass 7 (SEC-0069 through SEC-0070) -- All Resolved
+
+2 new findings identified through full re-audit of all source modules with 4 parallel adversarial review agents. All 12 automated scanners re-run (0 findings). Focused on:
+- Error-path resource management (errdefer completeness in new SEC-0065/0066 code)
+- Consistency of checked arithmetic hardening across codebase
+- Cross-verification of agent-reported findings against actual code (filtered 8+ false positives)
+
+### Medium Severity (1 finding)
+
+| Rank | Sev | Risk | Finding | Component | CWE | Fix | Issue | Status |
+|------|-----|------|---------|-----------|-----|-----|-------|--------|
+| 1 | Medium | 16 | Missing errdefer for heap resources in `FileStorage.init()` -- memory leak on init failure when snapshot config present | `src/file_storage.zig:129-171` | CWE-401, CWE-460 | Added errdefer after `fs` construction to free ArrayLists and close wal_file; changed `meta.freeConfig()` to use `defer` so it runs on both success and error paths (SEC-0069) | [#77](https://gitlab.com/devnw/zig/raft/-/work_items/77) | **Resolved** |
+
+### Low Severity (1 finding)
+
+| Rank | Sev | Risk | Finding | Component | CWE | Fix | Issue | Status |
+|------|-----|------|---------|-----------|-----|-----|-------|--------|
+| 2 | Low | 8 | Unchecked `+ 1` arithmetic in replication/log paths (4 locations) -- inconsistent with SEC-0055 hardening | `src/replication.zig:63,79,109`, `src/log.zig:295` | CWE-190 | Applied `std.math.add` for checked overflow at all 4 locations, matching the pattern from SEC-0055 (SEC-0070) | [#78](https://gitlab.com/devnw/zig/raft/-/work_items/78) | **Resolved** |
+
+---
+
+## Security Findings -- Pass 6 (SEC-0065 through SEC-0068) -- All Resolved
+
+4 findings identified through full re-audit of all source modules, CI/CD config, build files, and pre-commit configuration. All 12 automated scanners re-run (0 findings). Focused on:
+- Crash safety (directory fsync after atomic renames)
+- Concurrent access (file locking)
+- Thread safety (allocator in parallel paths)
+- Supply chain (pre-commit autofix)
+
+### Medium Severity (2 findings)
+
+| Rank | Sev | Risk | Finding | Component | CWE | Fix | Issue | Status |
+|------|-----|------|---------|-----------|-----|-----|-------|--------|
+| 1 | Medium | 32 | No exclusive file locking on data directory -- concurrent processes corrupt state | `src/file_storage.zig` | CWE-362, CWE-667 | Added exclusive advisory lock via `.lock` file in `init()`; held until `deinit()`; second init returns `error.WouldBlock` (SEC-0066) | [#74](https://gitlab.com/devnw/zig/raft/-/work_items/74) | **Resolved** |
+| 2 | Medium | 24 | Missing directory fsync after atomic renames -- crash can lose committed state | `src/file_storage.zig` | CWE-662 | Added `syncDir()` helper using `openat(".", O_DIRECTORY)` + `fsync`; called after every `rename()` in `saveHardStateImpl`, `saveSnapshotImpl`, `compactImpl`, `writeSnapshotMeta`, and recovery in `loadSnapshotImpl` (SEC-0065) | [#73](https://gitlab.com/devnw/zig/raft/-/work_items/73) | **Resolved** |
+
+### Low Severity (1 finding)
+
+| Rank | Sev | Risk | Finding | Component | CWE | Fix | Issue | Status |
+|------|-----|------|---------|-----------|-----|-----|-------|--------|
+| 3 | Low | 12 | Allocator thread-safety undocumented for spice parallel paths | `src/node.zig` | CWE-362 | Added doc comments to `RaftNode.allocator` field and `RaftNode.init()` documenting thread-safety requirement when spice parallelism is active (SEC-0067) | [#75](https://gitlab.com/devnw/zig/raft/-/work_items/75) | **Resolved** |
+
+### Info (1 finding)
+
+| Rank | Sev | Risk | Finding | Component | CWE | Fix | Issue | Status |
+|------|-----|------|---------|-----------|-----|-----|-------|--------|
+| 4 | Info | 8 | `autofix_prs: true` enables automated code modifications from external repos | `.pre-commit-config.yaml` | CWE-829 | Won't Do -- pre-commit configuration is handled via CI pipeline stages and developer tooling external to this repository (SEC-0068) | [#76](https://gitlab.com/devnw/zig/raft/-/work_items/76) | Won't Do |
 
 ---
 

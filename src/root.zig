@@ -40,6 +40,7 @@ pub const SnapshotMetadata = rpc.SnapshotMetadata;
 pub const ClusterConfig = rpc.ClusterConfig;
 pub const Storage = storage.Storage;
 pub const InMemoryStorage = storage.InMemoryStorage;
+pub const freeSnapshot = storage.freeSnapshot;
 pub const FileStorage = file_storage.FileStorage;
 pub const Transport = transport.Transport;
 pub const InProcessTransport = transport.InProcessTransport;

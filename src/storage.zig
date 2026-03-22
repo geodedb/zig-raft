@@ -13,6 +13,7 @@ pub const Storage = struct {
 
     pub const VTable = struct {
         saveHardState: *const fn (*anyopaque, state.HardState) anyerror!void,
+        loadHardState: *const fn (*anyopaque) anyerror!state.HardState,
         appendEntries: *const fn (*anyopaque, []const rpc.Entry) anyerror!void,
         entries: *const fn (*anyopaque, lo: u64, hi: u64) anyerror![]rpc.Entry,
         term: *const fn (*anyopaque, index: u64) anyerror!u64,
@@ -24,6 +25,10 @@ pub const Storage = struct {
 
     pub fn saveHardState(self: Storage, hs: state.HardState) anyerror!void {
         return self.vtable.saveHardState(self.ptr, hs);
+    }
+
+    pub fn loadHardState(self: Storage) anyerror!state.HardState {
+        return self.vtable.loadHardState(self.ptr);
     }
 
     pub fn appendEntries(self: Storage, ents: []const rpc.Entry) anyerror!void {
@@ -55,6 +60,15 @@ pub const Storage = struct {
     }
 };
 
+/// Free a Snapshot returned by Storage.loadSnapshot().
+/// Both InMemoryStorage and FileStorage return heap-allocated copies
+/// from loadSnapshot(); callers must free with this helper (SEC-0072).
+pub fn freeSnapshot(allocator: std.mem.Allocator, snap: rpc.Snapshot) void {
+    if (snap.data.len > 0) allocator.free(snap.data);
+    if (snap.metadata.config.voters.len > 0) allocator.free(snap.metadata.config.voters);
+    if (snap.metadata.config.voters_outgoing.len > 0) allocator.free(snap.metadata.config.voters_outgoing);
+}
+
 pub const InMemoryStorage = struct {
     log: std.ArrayList(rpc.Entry) = .{},
     hard_state: state.HardState = state.HardState.initial,
@@ -68,6 +82,13 @@ pub const InMemoryStorage = struct {
     }
 
     pub fn deinit(self: *InMemoryStorage) void {
+        // Free snapshot data if present (SEC-0095).
+        if (self.snapshot_data) |sd| {
+            if (sd.data.len > 0) self.allocator.free(sd.data);
+            if (sd.metadata.config.voters.len > 0) self.allocator.free(sd.metadata.config.voters);
+            if (sd.metadata.config.voters_outgoing.len > 0) self.allocator.free(sd.metadata.config.voters_outgoing);
+            self.snapshot_data = null;
+        }
         for (self.log.items) |entry| {
             if (entry.data.len > 0) {
                 self.allocator.free(entry.data);
@@ -81,6 +102,7 @@ pub const InMemoryStorage = struct {
             .ptr = @ptrCast(self),
             .vtable = &.{
                 .saveHardState = typeErasedSaveHardState,
+                .loadHardState = typeErasedLoadHardState,
                 .appendEntries = typeErasedAppendEntries,
                 .entries = typeErasedEntries,
                 .term = typeErasedTerm,
@@ -161,6 +183,8 @@ pub const InMemoryStorage = struct {
         if (index <= self.snapshot_index) return;
 
         const pos = index - self.snapshot_index - 1;
+        // Bounds check: reject compact index beyond log range (SEC-0087).
+        if (pos >= self.log.items.len) return StorageError.Unavailable;
         const remove_count = pos + 1;
 
         // Update snapshot_term from the entry being compacted to.
@@ -182,13 +206,73 @@ pub const InMemoryStorage = struct {
     }
 
     pub fn saveSnapshotImpl(self: *InMemoryStorage, snap: rpc.Snapshot) anyerror!void {
-        self.snapshot_data = snap;
+        // Free previous snapshot data if present (SEC-0095).
+        if (self.snapshot_data) |old| {
+            if (old.data.len > 0) self.allocator.free(old.data);
+            if (old.metadata.config.voters.len > 0) self.allocator.free(old.metadata.config.voters);
+            if (old.metadata.config.voters_outgoing.len > 0) self.allocator.free(old.metadata.config.voters_outgoing);
+        }
+        // Duplicate snapshot data and config slices so deinit can free them (SEC-0095).
+        const data_copy = if (snap.data.len > 0)
+            try self.allocator.dupe(u8, snap.data)
+        else
+            snap.data;
+        errdefer if (data_copy.len > 0) self.allocator.free(data_copy);
+        const voters_copy = if (snap.metadata.config.voters.len > 0)
+            try self.allocator.dupe(u64, snap.metadata.config.voters)
+        else
+            snap.metadata.config.voters;
+        errdefer if (voters_copy.len > 0) self.allocator.free(voters_copy);
+        const outgoing_copy = if (snap.metadata.config.voters_outgoing.len > 0)
+            try self.allocator.dupe(u64, snap.metadata.config.voters_outgoing)
+        else
+            snap.metadata.config.voters_outgoing;
+        self.snapshot_data = .{
+            .metadata = .{
+                .index = snap.metadata.index,
+                .term = snap.metadata.term,
+                .config = .{
+                    .voters = voters_copy,
+                    .voters_outgoing = outgoing_copy,
+                    .is_joint = snap.metadata.config.is_joint,
+                },
+            },
+            .data = data_copy,
+        };
         self.snapshot_index = snap.metadata.index;
         self.snapshot_term = snap.metadata.term;
     }
 
+    /// Returns a heap-allocated copy of the snapshot (data + config voter
+    /// slices). Caller must free via `freeSnapshot()` (SEC-0072).
     pub fn loadSnapshotImpl(self: *InMemoryStorage) anyerror!?rpc.Snapshot {
-        return self.snapshot_data;
+        const sd = self.snapshot_data orelse return null;
+        const data_copy = if (sd.data.len > 0)
+            try self.allocator.dupe(u8, sd.data)
+        else
+            sd.data;
+        errdefer if (data_copy.len > 0) self.allocator.free(data_copy);
+        const voters_copy = if (sd.metadata.config.voters.len > 0)
+            try self.allocator.dupe(u64, sd.metadata.config.voters)
+        else
+            sd.metadata.config.voters;
+        errdefer if (voters_copy.len > 0) self.allocator.free(voters_copy);
+        const outgoing_copy = if (sd.metadata.config.voters_outgoing.len > 0)
+            try self.allocator.dupe(u64, sd.metadata.config.voters_outgoing)
+        else
+            sd.metadata.config.voters_outgoing;
+        return rpc.Snapshot{
+            .metadata = .{
+                .index = sd.metadata.index,
+                .term = sd.metadata.term,
+                .config = .{
+                    .voters = voters_copy,
+                    .voters_outgoing = outgoing_copy,
+                    .is_joint = sd.metadata.config.is_joint,
+                },
+            },
+            .data = data_copy,
+        };
     }
 
     pub fn saveHardStateImpl(self: *InMemoryStorage, hs: state.HardState) anyerror!void {
@@ -199,11 +283,20 @@ pub const InMemoryStorage = struct {
         return self.hard_state;
     }
 
+    pub fn loadHardStateImpl(self: *InMemoryStorage) anyerror!state.HardState {
+        return self.hard_state;
+    }
+
     // --- Type-erased wrappers for vtable ---
 
     fn typeErasedSaveHardState(ptr: *anyopaque, hs: state.HardState) anyerror!void {
         const self: *InMemoryStorage = @ptrCast(@alignCast(ptr));
         return self.saveHardStateImpl(hs);
+    }
+
+    fn typeErasedLoadHardState(ptr: *anyopaque) anyerror!state.HardState {
+        const self: *InMemoryStorage = @ptrCast(@alignCast(ptr));
+        return self.loadHardStateImpl();
     }
 
     fn typeErasedAppendEntries(ptr: *anyopaque, ents: []const rpc.Entry) anyerror!void {
@@ -361,6 +454,7 @@ test "saveSnapshot and loadSnapshot round-trip" {
 
     const loaded = try store.loadSnapshotImpl();
     try std.testing.expect(loaded != null);
+    defer freeSnapshot(std.testing.allocator, loaded.?);
     try std.testing.expectEqual(@as(u64, 10), loaded.?.metadata.index);
     try std.testing.expectEqual(@as(u64, 3), loaded.?.metadata.term);
     try std.testing.expectEqualStrings("snapshot-data", loaded.?.data);

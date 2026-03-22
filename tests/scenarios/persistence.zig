@@ -118,6 +118,7 @@ test "persistence: snapshot survives restart" {
     try std.testing.expect(loaded != null);
 
     const snapshot = loaded.?;
+    defer raft.storage.freeSnapshot(net.allocator, snapshot);
     try std.testing.expectEqualStrings("my-snapshot", snapshot.data);
     try std.testing.expect(snapshot.metadata.index > 0);
     try std.testing.expect(snapshot.metadata.term > 0);

@@ -37,12 +37,20 @@ fn committedForSet(allocator: std.mem.Allocator, voters: []const u64, match_indi
     defer allocator.free(buf);
     var n: usize = 0;
     for (voters) |v| {
+        var found = false;
         for (node_ids, 0..) |nid, i| {
             if (nid == v) {
                 buf[n] = match_indices[i];
                 n += 1;
+                found = true;
                 break;
             }
+        }
+        // Voters not found in node_ids are treated as match_index=0
+        // rather than silently excluded from quorum (SEC-0075).
+        if (!found) {
+            buf[n] = 0;
+            n += 1;
         }
     }
     if (n == 0) return 0;

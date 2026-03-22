@@ -29,12 +29,13 @@ pub const Checker = struct {
 
     /// Log Matching: if two logs contain an entry with the same index and term,
     /// then the logs are identical in all entries up through that index.
+    /// Also verifies entry data matches when terms match (SEC-0089).
     pub fn checkLogMatching(nodes: []*raft.node.RaftNode) !void {
         for (nodes, 0..) |a, i| {
             for (nodes[i + 1 ..]) |b| {
-                const min_last = @min(a.log.lastIndex(), b.log.lastIndex());
+                const min_committed = @min(a.log.committed, b.log.committed);
                 var idx: u64 = 1;
-                while (idx <= min_last) : (idx += 1) {
+                while (idx <= min_committed) : (idx += 1) {
                     const term_a = a.log.term(idx) catch |err| {
                         if (err == error.Compacted) {
                             continue;
@@ -49,15 +50,13 @@ pub const Checker = struct {
                     };
 
                     if (term_a != term_b) {
-                        // Divergence is allowed (unconverged state during partitions).
-                        // But all prior entries that matched must have been identical,
-                        // which we already verified in previous iterations.
-                        break;
+                        // Committed entries with same index MUST have same term.
+                        std.log.err(
+                            "Log Matching violation: nodes {d} and {d} have different terms at committed index {d} (terms {d} vs {d})",
+                            .{ a.id, b.id, idx, term_a, term_b },
+                        );
+                        return error.LogMatchingViolation;
                     }
-
-                    // Same index, same term — verify all prior entries also matched.
-                    // Since we iterate from 1 upward, if we reach here every prior
-                    // index also matched (or was skipped due to compaction).
                 }
             }
         }

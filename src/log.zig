@@ -21,6 +21,9 @@ pub const RaftLog = struct {
         if (snap) |s| {
             snap_idx = s.metadata.index;
             snap_trm = s.metadata.term;
+            // Free heap-allocated snapshot data and config after extracting
+            // the index/term we need (SEC-0072).
+            stg.freeSnapshot(allocator, s);
         }
 
         return .{
@@ -222,10 +225,15 @@ pub const RaftLog = struct {
     pub fn compact(self: *RaftLog, compact_index: u64) !void {
         if (compact_index <= self.snapshot_index) return;
 
-        self.snapshot_term = self.term(compact_index) catch self.snapshot_term;
-        self.snapshot_index = compact_index;
+        // Capture term before mutating state (SEC-0084).
+        const new_snapshot_term = self.term(compact_index) catch self.snapshot_term;
 
+        // Call storage.compact() BEFORE mutating local state so that
+        // a storage failure leaves RaftLog consistent (SEC-0084).
         try self.storage.compact(compact_index);
+
+        self.snapshot_term = new_snapshot_term;
+        self.snapshot_index = compact_index;
 
         // Trim unstable entries below compact_index.
         if (self.unstable_entries.items.len > 0) {
@@ -292,7 +300,8 @@ pub const RaftLog = struct {
         if (self.unstable_entries.items.len > 0) {
             return self.unstable_entries.items[0].index;
         }
-        return self.lastIndex() + 1;
+        // Checked overflow: lastIndex() + 1 (SEC-0070).
+        return std.math.add(u64, self.lastIndex(), 1) catch self.lastIndex();
     }
 
     fn truncateUnstable(self: *RaftLog, from_index: u64) !void {
