@@ -43,10 +43,10 @@ Consumers can implement their own backend (embedded DB, cloud object store, etc.
 
 #### 2.2.1 FileStorage Crash-Recovery Protocol
 
-- **Record format:** Each log entry is written as: `[4-byte little-endian length][protobuf-encoded Entry][4-byte CRC32 of encoded bytes]`
+- **Record format:** Each log entry is written as a custom binary WAL record: `[data_len: u32 LE][index: u64 LE][term: u64 LE][kind: u8][data: data_len bytes][crc32: u32 LE]`
 - **Torn write detection:** On open, scan forward until CRC mismatch or EOF. Truncate any partial trailing record (`ftruncate` to last valid offset). This means a single-entry partial write is safely discarded.
-- **Index file:** A parallel `.idx` file stores `[8-byte file offset]` per entry for O(1) random access. Rebuilt from the log file if missing or corrupt.
-- **Atomic writes:** `appendEntries` writes records to a temp file, calls `fdatasync`, then `rename`-replaces the log segment. On Linux `rename` is atomic within the same filesystem.
+- **Index file:** An in-memory index (`std.ArrayList(IndexEntry)`) maps raft indices to WAL file offsets for O(1) random access. Rebuilt from WAL scan on `init()`.
+- **Atomic writes:** `appendEntries` appends records directly to the WAL file via `seekTo` + `writeAll`, then calls `fdatasync`. Torn writes are detected on recovery via CRC32 verification.
 - **`compact(index)`:** Rewrites the log from `index + 1` forward into a new file, calls `fdatasync`, then `rename`-replaces atomically. The old snapshot is only deleted after the new one is confirmed written.
 
 ### 2.3 Pluggable Transport (Interface + In-Process Implementation)
@@ -114,7 +114,7 @@ Consumer
   │
   ├── propose(data: []const u8) error{NotLeader}!void  # submit command (leader only)
   │     returns error.NotLeader if not leader; read node.leader_id for redirect hint
-  ├── step(msg: Message, task: ?*spice.Task)    # deliver inbound RPC
+  ├── step(from: u64, msg: Message, task: ?*spice.Task)    # deliver inbound RPC
   ├── tick(task: ?*spice.Task)                  # advance logical clock
   │
   └── ready() Ready                             # drain after each tick/step/propose
@@ -182,13 +182,14 @@ src/
   replication.zig  # AppendEntries: build per-peer payloads (parallel w/ spice),
                    #   track next_index/match_index, commit index majority advancement
   snapshot.zig     # should_snapshot flag in Ready, reportSnapshot() entry point,
-                   #   InstallSnapshot chunked send/receive, CRC32 verification,
+                   #   InstallSnapshot chunked send/receive, BLAKE3 verification,
                    #   log compaction trigger at snapshot_threshold
   membership.zig   # joint consensus: ClusterConfig, ConfigEntry, automatic phase 2
                    #   transition after joint config commits (§6.1), voter set arithmetic
   rpc.zig          # Message tagged union — all wire types (see §5)
   ready.zig        # Ready struct, advance() handshake, pending state between rounds
-  storage.zig      # Storage vtable + InMemoryStorage + FileStorage (§2.2.1)
+  storage.zig      # Storage vtable interface + InMemoryStorage
+  file_storage.zig # FileStorage — crash-safe WAL + snapshot persistence (§2.2.1)
   transport.zig    # Transport vtable + InProcessTransport
   quorum.zig       # quorum math: simple majority + joint quorum
                    #   (old config ∩ new config both independently need majority)
@@ -285,7 +286,8 @@ pub const Storage = struct {
         saveHardState: *const fn (*anyopaque, HardState) anyerror!void,
         // SAFETY-CRITICAL: loadHardState must return the last persisted term/voted_for
         // to prevent double-voting after restart (Raft safety property).
-        loadHardState: *const fn (*anyopaque) anyerror!?HardState,
+        // Returns HardState.initial (term=0, voted_for=null) when no state has been persisted.
+        loadHardState: *const fn (*anyopaque) anyerror!HardState,
         appendEntries: *const fn (*anyopaque, []const Entry) anyerror!void,
         // Returns entries with indices in [lo, hi) — half-open range.
         // Returns error.Compacted if lo <= snapshot_index.
@@ -401,7 +403,7 @@ pub fn proposeConfigChange(self: *RaftNode, new_peers: []const u64) !void;
 
 This keeps the library callback-free and fully consistent with the Ready pattern. The consumer's state machine serialization never blocks Raft processing.
 
-**Lagging follower catch-up:** When a follower's `next_index` falls behind the leader's `snapshot_index`, the leader sends the snapshot in chunks via `InstallSnapshot` RPC (`snapshot_chunk_size` = 64KB default). The follower assembles chunks in order, verifies CRC32 of the complete data on the final chunk, then surfaces the `Snapshot` in `Ready.snapshot` for the consumer to apply.
+**Lagging follower catch-up:** When a follower's `next_index` falls behind the leader's `snapshot_index`, the leader sends the snapshot in chunks via `InstallSnapshot` RPC (`snapshot_chunk_size` = 64KB default). The follower assembles chunks in order, verifies the BLAKE3 hash of the complete data on the final chunk, then surfaces the `Snapshot` in `Ready.snapshot` for the consumer to apply.
 
 ---
 
@@ -553,8 +555,6 @@ Build targets:
 
 | Category | Files | Estimated Lines |
 |----------|-------|----------------|
-| Source modules | 13 | ~3,500 |
-| Unit tests (embedded) | — | ~1,000 |
-| Scenario tests | ~22 files | ~2,200 |
-| Chaos tests | ~10 files | ~1,000 |
-| **Total** | | **~7,700** |
+| Source modules | 14 | ~7,675 |
+| Test files | 12 | ~4,118 |
+| **Total** | | **~11,800** |

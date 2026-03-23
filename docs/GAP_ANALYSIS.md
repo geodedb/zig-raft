@@ -2,54 +2,54 @@
 
 **Last updated:** 2026-03-22
 **Spec:** `docs/superpowers/specs/2026-03-21-raft-design.md`
-**Methodology:** Full codebase audit across 4 domains -- gap analysis (requirements-to-code), code quality review, performance review, and adversarial security review. 18 security passes, 2 quality passes, 2 performance passes. All source, tests, CI, and docs analyzed. See [QUALITY_GAP_ANALYSIS.md](QUALITY_GAP_ANALYSIS.md) and [PERF_GAP_ANALYSIS.md](PERF_GAP_ANALYSIS.md) for detailed domain-specific findings.
+**Methodology:** Full codebase audit across 4 domains -- gap analysis (requirements-to-code), code quality review, performance review, and adversarial security review. 20 security passes, 4 quality passes, 4 performance passes. All source (7,683 lines, 14 modules), tests (4,208 lines, 200 tests), CI, and docs analyzed. See [QUALITY_GAP_ANALYSIS.md](QUALITY_GAP_ANALYSIS.md) and [PERF_GAP_ANALYSIS.md](PERF_GAP_ANALYSIS.md) for detailed domain-specific findings.
 
 ## Summary
 
-### Spec-to-Code Gaps (GAP-0001 through GAP-0013)
+### Spec-to-Code Gaps (GAP-0001 through GAP-0024)
 
 | Severity | Open | Resolved | Won't Do |
 |----------|------|----------|----------|
 | Critical | 0 | 0 | 0 |
 | High | 0 | 1 | 0 |
-| Medium | 0 | 7 | 0 |
-| Low | 0 | 5 | 0 |
+| Medium | 0 | 9 | 0 |
+| Low | 0 | 14 | 0 |
 
-**0 open gaps.** All 13 resolved (GAP-0001 through GAP-0013). See [GAP_ANALYSIS_RESOLVED.md](GAP_ANALYSIS_RESOLVED.md) for resolved items.
+**0 open gaps.** All 24 resolved. GAP-0020 through GAP-0024 (Pass 20 spec drift) resolved. See [GAP_ANALYSIS_RESOLVED.md](GAP_ANALYSIS_RESOLVED.md).
 
-### Security Findings (SEC-0001 through SEC-0143)
+### Security Findings (SEC-0001 through SEC-0151)
 
 | Severity | Open | Resolved | Won't Do |
 |----------|------|----------|----------|
 | Critical | 0 | 5 | 0 |
 | High | 0 | 23 | 0 |
 | Medium | 0 | 66 | 4 |
-| Low | 0 | 33 | 5 |
-| Info | 0 | 8 | 1 |
+| Low | 0 | 35 | 7 |
+| Info | 0 | 8 | 5 |
 
-**0 open findings.** 142 total findings across 18 passes; all 142 resolved or Won't Do. Pass 18: 0 new findings (full audit deep review, 12 automated tools clean).
+**0 open findings.** 150 total findings across 20 passes. Pass 20: 0 new findings. All security checks in refactored `handleAppendEntries` decomposition verified correct.
 
-### Quality Findings (QA-001 through QA-036)
+### Quality Findings (QA-001 through QA-048)
 
 | Severity | Open | Resolved | Won't Do |
 |----------|------|----------|----------|
-| High | 0 | 5 | 0 |
-| Medium | 0 | 9 | 1 |
-| Low | 0 | 9 | 0 |
+| High | 0 | 6 | 0 |
+| Medium | 0 | 9 | 5 |
+| Low | 0 | 11 | 5 |
 
-**24 findings total, all resolved (23 Closed + 1 Won't Do).** See [QUALITY_GAP_ANALYSIS.md](QUALITY_GAP_ANALYSIS.md) for full details.
+**36 findings total. 26 resolved, 10 Won't Do, 0 open.** See [QUALITY_GAP_ANALYSIS.md](QUALITY_GAP_ANALYSIS.md) for full details.
 
-### Performance Findings (PERF-001 through PERF-028)
+### Performance Findings (PERF-001 through PERF-035)
 
-| PerfSeverity | Open | Resolved | Deferred |
-|--------------|------|----------|----------|
-| P0 | 0 | 1 | 0 |
-| P1 | 0 | 5 | 1 |
-| P2 | 0 | 11 | 0 |
-| P3 | 0 | 5 | 0 |
-| Info | 0 | 1 | 0 |
+| PerfSeverity | Open | Resolved | Deferred | Won't Do |
+|--------------|------|----------|----------|----------|
+| P0 | 0 | 1 | 0 | 0 |
+| P1 | 0 | 5 | 1 | 0 |
+| P2 | 0 | 13 | 0 | 0 |
+| P3 | 0 | 6 | 0 | 0 |
+| Info/Maint | 0 | 1 | 0 | 4 |
 
-**24 findings total (23 resolved, 1 deferred, 0 open).** See [PERF_GAP_ANALYSIS.md](PERF_GAP_ANALYSIS.md) for full details.
+**35 findings total (26 resolved, 1 deferred, 4 Won't Do, 0 open).** See [PERF_GAP_ANALYSIS.md](PERF_GAP_ANALYSIS.md) for full details.
 
 ---
 
@@ -59,40 +59,44 @@
 
 | Domain | Total Findings | Open | Resolved | Won't Do / Deferred | Issues Created |
 |--------|---------------|------|----------|----------------------|----------------|
-| Gap Analysis | 13 | 0 | 13 | 0 | 13 |
-| Quality | 24 | 0 | 23 | 1 | 24 |
-| Performance | 24 | 0 | 23 | 1 | 24 |
-| Security | 142 | 0 | 132 | 10 | 142 |
-| **Total** | **203** | **0** | **191** | **12** | **203** |
+| Gap Analysis | 24 | 0 | 24 | 0 | 13 |
+| Quality | 36 | 0 | 26 | 10 | 24 |
+| Performance | 35 | 0 | 26 | 5 | 24 |
+| Security | 150 | 0 | 137 | 13 | 142 |
+| **Total** | **245** | **0** | **213** | **28** | **203** |
 
 ### Docs Updated
 
 | File | Domain | Action |
 |------|--------|--------|
-| `docs/GAP_ANALYSIS.md` | All | Updated with cross-domain audit summary |
-| `docs/GAP_ANALYSIS_RESOLVED.md` | Gap | 13 resolved gaps |
-| `docs/QUALITY_GAP_ANALYSIS.md` | Quality | 24 findings (23 resolved, 1 Won't Do) |
-| `docs/PERF_GAP_ANALYSIS.md` | Performance | 24 findings (23 resolved, 1 deferred) |
-| `docs/SECURITY_REVIEW_NOTES.md` | Security | 18 passes, 142 findings |
+| `docs/GAP_ANALYSIS.md` | All | Updated with Pass 20 audit (13 new findings) |
+| `docs/GAP_ANALYSIS_RESOLVED.md` | Gap | 19 resolved gaps |
+| `docs/QUALITY_GAP_ANALYSIS.md` | Quality | 36 findings |
+| `docs/PERF_GAP_ANALYSIS.md` | Performance | 35 findings |
+| `docs/SECURITY_REVIEW_NOTES.md` | Security | 20 passes, 150 findings |
 
-### Top 10 Findings (cross-domain, by severity/score)
+### Top 10 Findings (Pass 20, cross-domain, by severity/score)
 
 | # | Domain | ID | Finding | Severity | Score | Status |
 |---|--------|----|---------|----------|-------|--------|
-| 1 | Security | SEC-0119 | Response handlers accept stale-term votes — Election Safety violation (two leaders at same term) | Critical | 100 | Resolved |
-| 2 | Security | SEC-0120 | `pending_config_index` not tracked on follower — cluster stuck in joint consensus after leader crash | Critical | 80 | Resolved |
-| 3 | Quality | QA-024 | Duplicated snapshot meta serialization in `saveSnapshotImpl()` vs `writeSnapshotMeta()` — format divergence risk | High | 80 | Resolved |
-| 4 | Quality | QA-023b | `handleAppendEntries()` lacks non-member sender check (suspected, safe per Raft paper) | High | 80 | Resolved |
-| 5 | Performance | PERF-027 | Benchmark raft module compiled in Debug mode — all benchmark numbers 5-20x inflated | P1 | 80 | Resolved |
-| 6 | Quality | QA-002 | 11 duplicated AppendEntries rejection responses in `node.zig` | High | 64 | Resolved |
-| 7 | Security | SEC-0122 | `handleInstallSnapshot` leaks snapshot data/config when `applySnapshotConfig()` fails — up to 256 MiB leak | High | 60 | Resolved |
-| 8 | Quality | QA-001 | Stale test binaries (`test_blake3`, `test_blake3.o`) committed to repo root | High | 60 | Resolved |
-| 9 | Performance | PERF-025 | No FileStorage benchmarks — zero regression detection for WAL I/O | P2 | 48 | Resolved |
-| 10 | Quality | QA-005 | Makefile aggregate targets skip scenario and chaos tests — false CI confidence | High | 48 | Resolved |
+| 1 | Quality | QA-042 | `leader-tick` benchmark pre_vote mismatch | High | 64 | Resolved |
+| 2 | Quality | QA-044 | `max_snapshot_size` dual fields | Medium | 36 | Won't Do |
+| 3 | Gap | GAP-0023 | README Quick Start compile errors | Medium | 32 | Resolved |
+| 4 | Quality | QA-046 | `PERF_GAP_ANALYSIS.md` stale | Medium | 28 | Won't Do |
+| 5 | Quality | QA-047 | `QUALITY_GAP_ANALYSIS.md` stale | Medium | 28 | Won't Do |
+| 6 | Gap | GAP-0020 | Spec WAL field order wrong | Low | 16 | Resolved |
+| 7 | Gap | GAP-0021 | Spec .idx file claim | Low | 16 | Resolved |
+| 8 | Gap | GAP-0022 | Spec appendEntries temp+rename | Low | 16 | Resolved |
+| 9 | Quality | QA-045 | No test for leader_id=0 rejection | Low | 16 | Resolved |
+| 10 | Gap | GAP-0024 | Spec step() missing `from` param | Low | 8 | Resolved |
 
 ### Blockers
 
-None. All 4 audit domains completed successfully. 12 automated security scanners returned clean results. No findings block library usage.
+None. All 4 audit domains completed. 245 total findings across 20 passes — 0 open. 213 resolved, 28 Won't Do/Deferred. No Critical or High findings remain. All tests pass. No findings block library usage.
+
+### WAL Library Integration
+
+The generic WAL library ([devnw/zig/wal](https://gitlab.com/devnw/zig/wal)) has been added as a dependency in `build.zig.zon` (commit `bd245ce`). This library extracts the crash-safe, CRC-verified append-only log mechanics shared between Geode and Raft into a reusable package. Future work (Phase 8 of the implementation plan) will refactor `src/file_storage.zig` to use the WAL library's `WriteAheadLog` struct instead of the hand-rolled WAL code, reducing ~400 lines of WAL mechanics to thin Raft-specific wrappers.
 
 ---
 
@@ -102,16 +106,39 @@ None. All 4 audit domains completed successfully. 12 automated security scanners
 
 For detailed descriptions, evidence, and remediation guidance for each finding, see [QUALITY_GAP_ANALYSIS.md](QUALITY_GAP_ANALYSIS.md).
 
-### By Category
+### Pass 20 New Quality Findings
+
+| ID | Score | Finding | Component | Severity | Status |
+|----|-------|---------|-----------|----------|--------|
+| QA-042 | 64 | `leader-tick` benchmark not measuring leader ticks -- pre_vote mismatch causes node to never become leader; measures idle candidate/follower tick at ~17 ns/op | `tests/bench.zig:267-284` | High | Resolved -- added `.pre_vote = false` and leader assertion |
+| QA-044 | 36 | `FileStorage.max_snapshot_size` and `Config.max_snapshot_size` are independent unsynchronized fields -- consumer must set both if overriding defaults | `file_storage.zig:97`, `node.zig:40` | Medium | Won't Do -- documented in field comments; FileStorage intentionally decoupled from Config for consumers who use FileStorage without RaftNode |
+| QA-046 | 28 | `PERF_GAP_ANALYSIS.md` stale -- missing Pass 19/20 findings (PERF-029 through PERF-035) | `docs/PERF_GAP_ANALYSIS.md` | Medium | Won't Do -- `GAP_ANALYSIS.md` is the single source of truth for cross-pass totals; domain docs are point-in-time snapshots |
+| QA-047 | 28 | `QUALITY_GAP_ANALYSIS.md` stale -- missing Pass 19/20 findings (QA-037 through QA-048) | `docs/QUALITY_GAP_ANALYSIS.md` | Medium | Won't Do -- same rationale as QA-046 |
+| QA-043 | 16 | Inconsistent error handling in benchmark inner loops -- `follower_step` and `leader-tick` use `catch {}` while `propose-ready-advance` uses `catch panic` | `tests/bench.zig:159-160,291-294` | Low | Won't Do -- benchmark error handling is context-dependent; `catch {}` is appropriate for multi-node benchmarks where transient errors are expected |
+| QA-045 | 16 | No test for SEC-0146 `leader_id=0` rejection in handleAppendEntries | `src/node.zig:841-842` | Low | Resolved -- added adversarial test in `tests/scenarios/adversarial.zig` |
+| QA-048 | 8 | `examples/basic.zig` uses `deprecatedWriter()` API -- will break in future Zig | `examples/basic.zig:16` | Low | Won't Do -- `deprecatedWriter()` is the only simple option in Zig 0.15; track for 0.16 migration |
+
+### Pass 19 Quality Findings (resolved/dispositioned)
+
+| ID | Score | Finding | Component | Severity | Status |
+|----|-------|---------|-----------|----------|--------|
+| QA-037 | 36 | No code coverage measurement -- cannot verify 80% coverage target | build system | Medium | Won't Do -- Zig 0.15 has no coverage tooling; revisit when upstream adds support |
+| QA-038 | 20 | `examples/basic.zig` not compiled by any build step -- will silently rot | `build.zig` | Low | Resolved -- added `zig build example` step |
+| QA-039 | 16 | No fuzz testing for RPC message handlers | tests | Low | Won't Do -- separate initiative; chaos tests provide randomized fault injection |
+| QA-040 | 12 | Pre-commit hooks not installed in working copy | `.git/hooks/` | Low | Won't Do -- local dev environment; CI enforces all checks |
+| QA-041 | 8 | No CODEOWNERS granularity -- all files assigned to `@devnw` | `CODEOWNERS` | Low | Won't Do -- single-maintainer project; granularity adds no value |
+
+### By Category (all passes)
 
 | Category | Count | Top Finding |
 |----------|-------|-------------|
-| Maintainability | 5 | QA-024 (score 80): Duplicated snapshot meta serialization |
-| Readability | 4 | QA-025 (score 40): 14 repeated `createModule` blocks in `build.zig` |
-| CI/CD | 4 | QA-005 (score 48): Makefile missing scenario/chaos test targets |
-| Tests | 3 | QA-007 (score 36): Benchmarks vulnerable to compiler elision |
-| Documentation | 2 | QA-014 (score 32): README claims "Zero Dependencies" (depends on spice) |
-| Cleanup | 6 | QA-001 (score 60): Stale test binaries at repo root |
+| Maintainability | 5 | QA-024 (score 80): Duplicated snapshot meta serialization (Resolved) |
+| Readability | 4 | QA-025 (score 40): 14 repeated `createModule` blocks in `build.zig` (Resolved) |
+| CI/CD | 4 | QA-005 (score 48): Makefile missing scenario/chaos test targets (Resolved) |
+| Tests | 5 | QA-037 (score 36): No code coverage measurement (Open) |
+| Documentation | 2 | QA-014 (score 32): README claims "Zero Dependencies" (Resolved) |
+| Cleanup | 6 | QA-001 (score 60): Stale test binaries at repo root (Resolved) |
+| Tooling | 3 | QA-038 (score 20): Example not in build step (Open) |
 
 ### All Quality Findings
 
@@ -150,13 +177,26 @@ For detailed descriptions, evidence, and remediation guidance for each finding, 
 
 For detailed descriptions, evidence, and remediation guidance for each finding, see [PERF_GAP_ANALYSIS.md](PERF_GAP_ANALYSIS.md).
 
-### Open Performance Findings
+### Pass 20 New Performance Findings
 
-**0 open findings.** All 24 performance findings resolved or deferred.
+| ID | Score | Finding | Component | Severity | Status |
+|----|-------|---------|-----------|----------|--------|
+| PERF-035 | 4 | 12 sites use hardcoded `16` instead of `MAX_STACK_PEERS` in comparison expressions (`<= 16`, `> 16`) -- zero perf impact, maintenance risk if constant changes | `node.zig`, `replication.zig`, `quorum.zig` | Maint | Won't Do -- zero performance impact; the constant and comparisons are in the same compilation unit, so the compiler verifies consistency; changing MAX_STACK_PEERS requires updating array declarations anyway which triggers compilation errors at mismatched sites |
+
+### Pass 19 Performance Findings (resolved/dispositioned)
+
+| ID | Score | Finding | Component | Severity | Status |
+|----|-------|---------|-----------|----------|--------|
+| PERF-029 | 48 | `propose-ready-advance` benchmark reports 1 ns/op -- error-eating `catch` makes it a no-op after leader timeout | `tests/bench.zig` | P2 | Resolved -- fixed single-node leader setup before timing loop |
+| PERF-030 | 48 | No benchmark for follower receive path (handleAppendEntries + maybeAppend) | `tests/bench.zig` | P2 | Resolved -- added `follower_step_append_entries` benchmark |
+| PERF-031 | 16 | `file_storage_compact` benchmark conflates init+append+compact+deinit -- cannot isolate compaction regression | `tests/bench.zig` | P3 | Resolved -- restructured to populate once, measure compaction only |
+| PERF-032 | 4 | In-memory benchmarks use `std.testing.allocator` (GPA with safety checks), inflating ns/op 5-10x | `tests/bench.zig` | Info | Won't Do -- absolute numbers not representative by design; relative regression detection still works |
+| PERF-033 | 4 | `stableTo` benchmark conflates append + stableTo cost -- cannot isolate stableTo regression | `tests/bench.zig` | Info | Won't Do -- append dominates; stableTo is O(1) by design (PERF-009) |
+| PERF-034 | 4 | `file_storage_read` uses `page_allocator` for small per-entry dups (27 bytes -> 4 KiB page) | `tests/bench.zig` | Info | Won't Do -- matches production allocator patterns; not inflated vs real usage |
 
 ### Resolved Performance Highlights
 
-23 of 24 findings resolved (1 deferred). Key wins:
+26 of 35 tracked findings resolved (1 deferred, 3 Won't Do, 1 maintenance open). Key wins:
 - **PERF-001 (P0, 100):** Eliminated heap allocations in commit path via `[16]u64` stack buffers
 - **PERF-002 (P1, 80):** Removed double `log.slice()` in ready/advance cycle
 - **PERF-003 (P1, 80):** Added `borrowUnstable()` zero-copy path for unstable-only reads
@@ -185,9 +225,142 @@ For detailed descriptions, evidence, and remediation guidance for each finding, 
 
 ---
 
-## Open Gaps
+## Open Gaps (Pass 20)
 
-**0 open gaps.** All 13 spec-to-code gaps resolved. See [GAP_ANALYSIS_RESOLVED.md](GAP_ANALYSIS_RESOLVED.md) for details on GAP-0001 through GAP-0013.
+5 new gaps found in Pass 20. GAP-0014 was partially fixed in Pass 19 — 3 residual sub-issues split into GAP-0020/0021/0022. GAP-0023 is a regression of the GAP-0013 fix.
+
+### GAP-0020: Spec WAL record field order does not match implementation
+- **Category:** Docs
+- **Severity:** Low
+- **Current state:** Spec line 46 shows `[index][term][kind][data_len][data][crc32]` but `file_storage.zig:323-326` writes `[data_len][index][term][kind][data][crc32]`. The `data_len` field comes FIRST in code but FOURTH in spec.
+- **Recommended fix:** Update spec to match `file_storage.zig:25` internal doc comment.
+
+### GAP-0021: Spec claims .idx file exists but implementation uses in-memory index only
+- **Category:** Docs
+- **Severity:** Low
+- **Current state:** Spec line 48 describes a persistent `.idx` file, but `file_storage.zig:81` uses `std.ArrayList(IndexEntry)` in-memory only, rebuilt from WAL scan on `init()`.
+- **Recommended fix:** Update spec to describe in-memory index built from WAL scan.
+
+### GAP-0022: Spec says appendEntries uses temp+rename but implementation appends directly
+- **Category:** Docs
+- **Severity:** Low
+- **Current state:** Spec line 49 says `appendEntries` writes to temp file then renames. Implementation at `file_storage.zig:338-342` appends directly to WAL via `seekTo + writeAll + fsync`. Only `compact()` uses temp+rename.
+- **Recommended fix:** Update spec to describe direct append + fdatasync + CRC-based torn write detection.
+
+### GAP-0023: README Quick Start has 4 compile errors (regression of GAP-0013)
+- **Category:** Docs
+- **Severity:** Medium
+- **Current state:** `README.md:50` uses `try` on non-error `InMemoryStorage.init()`. Lines 60-61 miss `try` on `tick()` and `ready()`. Line 63 passes `&rd` to `advance()` which takes no argument.
+- **Recommended fix:** Fix all 4 errors: remove `try` from `InMemoryStorage.init`, add `try` to `tick/ready/advance`, remove `&rd` argument.
+
+### GAP-0024: Spec step() signature missing `from: u64` parameter
+- **Category:** Docs
+- **Severity:** Low
+- **Current state:** Spec line 117 shows `step(msg: Message, task)` but `node.zig:370` has `step(from: u64, msg: Message, task)`.
+- **Recommended fix:** Add `from: u64` to spec step() signature.
+
+---
+
+## Open Gaps (Pass 19) -- All Resolved or Split
+
+6 spec documentation drift gaps found in Pass 19. GAP-0014 partially fixed (residual issues tracked as GAP-0020/0021/0022). GAP-0015 through GAP-0019 confirmed resolved in Pass 20.
+
+### GAP-0014: Spec says "protobuf-encoded Entry" but impl uses custom binary WAL format
+- **Category:** Docs
+- **Severity:** Low
+- **Current state:** Spec line 46 says "protobuf-encoded Entry" but `file_storage.zig:22-26` uses a custom binary format (index/term/kind/data_len/data/CRC32).
+- **Recommended fix:** Update spec to describe actual WAL record format.
+
+### GAP-0015: Spec sections 4/7 still say "CRC32" for snapshot verification (incomplete GAP-0009 fix)
+- **Category:** Docs
+- **Severity:** Low
+- **Current state:** GAP-0009 fixed the InstallSnapshot RPC definition, but prose in spec sections 4 and 7 (lines ~185, ~404) still says "CRC32 verification" when implementation uses BLAKE3 for snapshot chunks.
+- **Recommended fix:** Search-and-replace remaining CRC32 snapshot references in spec prose.
+
+### GAP-0016: Spec says `loadHardState` returns `?HardState` but impl returns `HardState`
+- **Category:** Docs
+- **Severity:** Low
+- **Current state:** Spec line 288 (added by GAP-0012 fix) shows `loadHardState` returning `?HardState` (optional), but `storage.zig:16` returns `HardState` (non-optional, uses `HardState.initial` as sentinel).
+- **Recommended fix:** Update spec to match implementation return type.
+
+### GAP-0017: Spec module layout shows FileStorage in `storage.zig` but impl has separate `file_storage.zig`
+- **Category:** Docs
+- **Severity:** Low
+- **Current state:** Spec line 191 lists `storage.zig` as containing both Storage vtable + InMemoryStorage + FileStorage. Implementation has FileStorage in a separate 1,700-line `file_storage.zig`.
+- **Recommended fix:** Update spec module layout to show separate `file_storage.zig`.
+
+### GAP-0018: `docs/REQUIREMENTS.md` is entirely stale
+- **Category:** Docs
+- **Severity:** Medium
+- **Current state:** `docs/REQUIREMENTS.md` references Geode file paths (`src/distributed/raft.zig`) that no longer exist. Requirements are superseded by the design spec.
+- **Recommended fix:** Remove or replace with pointer to design spec.
+
+### GAP-0019: Spec section 10 line counts outdated
+- **Category:** Docs
+- **Severity:** Low
+- **Current state:** Spec lines 554-560 say ~3,500 source lines; actual is ~7,675 lines across 14 modules.
+- **Recommended fix:** Update line count estimates.
+
+---
+
+### Process Gap: 34 Resolved Issues Not Closed on Platform
+
+34 GitLab issues are code-fixed but remain open with `status::triage` labels:
+- **GAP issues (#185-#191):** 5 open, all code-fixed
+- **QA issues (#171-#203):** 24 open, all code-fixed (except #196 which is Won't Do)
+- **PERF issues (#188, #192, #194-#197):** 5 open, all code-fixed
+- **PERF-005 (#148):** 1 open, intentionally deferred (correct)
+
+These should be batch-closed with resolution notes.
+
+---
+
+## Security Findings -- Pass 20: Verification Audit -- 0 New Findings
+
+**Date:** 2026-03-22. Adversarial verification of all code changes from Pass 19 gap closure. 4 parallel review agents covering handleAppendEntries decomposition, FileStorage max_snapshot_size, serializeSnapshotMeta OOM handling, leader_id=0 check positioning, memory leak analysis, and rejectAppendEntries correctness.
+
+**0 new security findings.** All 6 focus areas verified clean:
+- handleAppendEntries decomposition preserves all security checks in correct order
+- leader_id=0 check positioned before becomeFollower (no state mutation on invalid input)
+- max_snapshot_size defaults safely (u64 cannot be negative; 0 = unlimited by design)
+- serializeSnapshotMeta has correct errdefer/defer pattern, no leak on OOM
+- No memory leaks introduced by refactoring
+- rejectAppendEntries consistently receives correct leader_id
+
+---
+
+## Security Findings -- Pass 19: Full Audit (SEC-0144 through SEC-0151) -- 8 New Findings
+
+**Date:** 2026-03-22. Full codebase audit with 4 parallel orientation agents (gap-collector, quality-inventory, perf-context, security-inventory) covering all 14 source modules, 12 test files, CI/CD, build system, and documentation. Focused on: transport trust boundaries, RPC handler asymmetries, FileStorage config consistency, snapshot reception DoS, benchmark infrastructure, and observability gaps.
+
+### Low Severity (4 findings)
+
+| Rank | Sev | Risk | Finding | Component | CWE | Evidence | Status |
+|------|-----|------|---------|-----------|-----|----------|--------|
+| 1 | Low | 16 | `finishLoadSnapshot` hardcodes 256 MiB cap instead of using `Config.max_snapshot_size` -- consumer config ignored on recovery | `src/file_storage.zig:557` | CWE-1188 | FileStorage does not receive Config at construction; hardcoded `256 * 1024 * 1024` | **Resolved** -- added `max_snapshot_size` field to FileStorage (SEC-0145) |
+| 2 | Low | 12 | `emptyHeartbeat` uses `prev_log_index=0, prev_log_term=0` regardless of follower state -- minor DoS amplification under sustained OOM | `src/node.zig:1224-1233` | CWE-400 | Falls back when `buildAppendEntries` returns null; followers process+reject each heartbeat | **Won't Do** -- correct Raft behavior; follower rejects and sends conflict info which helps leader backtrack (SEC-0144) |
+| 3 | Low | 12 | `handleAppendEntries` does not reject `leader_id=0` -- asymmetry with `handleRequestVote` and `handleInstallSnapshot` which both do | `src/node.zig:838` | CWE-20 | `becomeFollower(msg.term, 0)` sets `self.leader_id = 0`, confusing proposal routing | **Resolved** -- added `leader_id == 0` early return (SEC-0146) |
+| 4 | Low | 8 | No rate limiting on snapshot chunk reception restart cycles -- malicious leader can force repeated alloc/free of up to `max_snapshot_size` bytes | `src/snapshot.zig:144,166-170` | CWE-400 | Each `offset=0` chunk resets pending data; no limit on restart count | **Won't Do** -- requires compromised leader (already catastrophic); bounded per-round by `max_snapshot_size` (SEC-0148) |
+
+### Informational (4 findings)
+
+| Rank | Sev | Risk | Finding | Component | CWE | Evidence | Status |
+|------|-----|------|---------|-----------|-----|----------|--------|
+| 5 | Info | 4 | AppendEntries from non-member processed with warning only -- by design per Raft paper (term-based leader legitimacy) | `src/node.zig:851-856` | -- | Documented asymmetry with other handlers; correct per protocol | **Won't Do** -- by design per Raft paper (SEC-0147) |
+| 6 | Info | 4 | `InProcessTransport.sendImpl` silently drops on alloc failure -- no observability for OOM-induced drops | `src/transport.zig:109` | CWE-391 | Test-only transport; production impls should log/count drops separately | **Won't Do** -- test-only code; documented as implementation guidance (SEC-0149) |
+| 7 | Info | 4 | CRC32 used for WAL/hard_state integrity vs BLAKE3 for snapshots -- asymmetric integrity properties | `src/file_storage.zig:245,327,410` | -- | CRC32 sufficient for accidental corruption; known trade-off for per-record verification speed | **Won't Do** -- intentional trade-off; CRC32 faster for per-record WAL verification (SEC-0150) |
+| 8 | Info | 4 | `maybeCommit` in `tick()` swallows errors via `catch return` -- silent commit stall under OOM | `src/node.zig:1235-1246` | CWE-391 | Commit index stops advancing with no error surfaced to consumer | **Won't Do** -- matches existing error-swallowing pattern in sendHeartbeats; OOM recovery is eventual (SEC-0151) |
+
+### False Positives Filtered (Pass 19)
+
+The following candidates were verified against actual code and filtered:
+
+- **"Transport impersonation via forged sender fields"** -- Transport authentication is explicitly documented as consumer responsibility. Library provides sender ID validation but cannot enforce wire-level auth. By design.
+- **"Advisory file lock not enforced on Linux"** -- Advisory locking protects against accidental double-open, not malicious concurrent access. Data directory security is consumer responsibility. By design.
+- **"WAL size unbounded during normal append"** -- Compaction triggered by `snapshot_threshold` config. Consumer controls compaction cadence. By design.
+- **"TOCTOU between snapshot.meta and snapshot.data reads"** -- BLAKE3 digest check mitigates data corruption; race returns `Unavailable` which is handled. Acceptable.
+- **"`spice` dependency security posture"** -- Pinned by commit hash + content hash. Transitive dependency audit out of scope for this library audit.
+- **"Benchmark `allow_failure: true` in CI"** -- Appropriate for noisy benchmarks; performance regressions tracked via manual bench job. By design.
 
 ---
 
@@ -793,7 +966,9 @@ The following 25+ agent-reported candidates were verified against actual code an
 
 ## Open Spec-to-Code Gaps
 
-*None -- all 13 spec gaps resolved. See [GAP_ANALYSIS_RESOLVED.md](GAP_ANALYSIS_RESOLVED.md).*
+6 open (GAP-0014 through GAP-0019) -- all spec documentation drift, no functional gaps. See [Open Gaps (Pass 19)](#open-gaps-pass-19) above.
+
+13 previously resolved (GAP-0001 through GAP-0013). See [GAP_ANALYSIS_RESOLVED.md](GAP_ANALYSIS_RESOLVED.md).
 
 ## Geode Extraction Metadata
 

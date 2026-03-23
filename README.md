@@ -47,7 +47,7 @@ pub fn main() !void {
     const allocator = std.heap.page_allocator;
 
     // Create storage and transport backends.
-    var store = try raft.InMemoryStorage.init(allocator);
+    var store = raft.InMemoryStorage.init(allocator);
     defer store.deinit();
     // (Use raft.FileStorage for crash-safe persistence.)
 
@@ -57,10 +57,11 @@ pub fn main() !void {
     defer node.deinit();
 
     // Consumer loop: tick → ready → persist/send/apply → advance.
-    node.tick(null);
-    var rd = node.ready();
+    try node.tick(null);
+    var rd = try node.ready();
     // ... persist rd.hard_state, send rd.messages, apply rd.committed_entries ...
-    node.advance(&rd);
+    _ = rd;
+    try node.advance();
 }
 ```
 

@@ -493,7 +493,50 @@ test "adversarial: stale AppendEntriesResponse does not update peer progress (SE
 }
 
 // =========================================================================
-// 12. Follower-to-leader joint config finalization (SEC-0120)
+// 12. AppendEntries with leader_id=0 silently dropped (SEC-0146)
+// =========================================================================
+
+test "adversarial: AppendEntries with leader_id=0 is silently dropped (SEC-0146)" {
+    var net = try harness.Network.init(std.testing.allocator, 3);
+    defer net.deinit();
+
+    const leader_id = try electLeader(&net);
+    const follower_id: u64 = if (leader_id == 1) 2 else 1;
+    const follower = net.nodes.get(follower_id).?;
+
+    // Snapshot state before the adversarial message.
+    const term_before = follower.current_term;
+    const role_before = follower.role;
+    const leader_before = follower.leader_id;
+    const log_last_before = follower.log.lastIndex();
+
+    // Send AppendEntries with leader_id=0 and from=0. The sender mismatch
+    // check passes (from == leader_id == 0), but handleAppendEntries must
+    // reject the zero leader_id (SEC-0146).
+    try follower.step(0, .{
+        .append_entries = .{
+            .term = follower.current_term,
+            .leader_id = 0,
+            .prev_log_index = 0,
+            .prev_log_term = 0,
+            .entries = &.{},
+            .leader_commit = 0,
+        },
+    }, null);
+
+    // The message must be silently dropped: no state change, no crash.
+    try std.testing.expectEqual(term_before, follower.current_term);
+    try std.testing.expectEqual(role_before, follower.role);
+    try std.testing.expectEqual(leader_before, follower.leader_id);
+    try std.testing.expectEqual(log_last_before, follower.log.lastIndex());
+
+    // Verify no response was generated (queue should be empty for this node).
+    // The cluster should remain healthy after this adversarial message.
+    try runChecker(&net);
+}
+
+// =========================================================================
+// 13. Follower-to-leader joint config finalization (SEC-0120)
 // =========================================================================
 
 test "adversarial: pending_config_index tracked on config entry application (SEC-0120)" {

@@ -91,6 +91,10 @@ pub const FileStorage = struct {
     /// Reusable batch buffer for appendEntriesImpl (PERF-028).
     batch_buf: std.ArrayList(u8),
     allocator: std.mem.Allocator,
+    /// Maximum snapshot data size in bytes (SEC-0145). Prevents unbounded
+    /// memory allocation from corrupted or malicious snapshot files.
+    /// Defaults to 256 MiB. Consumers can override after init() if needed.
+    max_snapshot_size: u64 = 256 * 1024 * 1024,
 
     /// Error returned when the data directory is already locked by another process (SEC-0066).
     pub const DirectoryAlreadyLocked = error.WouldBlock;
@@ -553,9 +557,9 @@ pub const FileStorage = struct {
 
         const size = try data_file.getEndPos();
         // Cap allocation to prevent unbounded memory usage from corrupted
-        // or malicious snapshot data files (SEC-0086). Default 256 MiB.
-        const max_snap_size: u64 = 256 * 1024 * 1024;
-        if (size > max_snap_size) {
+        // or malicious snapshot data files (SEC-0086, SEC-0145).
+        // Uses configurable max_snapshot_size field (default 256 MiB).
+        if (size > self.max_snapshot_size) {
             return stg.StorageError.Unavailable;
         }
         const data = try self.allocator.alloc(u8, size);

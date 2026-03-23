@@ -152,6 +152,15 @@ pub fn build(b: *std.Build) void {
     const run_bench = b.addRunArtifact(bench_tests);
     bench_step.dependOn(&run_bench.step);
 
+    // Example executable (QA-038: compile examples to prevent silent rot)
+    const example = b.addExecutable(.{
+        .name = "example-basic",
+        .root_module = addRaftModule(b, b.path("examples/basic.zig"), target, optimize, &.{}),
+    });
+    const run_example = b.addRunArtifact(example);
+    const example_step = b.step("example", "Run the basic example");
+    example_step.dependOn(&run_example.step);
+
     // Check step for IDE integration (fast syntax validation)
     const check_step = b.step("check", "Check for compilation errors");
     const check = b.addTest(.{

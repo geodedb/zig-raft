@@ -106,7 +106,7 @@ help:
 	@echo "Development:"
 	@echo "  all                  Build and run tests (default)"
 	@echo "  build                Build the library"
-	@echo "  dev                  Quick iteration: fmt + check + test"
+	@echo "  dev                  Quick iteration: fmt + test"
 	@echo "  ci                   Full CI: clean + build + test"
 	@echo ""
 	@echo "Testing:"

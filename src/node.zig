@@ -838,6 +838,9 @@ pub const RaftNode = struct {
     fn handleAppendEntries(self: *RaftNode, from: u64, msg: rpc.AppendEntries) !void {
         _ = from;
 
+        // Reject messages from node ID 0 — invalid sender (SEC-0146).
+        if (msg.leader_id == 0) return;
+
         // Phase 1: Term validation.
         if (msg.term < self.current_term) {
             self.rejectAppendEntries(msg.leader_id);

@@ -13,7 +13,7 @@
 const std = @import("std");
 
 pub fn main() !void {
-    const stdout = std.io.getStdOut().writer();
+    const stdout = std.fs.File.stdout().deprecatedWriter();
     try stdout.print("raft — basic ready-state loop example\n", .{});
     try stdout.print("======================================\n\n", .{});
 
@@ -26,13 +26,14 @@ pub fn main() !void {
     //
     //   // Consumer loop
     //   while (true) {
-    //       node.tick(null);
+    //       try node.tick(null);
     //       // ... call node.step(from, msg, null) for inbound messages ...
-    //       var rd = node.ready();
+    //       var rd = try node.ready();
+    //       _ = rd;
     //       // 1. Persist rd.hard_state to durable storage
     //       // 2. Send rd.messages via your network transport
     //       // 3. Apply rd.committed_entries to your state machine
-    //       node.advance(&rd);
+    //       try node.advance();
     //   }
 
     try stdout.print("See README.md Quick Start and tests/harness.zig for working examples.\n", .{});

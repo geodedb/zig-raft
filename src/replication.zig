@@ -14,8 +14,6 @@ pub const PeerProgress = struct {
 
     /// After rejection with conflict hints, update next_index for fast backtracking.
     /// Returns true if next_index changed.
-    /// After rejection with conflict hints, update next_index for fast backtracking.
-    /// Returns true if next_index changed.
     /// Only allows backward movement of next_index to prevent a malicious
     /// conflict_index from jumping next_index forward (SEC-0076).
     pub fn maybeDecrTo(
