@@ -72,6 +72,17 @@ stages:
   - export PATH="$PWD/zig-x86_64-linux-${ZIG_VERSION}:$PATH"
   - zig version
 
+# Override zig-format from CI catalog — the v1.2.1 component uses the old
+# Zig download URL format (zig-linux-x86_64-*) which 404s for Zig >= 0.15.
+# Use our own install script with the correct URL pattern.
+zig-format:
+  stage: test
+  image: debian:bookworm-slim
+  before_script:
+    - *install-zig
+  script:
+    - zig fmt --check src/ tests/ build.zig
+
 # Build job
 build:
   stage: build
