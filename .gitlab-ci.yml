@@ -18,8 +18,8 @@ include:
   - component: gitlab.com/devnw/ci-catalog/security-secrets@v1.7.1
   - component: gitlab.com/devnw/ci-catalog/security-gitleaks@v1.7.1
 
-  # Code quality
-  - component: gitlab.com/devnw/ci-catalog/zig-format@v1.2.1
+  # Code quality — zig-format@v1.2.1 removed: uses stale Zig download URL
+  # and injects a cache key for zig-0.14.0. Replaced by inline job below.
 
   # SBOM
   - component: gitlab.com/devnw/ci-catalog/sbom-generate@v1.7.1
