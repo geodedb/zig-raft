@@ -2,6 +2,7 @@
 // Copyright (c) 2024-2025 CodePros
 
 const std = @import("std");
+const spice = @import("spice");
 const rpc = @import("rpc.zig");
 const membership = @import("membership.zig");
 
@@ -95,6 +96,11 @@ pub const SnapshotState = struct {
 
     /// Build InstallSnapshot messages (chunks) for sending to a lagging follower.
     /// Returns a list of Message values, each containing one chunk.
+    ///
+    /// When `task` is non-null, spice parallelism may be used for hash
+    /// computation and chunk construction on large snapshots. Currently
+    /// sequential: Zig's Blake3 API does not expose parallel tree hashing,
+    /// and per-chunk work is trivially cheap.
     const Blake3 = std.crypto.hash.Blake3;
 
     pub fn buildInstallSnapshotMessages(
@@ -102,7 +108,9 @@ pub const SnapshotState = struct {
         snapshot: rpc.Snapshot,
         term: u64,
         leader_id: u64,
+        task: ?*spice.Task,
     ) ![]rpc.Message {
+        _ = task; // Reserved for future parallel hashing when Blake3 tree API available.
         const data = snapshot.data;
 
         // Compute BLAKE3 digest of the full snapshot data.
@@ -367,7 +375,7 @@ test "buildInstallSnapshotMessages single chunk for small data" {
         .data = "small",
     };
 
-    const msgs = try ss.buildInstallSnapshotMessages(snap, 5, 1);
+    const msgs = try ss.buildInstallSnapshotMessages(snap, 5, 1, null);
     defer ss.allocator.free(msgs);
 
     try std.testing.expectEqual(@as(usize, 1), msgs.len);
@@ -393,7 +401,7 @@ test "buildInstallSnapshotMessages multiple chunks with correct offsets and CRC"
         .data = "HelloWorld!", // 11 bytes, chunk_size=4 => 3 chunks (4+4+3)
     };
 
-    const msgs = try ss.buildInstallSnapshotMessages(snap, 2, 1);
+    const msgs = try ss.buildInstallSnapshotMessages(snap, 2, 1, null);
     defer ss.allocator.free(msgs);
 
     try std.testing.expectEqual(@as(usize, 3), msgs.len);

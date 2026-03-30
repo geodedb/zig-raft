@@ -62,7 +62,7 @@ test "adversarial: reject RequestVote with mismatched candidate_id" {
             .last_log_term = 0,
             .pre_vote = false,
         },
-    }, null);
+    });
 
     // Follower should ignore the message — no term change, no vote granted.
     try std.testing.expectEqual(term_before, follower.current_term);
@@ -89,7 +89,7 @@ test "adversarial: reject AppendEntries with mismatched leader_id" {
             .entries = &.{},
             .leader_commit = 0,
         },
-    }, null);
+    });
 
     // Message should be silently dropped.
     try runChecker(&net);
@@ -125,7 +125,7 @@ test "adversarial: reject AppendEntries exceeding max_entries_per_msg" {
         .prev_log_term = 0,
         .entries = &entries,
         .leader_commit = 0,
-    } }, null);
+    } });
 
     // Should reject — log should not contain these entries.
     try std.testing.expectEqual(@as(u64, 0), follower.log.lastIndex());
@@ -155,7 +155,7 @@ test "adversarial: ignore vote response from non-voter" {
             .term = node.current_term,
             .vote_granted = true,
             .pre_vote = false,
-        } }, null);
+        } });
 
         // The non-voter vote should be ignored — node shouldn't become leader
         // from just self + non-voter vote in a 3-node cluster.
@@ -188,7 +188,7 @@ test "adversarial: reject AppendEntries with stale term" {
             .entries = &.{},
             .leader_commit = 0,
         },
-    }, null);
+    });
 
     // Term should not change.
     try std.testing.expectEqual(current_term, follower.current_term);
@@ -224,7 +224,7 @@ test "adversarial: reject InstallSnapshot with term=0" {
                 .is_joint = false,
             },
         },
-    }, null);
+    });
 
     // Snapshot should be rejected — snapshot_term should remain unchanged.
     try std.testing.expectEqual(@as(u64, 0), follower.snapshot_state.snapshot_index);
@@ -259,7 +259,7 @@ test "adversarial: reject InstallSnapshot with empty voters" {
                 .is_joint = false,
             },
         },
-    }, null);
+    });
 
     // Snapshot should be rejected.
     try std.testing.expectEqual(@as(u64, 0), follower.snapshot_state.snapshot_index);
@@ -313,7 +313,7 @@ test "adversarial: leader rejects pre-vote requests" {
         .last_log_index = 1000,
         .last_log_term = leader.current_term + 10,
         .pre_vote = true,
-    } }, null);
+    } });
 
     // Leader should NOT step down from a pre-vote.
     try std.testing.expectEqual(raft.Role.leader, leader.role);
@@ -342,7 +342,7 @@ test "adversarial: cluster remains functional after malicious messages" {
         .prev_log_term = 0,
         .entries = &.{},
         .leader_commit = 0,
-    } }, null);
+    } });
 
     // 2. Mismatched sender RequestVote.
     try follower.step(99, .{ .request_vote = .{
@@ -351,7 +351,7 @@ test "adversarial: cluster remains functional after malicious messages" {
         .last_log_index = 0,
         .last_log_term = 0,
         .pre_vote = false,
-    } }, null);
+    } });
 
     // 3. InstallSnapshot with zero term.
     try follower.step(leader_id, .{ .install_snapshot = .{
@@ -368,7 +368,7 @@ test "adversarial: cluster remains functional after malicious messages" {
             .voters_outgoing = &.{},
             .is_joint = false,
         },
-    } }, null);
+    } });
 
     // After adversarial messages, cluster should still work.
     // Propose and commit a normal entry.
@@ -430,7 +430,7 @@ test "adversarial: stale RequestVoteResponse does not count toward quorum (SEC-0
             .entries = &.{},
             .leader_commit = 0,
         },
-    }, null);
+    });
 
     // Candidate is now at term 9, role follower. Trigger an election.
     // Pre-vote is enabled by default, so we need to go through pre-vote first.
@@ -444,7 +444,7 @@ test "adversarial: stale RequestVoteResponse does not count toward quorum (SEC-0
             .last_log_term = 0,
             .pre_vote = false,
         },
-    }, null);
+    });
 
     // candidate should now be at term 10. Inject a stale response from term 5.
     const term_before = candidate.current_term;
@@ -455,7 +455,7 @@ test "adversarial: stale RequestVoteResponse does not count toward quorum (SEC-0
             .vote_granted = true,
             .pre_vote = false,
         },
-    }, null);
+    });
 
     // Candidate's state should not have changed — stale vote ignored.
     try std.testing.expectEqual(term_before, candidate.current_term);
@@ -485,7 +485,7 @@ test "adversarial: stale AppendEntriesResponse does not update peer progress (SE
             .conflict_index = 0,
             .conflict_term = 0,
         },
-    }, null);
+    });
 
     // match_index must not have been updated.
     try std.testing.expectEqual(match_before, progress.match_index);
@@ -522,7 +522,7 @@ test "adversarial: AppendEntries with leader_id=0 is silently dropped (SEC-0146)
             .entries = &.{},
             .leader_commit = 0,
         },
-    }, null);
+    });
 
     // The message must be silently dropped: no state change, no crash.
     try std.testing.expectEqual(term_before, follower.current_term);

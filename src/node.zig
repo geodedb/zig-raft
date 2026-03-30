@@ -107,8 +107,8 @@ pub const RaftNode = struct {
     ///
     /// **Thread-safety requirement (SEC-0067):** When passing a non-null
     /// `spice.Task` to `tick()` or `step()`, parallel worker threads will
-    /// allocate from this allocator concurrently (e.g. in `parallelBuildAE`,
-    /// `parallelSendVotes`, `parallelSendHeartbeats`). In that case, the
+    /// allocate from this allocator concurrently (e.g. in `parallelBuildAE`).
+    /// In that case, the
     /// allocator **must** be thread-safe. For example, use
     /// `std.heap.GeneralPurposeAllocator(.{ .thread_safe = true })` or
     /// `std.heap.page_allocator`. If `task` is always null (sequential mode),
@@ -359,16 +359,13 @@ pub const RaftNode = struct {
     }
 
     /// Process an inbound RPC message from another node.
-    /// When `task` is non-null, spice parallelism may be used for
-    /// read-only operations (e.g. building AppendEntries responses).
     ///
     /// NOTE: This library validates that `from` matches the sender ID
     /// embedded in messages (e.g. candidate_id, leader_id) where applicable.
     /// However, the `from` parameter itself is supplied by the transport layer.
     /// Transport implementations MUST authenticate peers (e.g. via mTLS or
     /// HMAC-signed messages) to prevent impersonation attacks.
-    pub fn step(self: *RaftNode, from: u64, msg: rpc.Message, task: ?*spice.Task) !void {
-        _ = task; // Reserved for future parallel response construction.
+    pub fn step(self: *RaftNode, from: u64, msg: rpc.Message) !void {
 
         // Validate that the transport-provided sender matches the message's
         // internal sender field to prevent spoofed/misrouted messages.
@@ -409,7 +406,7 @@ pub const RaftNode = struct {
 
     /// Advance internal timers and trigger leader/follower actions.
     /// When `task` is non-null, spice parallelism is used for building
-    /// AppendEntries payloads and broadcasting votes in parallel.
+    /// AppendEntries payloads in parallel during leader heartbeats.
     pub fn tick(self: *RaftNode, task: ?*spice.Task) !void {
         self.perf_stats.ticks += 1;
         if (self.role == .leader) {
@@ -449,7 +446,7 @@ pub const RaftNode = struct {
         } else {
             self.election_state.tickElection();
             if (self.election_state.electionTimeoutElapsed()) {
-                try self.startElection(self.config.pre_vote, task);
+                try self.startElection(self.config.pre_vote);
             }
         }
     }
@@ -678,7 +675,7 @@ pub const RaftNode = struct {
         }
     }
 
-    fn startElection(self: *RaftNode, pre_vote: bool, task: ?*spice.Task) !void {
+    fn startElection(self: *RaftNode, pre_vote: bool) !void {
         if (pre_vote) {
             self.is_pre_vote_election = true;
             // Don't increment term or set voted_for for pre-vote.
@@ -705,7 +702,7 @@ pub const RaftNode = struct {
         if (peers.len == 0) {
             if (pre_vote) {
                 // Pre-vote succeeded (self-only), start real election.
-                try self.startElection(false, task);
+                try self.startElection(false);
             } else {
                 try self.becomeLeader();
             }
@@ -828,7 +825,7 @@ pub const RaftNode = struct {
         // Check quorum (reuse cfg from voter validation above).
         if (self.election_state.hasJointQuorum(cfg.voters, cfg.voters_outgoing)) {
             if (self.is_pre_vote_election) {
-                try self.startElection(false, null);
+                try self.startElection(false);
             } else {
                 try self.becomeLeader();
             }
@@ -1146,23 +1143,30 @@ pub const RaftNode = struct {
                 });
             }
 
-            for (peers, 0..) |peer, i| {
-                // join returns ?void — null means the future wasn't executed
-                // (was popped before a worker got to it).
-                const did_run = futures[i].join(t);
-                if (did_run == null) {
-                    // Future didn't execute; build sequentially.
-                    results[i] = rs.buildAppendEntries(
-                        peer,
-                        &self.log,
-                        self.current_term,
-                        self.id,
-                        self.log.committed,
-                        self.config.max_entries_per_msg,
-                        self.config.max_bytes_per_msg,
-                    ) catch null;
+            // Join in reverse order (LIFO) — spice's work queue is a stack,
+            // so queued jobs must be popped from the tail first.
+            {
+                var j: usize = peers.len;
+                while (j > 0) {
+                    j -= 1;
+                    const did_run = futures[j].join(t);
+                    if (did_run == null) {
+                        // Future wasn't picked up; build sequentially.
+                        results[j] = rs.buildAppendEntries(
+                            peers[j],
+                            &self.log,
+                            self.current_term,
+                            self.id,
+                            self.log.committed,
+                            self.config.max_entries_per_msg,
+                            self.config.max_bytes_per_msg,
+                        ) catch null;
+                    }
                 }
+            }
 
+            // Send in forward order (message ordering is independent of join order).
+            for (peers, 0..) |peer, i| {
                 if (results[i]) |m| {
                     self.sendMsg(peer, m);
                     // Free the entries slice allocated by buildAppendEntries (SEC-0140).
@@ -1444,7 +1448,7 @@ test "step with higher term becomes follower" {
         .prev_log_term = 0,
         .entries = &.{},
         .leader_commit = 0,
-    } }, null);
+    } });
 
     try std.testing.expectEqual(st.Role.follower, node.role);
     try std.testing.expectEqual(leader_term + 5, node.current_term);

@@ -30,9 +30,9 @@ make ci      # clean + build + all tests
 
 The library is consumer-driven, not event-loop-driven. The consumer calls `tick()`, `step()`, and `propose()` on `RaftNode`; the library produces a `Ready` struct each round describing what to persist, send, and apply. The Raft core is a pure deterministic state machine — it never does I/O directly.
 
-Consumer loop: `tick(task)` -> `step(from, msg, task)` -> `propose(data)` -> `ready()` -> persist/send/apply -> `advance()`
+Consumer loop: `tick(task)` -> `step(from, msg)` -> `propose(data)` -> `ready()` -> persist/send/apply -> `advance()`
 
-The `task` parameter is an optional `*spice.Task` for parallel execution. Pass `null` for sequential behavior.
+The `task` parameter on `tick()` is an optional `*spice.Task` for parallel execution. Pass `null` for sequential behavior. `step()` is always sequential.
 
 ### Pluggable Interfaces (vtable pattern)
 

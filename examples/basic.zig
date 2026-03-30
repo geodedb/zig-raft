@@ -27,7 +27,7 @@ pub fn main() !void {
     //   // Consumer loop
     //   while (true) {
     //       try node.tick(null);
-    //       // ... call node.step(from, msg, null) for inbound messages ...
+    //       // ... call node.step(from, msg) for inbound messages ...
     //       var rd = try node.ready();
     //       _ = rd;
     //       // 1. Persist rd.hard_state to durable storage

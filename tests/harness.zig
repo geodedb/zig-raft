@@ -216,7 +216,7 @@ pub const Network = struct {
             if (self.paused_nodes.contains(pm.to)) continue;
             if (self.dropped_routes.contains(.{ .from = pm.from, .to = pm.to })) continue;
             if (self.nodes.get(pm.to)) |n| {
-                try n.step(pm.from, pm.msg, null);
+                try n.step(pm.from, pm.msg);
             }
         }
 
@@ -231,7 +231,7 @@ pub const Network = struct {
             if (self.paused_nodes.contains(pm.to)) continue;
             if (self.dropped_routes.contains(.{ .from = pm.from, .to = pm.to })) continue;
             if (self.nodes.get(pm.to)) |n| {
-                try n.step(pm.from, pm.msg, null);
+                try n.step(pm.from, pm.msg);
             }
         }
 

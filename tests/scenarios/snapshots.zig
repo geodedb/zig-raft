@@ -216,6 +216,7 @@ test "scenario: buildInstallSnapshotMessages produces correct chunks" {
         snap,
         leader.current_term,
         leader.id,
+        null,
     );
 
     // 16 bytes / 4-byte chunks = 4 messages.
@@ -322,12 +323,13 @@ test "scenario: snapshot_catches_up_laggard" {
         snap,
         leader.current_term,
         leader.id,
+        null,
     );
 
     // Deliver each chunk to the laggard.
     const laggard = net.nodes.get(laggard_id).?;
     for (msgs) |m| {
-        try laggard.step(leader_id, m, null);
+        try laggard.step(leader_id, m);
     }
 
     // The laggard's snapshot_state should reflect the received snapshot.
@@ -392,6 +394,7 @@ test "scenario: chunked_snapshot_transfer" {
         snap,
         leader.current_term,
         leader.id,
+        null,
     );
 
     // Should produce ceil(100/7) = 15 chunks.
@@ -413,7 +416,7 @@ test "scenario: chunked_snapshot_transfer" {
         // Verify offset progression.
         try std.testing.expectEqual(@as(u64, idx * 7), is_chunk.offset);
 
-        try follower.step(leader_id, m, null);
+        try follower.step(leader_id, m);
     }
 
     // Last chunk should be done=true.
