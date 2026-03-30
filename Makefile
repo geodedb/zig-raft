@@ -3,6 +3,7 @@
 # Copyright (c) 2024-2025 CodePros
 
 .PHONY: all build test test-unit test-integration test-scenarios test-chaos clean check fmt help dev ci bench
+.PHONY: scale-bench bench-save bench-compare bench-baseline
 .PHONY: test-release-safe test-release-fast test-release-small test-all-optimizations
 .PHONY: pre-commit-install pre-commit pre-commit-run
 
@@ -68,6 +69,29 @@ bench:
 	@echo "Running benchmarks (ReleaseFast)..."
 	@zig build bench --summary all
 
+# Incremental scale benchmark (JSON to stdout, table to stderr)
+scale-bench:
+	@echo "Running incremental scale benchmark..."
+	@zig build scale-bench 2>/dev/null
+
+# Run scale bench and save results to benchmarks/results/<git-sha>.json
+bench-save:
+	@echo "Running scale benchmark and saving results..."
+	@zig build scale-bench 2>/dev/null > benchmarks/results/$$(git rev-parse --short HEAD).json
+	@echo "Saved to benchmarks/results/$$(git rev-parse --short HEAD).json"
+
+# Compare current results against baseline
+bench-compare:
+	@echo "Running scale benchmark and comparing against baseline..."
+	@zig build scale-bench 2>/dev/null > /tmp/raft-current-bench.json
+	@zig build compare-bench -- benchmarks/results/baseline.json /tmp/raft-current-bench.json
+
+# Save current results as the new baseline
+bench-baseline:
+	@echo "Running scale benchmark and saving as baseline..."
+	@zig build scale-bench 2>/dev/null > benchmarks/results/baseline.json
+	@echo "Saved to benchmarks/results/baseline.json"
+
 # Release optimization level tests
 test-release-safe:
 	@echo "🧪 Testing with ReleaseSafe..."
@@ -120,6 +144,10 @@ help:
 	@echo "  test-release-small   Test with ReleaseSmall"
 	@echo "  test-all-optimizations  Test all optimization levels"
 	@echo "  bench                Run benchmarks (ReleaseFast)"
+	@echo "  scale-bench          Run scale benchmarks (JSON to stdout)"
+	@echo "  bench-save           Save scale bench results to results/<sha>.json"
+	@echo "  bench-compare        Compare scale bench against baseline"
+	@echo "  bench-baseline       Save current scale bench as baseline"
 	@echo ""
 	@echo "Code Quality:"
 	@echo "  fmt                  Format source code"

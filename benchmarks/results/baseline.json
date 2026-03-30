@@ -1,0 +1,73 @@
+{
+  "version": 1,
+  "timestamp": "2026-03-30T17:22:18Z",
+  "git_commit": "unknown",
+  "system": { "os": "linux", "arch": "x86_64" },
+  "tiers": [
+    {
+      "name": "1-node",
+      "node_count": 1,
+      "peer_count": 0,
+      "propose_ns": 13698,
+      "tick_ns": 66,
+      "tick_parallel_ns": 0,
+      "step_ae_ns": 137950,
+      "log_append_ns": 544513,
+      "ready_advance_ns": 13765,
+      "heartbeat_ops_sec": 29389256,
+      "replication_ops_sec": 71694
+    },
+    {
+      "name": "3-node",
+      "node_count": 3,
+      "peer_count": 2,
+      "propose_ns": 13610,
+      "tick_ns": 72,
+      "tick_parallel_ns": 141,
+      "step_ae_ns": 141643,
+      "log_append_ns": 538542,
+      "ready_advance_ns": 14138,
+      "heartbeat_ops_sec": 9858379,
+      "replication_ops_sec": 72878
+    },
+    {
+      "name": "5-node",
+      "node_count": 5,
+      "peer_count": 4,
+      "propose_ns": 13756,
+      "tick_ns": 159,
+      "tick_parallel_ns": 285,
+      "step_ae_ns": 145058,
+      "log_append_ns": 530018,
+      "ready_advance_ns": 14333,
+      "heartbeat_ops_sec": 9228447,
+      "replication_ops_sec": 73715
+    },
+    {
+      "name": "7-node",
+      "node_count": 7,
+      "peer_count": 6,
+      "propose_ns": 13610,
+      "tick_ns": 195,
+      "tick_parallel_ns": 459,
+      "step_ae_ns": 137966,
+      "log_append_ns": 534530,
+      "ready_advance_ns": 13602,
+      "heartbeat_ops_sec": 7181071,
+      "replication_ops_sec": 71863
+    },
+    {
+      "name": "11-node",
+      "node_count": 11,
+      "peer_count": 10,
+      "propose_ns": 14480,
+      "tick_ns": 342,
+      "tick_parallel_ns": 685,
+      "step_ae_ns": 142596,
+      "log_append_ns": 547573,
+      "ready_advance_ns": 12800,
+      "heartbeat_ops_sec": 4130320,
+      "replication_ops_sec": 69237
+    }
+  ]
+}

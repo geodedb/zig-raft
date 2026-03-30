@@ -34,9 +34,17 @@ pub fn build(b: *std.Build) void {
     });
     const spice_module = spice_dep.module("spice");
 
+    // WAL dependency (write-ahead log)
+    const wal_dep = b.dependency("wal", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const wal_module = wal_dep.module("wal");
+
     // Common import sets used across test modules.
-    const spice_imports: []const Import = &.{
+    const raft_lib_imports: []const Import = &.{
         .{ .name = "spice", .module = spice_module },
+        .{ .name = "wal", .module = wal_module },
     };
 
     // Main library module
@@ -44,7 +52,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = spice_imports,
+        .imports = raft_lib_imports,
     });
 
     const raft_imports: []const Import = &.{
@@ -54,7 +62,7 @@ pub fn build(b: *std.Build) void {
     // Unit tests (run tests defined in the module itself)
     const test_step = b.step("test", "Run unit tests");
     const unit_tests = b.addTest(.{
-        .root_module = addRaftModule(b, b.path("src/root.zig"), target, optimize, spice_imports),
+        .root_module = addRaftModule(b, b.path("src/root.zig"), target, optimize, raft_lib_imports),
     });
     const run_unit_tests = b.addRunArtifact(unit_tests);
     test_step.dependOn(&run_unit_tests.step);
@@ -93,6 +101,7 @@ pub fn build(b: *std.Build) void {
         "tests/scenarios/membership.zig",
         "tests/scenarios/replication.zig",
         "tests/scenarios/adversarial.zig",
+        "tests/scenarios/parallel.zig",
     };
 
     for (scenario_files) |path| {
@@ -134,12 +143,17 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = .ReleaseFast,
     });
+    const bench_wal_dep = b.dependency("wal", .{
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
     const bench_raft_module = b.addModule("raft-bench", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = .ReleaseFast,
         .imports = &.{
             .{ .name = "spice", .module = bench_spice_dep.module("spice") },
+            .{ .name = "wal", .module = bench_wal_dep.module("wal") },
         },
     });
 
@@ -151,6 +165,42 @@ pub fn build(b: *std.Build) void {
     });
     const run_bench = b.addRunArtifact(bench_tests);
     bench_step.dependOn(&run_bench.step);
+
+    // Incremental scale benchmark executable
+    const scale_bench_step = b.step("scale-bench", "Run incremental scale benchmarks with JSON output");
+    const scale_bench_exe = b.addExecutable(.{
+        .name = "scale-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/scale_bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "raft", .module = bench_raft_module },
+            },
+        }),
+    });
+    b.installArtifact(scale_bench_exe);
+    const run_scale_bench = b.addRunArtifact(scale_bench_exe);
+    if (b.args) |args| {
+        run_scale_bench.addArgs(args);
+    }
+    scale_bench_step.dependOn(&run_scale_bench.step);
+
+    // Benchmark comparison tool
+    const compare_bench_step = b.step("compare-bench", "Compare benchmark results against a baseline");
+    const compare_bench_exe = b.addExecutable(.{
+        .name = "compare-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/compare.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    const run_compare_bench = b.addRunArtifact(compare_bench_exe);
+    if (b.args) |args| {
+        run_compare_bench.addArgs(args);
+    }
+    compare_bench_step.dependOn(&run_compare_bench.step);
 
     // Example executable (QA-038: compile examples to prevent silent rot)
     const example = b.addExecutable(.{
@@ -164,7 +214,7 @@ pub fn build(b: *std.Build) void {
     // Check step for IDE integration (fast syntax validation)
     const check_step = b.step("check", "Check for compilation errors");
     const check = b.addTest(.{
-        .root_module = addRaftModule(b, b.path("src/root.zig"), target, optimize, spice_imports),
+        .root_module = addRaftModule(b, b.path("src/root.zig"), target, optimize, raft_lib_imports),
     });
     check_step.dependOn(&check.step);
 }
