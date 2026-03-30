@@ -9,8 +9,7 @@
             .hash = "spice-0.0.0-HnDb58jJAACojBd1dquGT-Ngc6TORlC6izlAKf0f4Rno",
         },
         .wal = .{
-            .url = "git+https://gitlab.com/devnw/zig/wal.git#706135329488aad3d349a61987e227c6114c974f",
-            .hash = "wal-0.1.0-EqPqpmpTAwB9UGtm88GYWXD2iV9mFKUfhlW4iZqe62oi",
+            .path = "../wal",
         },
     },
     .paths = .{

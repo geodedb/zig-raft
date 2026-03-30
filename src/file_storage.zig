@@ -3,55 +3,36 @@
 
 //! File-backed implementation of the `Storage` interface.
 //!
-//! Provides crash-safe, durable storage using flat files on disk. This
-//! serves as both a production-ready storage backend and a reference
-//! implementation for consumers who want to build custom backends
-//! (S3, database, etc.) against the `Storage` vtable.
+//! Provides crash-safe, durable storage using flat files on disk. Uses the
+//! `wal` library for the write-ahead log (append, recovery, compaction) and
+//! maintains an in-memory index for O(1) term lookups.
 //!
 //! ## Directory layout
 //!
 //! ```
 //! <data_dir>/
 //!   hard_state    -- 20 bytes: [term: u64 LE][voted_for: u64 LE][crc32: u32 LE]
-//!   wal           -- append-only write-ahead log of entry records
+//!   entries.wal   -- write-ahead log of entry records (managed by wal library)
 //!   snapshot.meta -- variable: [index: u64 LE][term: u64 LE][data_blake3: 32 bytes][config_data...][crc32: u32 LE]
 //!   snapshot.data -- raw snapshot bytes
 //! ```
 //!
-//! ## WAL record format
+//! ## WAL payload format
 //!
-//! Each record is:
+//! Each WAL record payload (inside the wal library's framing) contains:
 //! ```
-//! [data_len: u32 LE][index: u64 LE][term: u64 LE][kind: u8][data: data_len bytes][crc32: u32 LE]
+//! [term: u64 LE][kind: u8][data: N bytes]
 //! ```
-//!
-//! On open, the WAL is scanned and CRC-verified. Torn writes are detected
-//! and truncated. An in-memory index is built for O(1) term lookups and
-//! efficient range reads.
+//! The raft entry index is mapped to the WAL LSN.
 //!
 //! ## Crash safety
 //!
 //! - Hard state and snapshots: write to temp file, sync, rename.
-//! - WAL: append + sync. Torn write recovery on next open.
-//! - Compaction: rewrite WAL atomically via temp + rename.
-//!
-//! ## Security: path validation
-//!
-//! `FileStorage.init(dir_path)` opens the given directory directly. It does NOT
-//! validate the path for traversal sequences (e.g. `../`). The `dir_path` is
-//! expected to come from the consumer's configuration, not from untrusted user
-//! input. Consumers MUST ensure the path is sanitized before passing it here.
-//!
-//! ## Example usage
-//!
-//! ```zig
-//! var file_store = try FileStorage.init(allocator, "/var/lib/raft/node1");
-//! defer file_store.deinit();
-//!
-//! var raft_node = try RaftNode.init(allocator, config, file_store.storage());
-//! ```
+//! - WAL: handled by the wal library (CRC32, fdatasync, torn write recovery).
+//! - Compaction: handled by the wal library (atomic rewrite via temp + rename).
 
 const std = @import("std");
+const wal_mod = @import("wal");
 const state = @import("state.zig");
 const rpc = @import("rpc.zig");
 const stg = @import("storage.zig");
@@ -60,71 +41,44 @@ const mem = @import("membership.zig");
 /// Sentinel value for voted_for = null in the hard_state file.
 const VOTED_FOR_NONE: u64 = std.math.maxInt(u64);
 
-/// Fixed portion of a WAL record (before variable-length data).
-/// data_len(4) + index(8) + term(8) + kind(1) = 21 bytes
-const WAL_HEADER_SIZE: usize = 4 + 8 + 8 + 1;
-
-/// CRC footer size.
-const WAL_CRC_SIZE: usize = 4;
-
-/// Maximum allowed data_len in a single WAL record during recovery.
-/// Guards against corrupted headers causing unbounded allocation.
-/// 64 MiB is generous enough for any realistic entry while preventing
-/// multi-GB allocations from corrupted u32 values.
-const WAL_MAX_RECORD_DATA_LEN: u32 = 64 * 1024 * 1024;
+/// Payload header size: [term: u64 LE][kind: u8] = 9 bytes.
+const PAYLOAD_HEADER_SIZE: usize = 8 + 1;
 
 pub const FileStorage = struct {
     dir: std.fs.Dir,
     lock_file: ?std.fs.File,
-    wal_file: ?std.fs.File,
-    wal_end: u64,
+    wal_log: ?wal_mod.WriteAheadLog,
     index: std.ArrayList(IndexEntry),
     snapshot_index: u64,
     snapshot_term: u64,
-    /// Cached BLAKE3 digest of snapshot.data (SEC-0032). Zero if no snapshot.
     snapshot_data_digest: [32]u8,
-    /// Cached snapshot ClusterConfig (SEC-0039). Preserved across compaction.
     snapshot_config_voters: std.ArrayList(u64),
     snapshot_config_voters_outgoing: std.ArrayList(u64),
     snapshot_config_is_joint: bool,
     hard_state: state.HardState,
-    /// Reusable batch buffer for appendEntriesImpl (PERF-028).
-    batch_buf: std.ArrayList(u8),
     allocator: std.mem.Allocator,
-    /// Maximum snapshot data size in bytes (SEC-0145). Prevents unbounded
-    /// memory allocation from corrupted or malicious snapshot files.
-    /// Defaults to 256 MiB. Consumers can override after init() if needed.
     max_snapshot_size: u64 = 256 * 1024 * 1024,
 
-    /// Error returned when the data directory is already locked by another process (SEC-0066).
     pub const DirectoryAlreadyLocked = error.WouldBlock;
 
-    /// In-memory index entry for fast lookups.
+    /// In-memory index entry for fast term lookups.
     const IndexEntry = struct {
-        file_offset: u64,
         raft_index: u64,
         term: u64,
         data_len: u32,
     };
 
     /// Flush directory metadata to disk after a rename (SEC-0065).
-    /// Zig's Dir.fd uses O_PATH which does not support fsync, so we
-    /// open a syncable fd via openat(".", O_DIRECTORY) and fsync it.
     fn syncDir(self: *FileStorage) !void {
         const sync_fd = try std.posix.openat(self.dir.fd, ".", .{ .DIRECTORY = true }, 0);
         defer std.posix.close(sync_fd);
         try std.posix.fsync(sync_fd);
     }
 
-    /// Open or create a FileStorage at the given directory path.
-    /// Recovers existing state from files if present.
     pub fn init(allocator: std.mem.Allocator, dir_path: []const u8) !FileStorage {
-        // Open or create the directory.
         var dir = try std.fs.cwd().makeOpenPath(dir_path, .{});
         errdefer dir.close();
 
-        // Acquire exclusive advisory lock on data directory (SEC-0066).
-        // Prevents two processes from corrupting state by writing concurrently.
         const lock_file = try dir.createFile(".lock", .{
             .lock = .exclusive,
             .lock_nonblocking = true,
@@ -135,8 +89,7 @@ pub const FileStorage = struct {
         var fs = FileStorage{
             .dir = dir,
             .lock_file = lock_file,
-            .wal_file = null,
-            .wal_end = 0,
+            .wal_log = null,
             .index = .{},
             .snapshot_index = 0,
             .snapshot_term = 0,
@@ -145,47 +98,29 @@ pub const FileStorage = struct {
             .snapshot_config_voters_outgoing = .{},
             .snapshot_config_is_joint = false,
             .hard_state = state.HardState.initial,
-            .batch_buf = .{},
             .allocator = allocator,
         };
-        // Free heap resources on init failure (SEC-0069). Dir and lock_file
-        // are handled by their own errdefers above; these cover ArrayLists
-        // and the WAL file handle that may be opened during recoverWal().
         errdefer {
             fs.index.deinit(allocator);
-            fs.batch_buf.deinit(allocator);
             fs.snapshot_config_voters.deinit(allocator);
             fs.snapshot_config_voters_outgoing.deinit(allocator);
-            if (fs.wal_file) |f| f.close();
+            if (fs.wal_log) |*w| w.deinit();
         }
 
-        // Clean up stale hard_state tmp (safe — not used by recovery).
         dir.deleteFile("hard_state.tmp") catch {};
-
-        // NOTE: snapshot .tmp files are NOT deleted here — loadSnapshotImpl()
-        // uses snapshot.data.tmp for crash recovery when a rename was
-        // interrupted (SEC-0130, SEC-0041). They are cleaned up after
-        // snapshot recovery below.
 
         // Recover hard state.
         fs.hard_state = fs.readHardStateFile() catch state.HardState.initial;
 
-        // Recover snapshot metadata (config now included in V3 format, SEC-0039).
-        // This also recovers from interrupted snapshot.data renames (SEC-0130).
+        // Recover snapshot metadata.
         const snap_meta = fs.readSnapshotMeta() catch null;
         if (snap_meta) |meta| {
-            // Free the owned buffers from readSnapshotMeta on both success and
-            // error paths (SEC-0069). appendSlice below can fail with OOM,
-            // which would leak meta's config buffers without this defer.
             var m = meta;
             defer m.freeConfig(allocator);
 
             fs.snapshot_index = meta.index;
             fs.snapshot_term = meta.term;
             fs.snapshot_data_digest = meta.data_digest orelse (.{0} ** 32);
-            // Cache config for compactImpl to preserve across rewrites.
-            // Roll back first appendSlice if second fails to prevent
-            // inconsistent snapshot config state (SEC-0105).
             if (meta.config) |cfg| {
                 try fs.snapshot_config_voters.appendSlice(allocator, cfg.voters);
                 errdefer fs.snapshot_config_voters.clearRetainingCapacity();
@@ -194,29 +129,24 @@ pub const FileStorage = struct {
             }
         }
 
-        // Now that snapshot recovery is complete, clean up any stale .tmp
-        // files that were preserved for crash recovery (SEC-0130, SEC-0041).
         dir.deleteFile("snapshot.data.tmp") catch {};
         dir.deleteFile("snapshot.meta.tmp") catch {};
 
-        // Open WAL and rebuild in-memory index with torn write recovery.
+        // Open WAL and rebuild in-memory index.
         try fs.recoverWal();
 
         return fs;
     }
 
     pub fn deinit(self: *FileStorage) void {
-        if (self.wal_file) |f| f.close();
+        if (self.wal_log) |*w| w.deinit();
         self.index.deinit(self.allocator);
-        self.batch_buf.deinit(self.allocator);
         self.snapshot_config_voters.deinit(self.allocator);
         self.snapshot_config_voters_outgoing.deinit(self.allocator);
-        // Release exclusive directory lock (SEC-0066).
         if (self.lock_file) |lf| lf.close();
         self.dir.close();
     }
 
-    /// Return a `Storage` vtable wrapper backed by this FileStorage.
     pub fn storage(self: *FileStorage) stg.Storage {
         return .{
             .ptr = @ptrCast(self),
@@ -240,16 +170,13 @@ pub const FileStorage = struct {
     // Public implementation methods
     // ========================================================================
 
-    /// Format: [term: u64 LE][voted_for: u64 LE][crc32: u32 LE] = 20 bytes (SEC-0036)
     pub fn saveHardStateImpl(self: *FileStorage, hs: state.HardState) !void {
         var buf: [20]u8 = undefined;
         std.mem.writeInt(u64, buf[0..8], hs.current_term, .little);
         std.mem.writeInt(u64, buf[8..16], hs.voted_for orelse VOTED_FOR_NONE, .little);
-        // Append CRC32 of the payload (SEC-0036).
         const crc = std.hash.Crc32.hash(buf[0..16]);
         std.mem.writeInt(u32, buf[16..20], crc, .little);
 
-        // Write to temp, sync, rename.
         var tmp = try self.dir.createFile("hard_state.tmp", .{});
         errdefer {
             tmp.close();
@@ -260,7 +187,7 @@ pub const FileStorage = struct {
         tmp.close();
 
         try self.dir.rename("hard_state.tmp", "hard_state");
-        try self.syncDir(); // SEC-0065: flush directory metadata to disk.
+        try self.syncDir();
         self.hard_state = hs;
     }
 
@@ -273,109 +200,70 @@ pub const FileStorage = struct {
         // truncate the WAL and index from the conflict point.
         try self.truncateFrom(first_new_index);
 
-        // Open WAL for appending (create if not exists).
-        if (self.wal_file == null) {
-            // Ensure the file exists.
-            {
-                var f = try self.dir.createFile("wal", .{ .truncate = false });
-                f.close();
-            }
-            // Open for read+write.
-            self.wal_file = try self.dir.openFile("wal", .{ .mode = .read_write });
-        }
-        const file = self.wal_file.?;
-
-        // Track starting state for rollback (SEC-0028).
-        const saved_wal_end = self.wal_end;
-        const saved_index_len = self.index.items.len;
-
-        // --- Batched WAL write: single buffer + single writeAll (PERF-007) ---
-
-        // First pass: validate entries and compute total buffer size.
-        var total_buf_size: usize = 0;
-        for (ents) |entry| {
-            if (entry.data.len > std.math.maxInt(u32)) {
-                return stg.StorageError.Unavailable;
-            }
-            total_buf_size += WAL_HEADER_SIZE + entry.data.len + WAL_CRC_SIZE;
+        // Ensure WAL is open.
+        if (self.wal_log == null) {
+            self.wal_log = try wal_mod.WriteAheadLog.init(
+                self.allocator,
+                self.dir,
+                "entries.wal",
+                .{},
+            );
         }
 
-        // Pre-reserve index capacity so updates below cannot fail (SEC-0028).
+        // Pre-reserve index capacity.
         self.index.ensureTotalCapacity(self.allocator, self.index.items.len + ents.len) catch |err| {
             return err;
         };
 
-        // Reuse batch buffer, clearing but retaining capacity (PERF-028).
-        self.batch_buf.clearRetainingCapacity();
-        self.batch_buf.ensureTotalCapacity(self.allocator, total_buf_size) catch |err| {
-            return err;
-        };
-        self.batch_buf.expandToCapacity();
-        const buf = self.batch_buf.items[0..total_buf_size];
-
-        // Second pass: serialize all entries + CRCs into the buffer.
-        var pos: usize = 0;
-        for (ents) |entry| {
-            const data_len: u32 = @intCast(entry.data.len);
-            const record_size = WAL_HEADER_SIZE + entry.data.len;
-            const payload = buf[pos..][0..record_size];
-
-            std.mem.writeInt(u32, payload[0..4], data_len, .little);
-            std.mem.writeInt(u64, payload[4..12], entry.index, .little);
-            std.mem.writeInt(u64, payload[12..20], entry.term, .little);
-            payload[20] = @intFromEnum(entry.kind);
-            if (entry.data.len > 0) {
-                @memcpy(payload[21..][0..entry.data.len], entry.data);
+        // Serialize entries as WAL payloads: [term:u64 LE][kind:u8][data]
+        const payloads = try self.allocator.alloc([]const u8, ents.len);
+        defer {
+            for (payloads) |p| {
+                if (p.len > 0) self.allocator.free(p);
             }
-
-            const crc = std.hash.Crc32.hash(payload);
-            std.mem.writeInt(u32, buf[pos + record_size ..][0..4], crc, .little);
-
-            pos += record_size + WAL_CRC_SIZE;
+            self.allocator.free(payloads);
         }
 
-        // Single seekTo + writeAll instead of 2N syscalls.
-        try file.seekTo(self.wal_end);
-        file.writeAll(buf) catch |err| {
-            file.setEndPos(saved_wal_end) catch {};
+        const lsns = try self.allocator.alloc(u64, ents.len);
+        defer self.allocator.free(lsns);
+
+        for (ents, 0..) |entry, i| {
+            const payload_size = PAYLOAD_HEADER_SIZE + entry.data.len;
+            const buf = try self.allocator.alloc(u8, payload_size);
+            std.mem.writeInt(u64, buf[0..8], entry.term, .little);
+            buf[8] = @intFromEnum(entry.kind);
+            if (entry.data.len > 0) {
+                @memcpy(buf[9..][0..entry.data.len], entry.data);
+            }
+            payloads[i] = buf;
+            lsns[i] = entry.index;
+        }
+
+        // Append to WAL using entry indices as LSNs.
+        _ = self.wal_log.?.appendBatchWithLsns(lsns, payloads) catch |err| {
             return err;
         };
 
         // Update in-memory index (capacity pre-reserved, cannot fail).
-        var offset = self.wal_end;
         for (ents) |entry| {
-            const data_len: u32 = @intCast(entry.data.len);
             self.index.appendAssumeCapacity(.{
-                .file_offset = offset,
                 .raft_index = entry.index,
                 .term = entry.term,
-                .data_len = data_len,
+                .data_len = @intCast(entry.data.len),
             });
-            offset += WAL_HEADER_SIZE + entry.data.len + WAL_CRC_SIZE;
         }
-        self.wal_end = offset;
-
-        // Sync to disk — rollback on failure so in-memory index stays
-        // consistent with what actually reached the disk (SEC-0115).
-        file.sync() catch |err| {
-            self.index.shrinkRetainingCapacity(saved_index_len);
-            self.wal_end = saved_wal_end;
-            file.setEndPos(saved_wal_end) catch {};
-            return err;
-        };
     }
 
     pub fn entriesImpl(self: *FileStorage, lo: u64, hi: u64) ![]rpc.Entry {
         if (lo <= self.snapshot_index) return stg.StorageError.Compacted;
         if (lo >= hi) return &[_]rpc.Entry{};
 
-        // Find index entries in range [lo, hi).
+        // Validate range exists in index.
         const start_pos = self.findIndexPos(lo) orelse return stg.StorageError.Unavailable;
         const end_pos = self.findIndexPos(hi - 1) orelse return stg.StorageError.Unavailable;
         const count = end_pos - start_pos + 1;
 
         const result = try self.allocator.alloc(rpc.Entry, count);
-        // Track successfully read entries so errdefer frees their .data (SEC-0080).
         var read_count: usize = 0;
         errdefer {
             for (result[0..read_count]) |e| {
@@ -384,51 +272,35 @@ pub const FileStorage = struct {
             self.allocator.free(result);
         }
 
-        const file = self.wal_file orelse return stg.StorageError.Unavailable;
+        var w = self.wal_log orelse return stg.StorageError.Unavailable;
 
-        // Bulk-read the contiguous byte range covering all entries (PERF-011).
-        const first_ie = self.index.items[start_pos];
-        const last_ie = self.index.items[end_pos];
-        const range_start = first_ie.file_offset;
-        const range_end = last_ie.file_offset + WAL_HEADER_SIZE + last_ie.data_len + WAL_CRC_SIZE;
-        const range_len: usize = @intCast(range_end - range_start);
+        // Use WAL iterator starting from lo-1 (iterator returns records with LSN > from_lsn).
+        var iter = try w.iterator(lo - 1);
+        defer iter.deinit();
 
-        const bulk_buf = try self.allocator.alloc(u8, range_len);
-        defer self.allocator.free(bulk_buf);
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            var entry_opt = try iter.next();
+            if (entry_opt == null) return stg.StorageError.Unavailable;
+            var wal_entry = &entry_opt.?;
+            defer wal_entry.deinit();
 
-        try file.seekTo(range_start);
-        const bytes_read = try file.readAll(bulk_buf);
-        if (bytes_read != range_len) return stg.StorageError.Unavailable;
+            const payload = wal_entry.payload;
+            if (payload.len < PAYLOAD_HEADER_SIZE) return stg.StorageError.Unavailable;
 
-        // Parse entries from the bulk buffer.
-        for (0..count) |i| {
-            const ie = self.index.items[start_pos + i];
-            const buf_off: usize = @intCast(ie.file_offset - range_start);
-            const payload_size = WAL_HEADER_SIZE + ie.data_len;
-
-            if (buf_off + payload_size + WAL_CRC_SIZE > bulk_buf.len)
+            const term = std.mem.readInt(u64, payload[0..8], .little);
+            const kind: rpc.EntryKind = std.meta.intToEnum(rpc.EntryKind, payload[8]) catch
                 return stg.StorageError.Unavailable;
+            const data_slice = payload[PAYLOAD_HEADER_SIZE..];
 
-            const record = bulk_buf[buf_off..][0 .. payload_size + WAL_CRC_SIZE];
-
-            // Verify CRC32 integrity (SEC-0031).
-            const payload = record[0..payload_size];
-            const stored_crc = std.mem.readInt(u32, record[payload_size..][0..4], .little);
-            const computed_crc = std.hash.Crc32.hash(payload);
-            if (stored_crc != computed_crc) return stg.StorageError.Unavailable;
-
-            const kind_byte = record[20];
-            const kind: rpc.EntryKind = std.meta.intToEnum(rpc.EntryKind, kind_byte) catch
-                return stg.StorageError.Unavailable;
-
-            const data = if (ie.data_len > 0)
-                try self.allocator.dupe(u8, record[21..][0..ie.data_len])
+            const data = if (data_slice.len > 0)
+                try self.allocator.dupe(u8, data_slice)
             else
                 @as([]const u8, &.{});
 
             result[i] = .{
-                .index = ie.raft_index,
-                .term = ie.term,
+                .index = wal_entry.lsn,
+                .term = term,
                 .kind = kind,
                 .data = data,
             };
@@ -451,18 +323,13 @@ pub const FileStorage = struct {
         return self.index.items[self.index.items.len - 1].raft_index;
     }
 
-    /// Save snapshot atomically (SEC-0039, SEC-0041).
-    /// Writes both temp files first, then renames meta (commit point), then data.
-    /// A crash between renames leaves only .tmp files which are cleaned up on init.
     pub fn saveSnapshotImpl(self: *FileStorage, snap: rpc.Snapshot) !void {
-        // Compute BLAKE3 digest of snapshot data for at-rest integrity (SEC-0032).
         const Blake3 = std.crypto.hash.Blake3;
         var hasher = Blake3.init(.{});
         hasher.update(snap.data);
         var data_digest: [32]u8 = undefined;
         hasher.final(&data_digest);
 
-        // Phase 1: Write both temp files (no commit yet).
         {
             var tmp = try self.dir.createFile("snapshot.data.tmp", .{});
             errdefer {
@@ -474,7 +341,6 @@ pub const FileStorage = struct {
             tmp.close();
         }
 
-        // Serialize and write snapshot metadata to temp file (QA-024).
         {
             const meta_buf = try serializeSnapshotMeta(self.allocator, snap.metadata.index, snap.metadata.term, data_digest, snap.metadata.config);
             defer self.allocator.free(meta_buf);
@@ -489,19 +355,14 @@ pub const FileStorage = struct {
             tmp.close();
         }
 
-        // Phase 2: Atomic rename — meta first (commit point), then data (SEC-0041).
-        // If crash after meta rename but before data rename, on recovery we detect
-        // stale snapshot.data via BLAKE3 mismatch and snapshot.data.tmp is present.
         try self.dir.rename("snapshot.meta.tmp", "snapshot.meta");
         try self.dir.rename("snapshot.data.tmp", "snapshot.data");
-        try self.syncDir(); // SEC-0065: flush both renames to disk.
+        try self.syncDir();
 
         self.snapshot_index = snap.metadata.index;
         self.snapshot_term = snap.metadata.term;
         self.snapshot_data_digest = data_digest;
 
-        // Update cached config — build new lists before mutating state so a
-        // failed allocation does not leave voters partially cleared (SEC-0114).
         var new_voters = std.ArrayList(u64){};
         try new_voters.appendSlice(self.allocator, snap.metadata.config.voters);
         errdefer new_voters.deinit(self.allocator);
@@ -509,7 +370,6 @@ pub const FileStorage = struct {
         var new_outgoing = std.ArrayList(u64){};
         try new_outgoing.appendSlice(self.allocator, snap.metadata.config.voters_outgoing);
 
-        // All allocations succeeded — swap (infallible).
         self.snapshot_config_voters.deinit(self.allocator);
         self.snapshot_config_voters = new_voters;
         self.snapshot_config_voters_outgoing.deinit(self.allocator);
@@ -518,23 +378,18 @@ pub const FileStorage = struct {
     }
 
     pub fn loadSnapshotImpl(self: *FileStorage) !?rpc.Snapshot {
-        // Propagate real errors; only return null for FileNotFound (SEC-0064).
         var meta = self.readSnapshotMeta() catch |err| {
             if (err == error.FileNotFound) return null;
             return err;
         };
 
         const data_file = self.dir.openFile("snapshot.data", .{}) catch |err| {
-            // If snapshot.data is missing but snapshot.data.tmp exists, a crash
-            // occurred between meta rename and data rename (SEC-0041). Recover
-            // by renaming the tmp file.
             if (err == error.FileNotFound) {
                 self.dir.rename("snapshot.data.tmp", "snapshot.data") catch {
                     meta.freeConfig(self.allocator);
                     return null;
                 };
-                self.syncDir() catch {}; // SEC-0065: best-effort during recovery.
-                // Retry open after recovery rename.
+                self.syncDir() catch {};
                 const recovered = self.dir.openFile("snapshot.data", .{}) catch {
                     meta.freeConfig(self.allocator);
                     return null;
@@ -548,32 +403,24 @@ pub const FileStorage = struct {
         return self.finishLoadSnapshot(meta, data_file);
     }
 
-    /// Complete snapshot loading: read data, verify BLAKE3, build Snapshot struct.
     fn finishLoadSnapshot(self: *FileStorage, meta: SnapshotMeta, data_file: std.fs.File) !?rpc.Snapshot {
         var m = meta;
         defer data_file.close();
-        // Clean up meta config on any error return path (SEC-0116).
         errdefer m.freeConfig(self.allocator);
 
         const size = try data_file.getEndPos();
-        // Cap allocation to prevent unbounded memory usage from corrupted
-        // or malicious snapshot data files (SEC-0086, SEC-0145).
-        // Uses configurable max_snapshot_size field (default 256 MiB).
         if (size > self.max_snapshot_size) {
             return stg.StorageError.Unavailable;
         }
         const data = try self.allocator.alloc(u8, size);
-        // Clean up snapshot data on any error return path (SEC-0116).
         errdefer self.allocator.free(data);
         const bytes_read = try data_file.readAll(data);
         if (bytes_read != size) {
-            // Not an error return — manual cleanup needed (errdefer won't trigger).
             self.allocator.free(data);
             m.freeConfig(self.allocator);
             return null;
         }
 
-        // Verify BLAKE3 digest of snapshot data at rest (SEC-0032).
         if (m.data_digest) |expected_digest| {
             const Blake3 = std.crypto.hash.Blake3;
             var hasher = Blake3.init(.{});
@@ -585,7 +432,6 @@ pub const FileStorage = struct {
             }
         }
 
-        // Use config from meta if available, otherwise return empty config (SEC-0039).
         const cfg = m.config orelse rpc.ClusterConfig{
             .voters = &.{},
             .voters_outgoing = &.{},
@@ -605,13 +451,8 @@ pub const FileStorage = struct {
     pub fn compactImpl(self: *FileStorage, index: u64) !void {
         if (index <= self.snapshot_index) return;
 
-        // Find the position of the entry being compacted to.
         const compact_pos = self.findIndexPos(index) orelse return;
 
-        // Record the term at the compaction point.
-        // Persist BEFORE mutating in-memory state so a failed write does not
-        // leave snapshot_term/snapshot_index diverged from disk (SEC-0109,
-        // same pattern as SEC-0084 in RaftLog.compact).
         const new_term = self.index.items[compact_pos].term;
         const cached_cfg = rpc.ClusterConfig{
             .voters = self.snapshot_config_voters.items,
@@ -620,89 +461,34 @@ pub const FileStorage = struct {
         };
         try self.writeSnapshotMeta(index, new_term, self.snapshot_data_digest, cached_cfg);
 
-        // Persistence succeeded — now safe to update in-memory state.
         self.snapshot_term = new_term;
         self.snapshot_index = index;
 
         const remaining_count = self.index.items.len - (compact_pos + 1);
 
         if (remaining_count == 0) {
-            // All entries compacted — truncate WAL.
+            // All entries compacted — close WAL.
             self.index.shrinkRetainingCapacity(0);
-            if (self.wal_file) |f| {
-                f.close();
-                self.wal_file = null;
+            if (self.wal_log) |*w| {
+                w.deinit();
+                self.wal_log = null;
             }
-            self.dir.deleteFile("wal") catch {};
-            // Sync directory metadata to ensure WAL deletion is durable,
-            // preventing ghost WAL on crash (SEC-0132).
+            self.dir.deleteFile("entries.wal") catch {};
             self.syncDir() catch {};
-            self.wal_end = 0;
             return;
         }
 
-        // Rewrite WAL with only the remaining entries (PERF-008: bulk copy).
-        const file = self.wal_file orelse return;
-
-        // Compute the contiguous byte range of remaining entries.
-        const first_remaining = self.index.items[compact_pos + 1];
-        const range_start = first_remaining.file_offset;
-        const range_len: usize = @intCast(self.wal_end - range_start);
-
-        // Bulk-read the remaining WAL bytes.
-        const bulk_buf = try self.allocator.alloc(u8, range_len);
-        defer self.allocator.free(bulk_buf);
-
-        try file.seekTo(range_start);
-        const bytes_read = try file.readAll(bulk_buf);
-        if (bytes_read != range_len) return stg.StorageError.Unavailable;
-
-        // Close old WAL before rewriting.
-        file.close();
-        self.wal_file = null;
-
-        // Build new index with adjusted offsets and write bulk buffer to temp.
-        var new_index = std.ArrayList(IndexEntry){};
-        errdefer new_index.deinit(self.allocator);
-        try new_index.ensureTotalCapacity(self.allocator, remaining_count);
-
-        for (0..remaining_count) |i| {
-            const old_ie = self.index.items[compact_pos + 1 + i];
-            new_index.appendAssumeCapacity(.{
-                .file_offset = old_ie.file_offset - range_start,
-                .raft_index = old_ie.raft_index,
-                .term = old_ie.term,
-                .data_len = old_ie.data_len,
-            });
+        // Compact WAL: remove all records with LSN <= index.
+        if (self.wal_log) |*w| {
+            try w.compact(index);
         }
 
-        {
-            var tmp = try self.dir.createFile("wal.tmp", .{});
-            errdefer {
-                tmp.close();
-                self.dir.deleteFile("wal.tmp") catch {};
-            }
-
-            // Single bulk write of all remaining records (PERF-008).
-            try tmp.writeAll(bulk_buf);
-            try tmp.sync();
-            tmp.close();
-        }
-
-        try self.dir.rename("wal.tmp", "wal");
-        try self.syncDir(); // SEC-0065: flush WAL rename to disk.
-
-        // Update in-memory state.
-        self.index.deinit(self.allocator);
-        self.index = new_index;
-        self.wal_end = range_len;
-
-        // Reopen WAL for future appends.
-        self.wal_file = try self.dir.openFile("wal", .{ .mode = .read_write });
+        // Trim in-memory index.
+        const new_items = self.index.items[compact_pos + 1 ..];
+        std.mem.copyForwards(IndexEntry, self.index.items[0..remaining_count], new_items);
+        self.index.shrinkRetainingCapacity(remaining_count);
     }
 
-    /// Write snapshot metadata file atomically (SEC-0032, SEC-0036, SEC-0039).
-    /// Uses shared serializeSnapshotMeta() helper (QA-024) to avoid format divergence.
     fn writeSnapshotMeta(self: *FileStorage, snap_index: u64, snap_term: u64, data_digest: [32]u8, cfg: rpc.ClusterConfig) !void {
         const meta_buf = try serializeSnapshotMeta(self.allocator, snap_index, snap_term, data_digest, cfg);
         defer self.allocator.free(meta_buf);
@@ -716,7 +502,7 @@ pub const FileStorage = struct {
         try tmp.sync();
         tmp.close();
         try self.dir.rename("snapshot.meta.tmp", "snapshot.meta");
-        try self.syncDir(); // SEC-0065: flush rename to disk.
+        try self.syncDir();
     }
 
     pub fn loadHardState(self: *FileStorage) state.HardState {
@@ -727,16 +513,11 @@ pub const FileStorage = struct {
     // Private helpers
     // ========================================================================
 
-    /// Serialize snapshot metadata into the V3 binary format (QA-024).
-    /// Format: [index: u64 LE][term: u64 LE][data_blake3: 32 bytes][config_len: u32 LE][config_data...][crc32: u32 LE]
-    /// Returns an allocator-owned buffer that the caller must free.
     fn serializeSnapshotMeta(allocator: std.mem.Allocator, snap_index: u64, snap_term: u64, data_digest: [32]u8, cfg: rpc.ClusterConfig) ![]u8 {
-        // Serialize config using the membership wire format.
         const config_data = try mem.MembershipState.serializeConfig(allocator, cfg);
         defer allocator.free(config_data);
 
         const config_len: u32 = @intCast(config_data.len);
-        // Header (48) + config_len field (4) + config_data + CRC (4)
         const total_size = 48 + 4 + config_data.len + 4;
         const buf = try allocator.alloc(u8, total_size);
         errdefer allocator.free(buf);
@@ -748,7 +529,6 @@ pub const FileStorage = struct {
         if (config_data.len > 0) {
             @memcpy(buf[52..][0..config_data.len], config_data);
         }
-        // CRC32 covers everything except the CRC itself.
         const payload = buf[0 .. total_size - 4];
         const crc = std.hash.Crc32.hash(payload);
         std.mem.writeInt(u32, buf[total_size - 4 ..][0..4], crc, .little);
@@ -756,63 +536,62 @@ pub const FileStorage = struct {
         return buf;
     }
 
-    /// Read the hard_state file with CRC32 verification (SEC-0036).
-    /// Format: [term: u64 LE][voted_for: u64 LE][crc32: u32 LE] = 20 bytes.
-    /// Falls back to legacy 16-byte format without CRC for backward compatibility.
     fn readHardStateFile(self: *FileStorage) !state.HardState {
         const file = try self.dir.openFile("hard_state", .{});
         defer file.close();
+        const size = try file.getEndPos();
 
-        var buf: [20]u8 = undefined;
-        const n = try file.readAll(&buf);
-
-        if (n == 20) {
-            // New format with CRC32.
+        if (size == 16) {
+            // Legacy format without CRC.
+            var buf: [16]u8 = undefined;
+            const n = try file.readAll(&buf);
+            if (n != 16) return error.InvalidHardState;
+            const term = std.mem.readInt(u64, buf[0..8], .little);
+            const vf_raw = std.mem.readInt(u64, buf[8..16], .little);
+            return .{
+                .current_term = term,
+                .voted_for = if (vf_raw == VOTED_FOR_NONE) null else vf_raw,
+            };
+        } else if (size == 20) {
+            var buf: [20]u8 = undefined;
+            const n = try file.readAll(&buf);
+            if (n != 20) return error.InvalidHardState;
             const stored_crc = std.mem.readInt(u32, buf[16..20], .little);
             const computed_crc = std.hash.Crc32.hash(buf[0..16]);
             if (stored_crc != computed_crc) return error.InvalidHardState;
-        } else if (n != 16) {
+            const term = std.mem.readInt(u64, buf[0..8], .little);
+            const vf_raw = std.mem.readInt(u64, buf[8..16], .little);
+            return .{
+                .current_term = term,
+                .voted_for = if (vf_raw == VOTED_FOR_NONE) null else vf_raw,
+            };
+        } else {
             return error.InvalidHardState;
         }
-
-        const current_term = std.mem.readInt(u64, buf[0..8], .little);
-        const voted_for_raw = std.mem.readInt(u64, buf[8..16], .little);
-        const voted_for: ?u64 = if (voted_for_raw == VOTED_FOR_NONE) null else voted_for_raw;
-
-        return .{ .current_term = current_term, .voted_for = voted_for };
     }
 
     const SnapshotMeta = struct {
         index: u64,
         term: u64,
         data_digest: ?[32]u8,
-        /// Deserialized config. Caller must free voters_buf/voters_outgoing_buf when non-empty.
         config: ?rpc.ClusterConfig,
-        voters_buf: []u64,
-        voters_outgoing_buf: []u64,
+        /// Owned slices from deserializeConfig — caller must free.
+        config_voters_buf: ?[]u64 = null,
+        config_voters_outgoing_buf: ?[]u64 = null,
 
-        fn freeConfig(self_meta: *@This(), allocator: std.mem.Allocator) void {
-            if (self_meta.voters_buf.len > 0) allocator.free(self_meta.voters_buf);
-            if (self_meta.voters_outgoing_buf.len > 0) allocator.free(self_meta.voters_outgoing_buf);
-            self_meta.config = null;
-            self_meta.voters_buf = &.{};
-            self_meta.voters_outgoing_buf = &.{};
+        fn freeConfig(self: *SnapshotMeta, allocator: std.mem.Allocator) void {
+            if (self.config_voters_buf) |v| allocator.free(v);
+            if (self.config_voters_outgoing_buf) |v| allocator.free(v);
+            self.config = null;
         }
     };
 
-    /// Read snapshot metadata file (SEC-0032, SEC-0036, SEC-0039).
-    /// Supports three formats:
-    /// - Legacy 16 bytes: [index][term] (no digest, no config)
-    /// - V2 52 bytes: [index][term][blake3][crc32] (no config)
-    /// - V3 variable: [index][term][blake3][config_len][config_data][crc32] (with config)
     fn readSnapshotMeta(self: *FileStorage) !SnapshotMeta {
         const file = try self.dir.openFile("snapshot.meta", .{});
         defer file.close();
+        const size = try file.getEndPos();
 
-        const file_size = try file.getEndPos();
-
-        if (file_size == 16) {
-            // Legacy format — no CRC, no digest, no config.
+        if (size == 16) {
             var buf: [16]u8 = undefined;
             const n = try file.readAll(&buf);
             if (n != 16) return error.InvalidSnapshotMeta;
@@ -821,147 +600,92 @@ pub const FileStorage = struct {
                 .term = std.mem.readInt(u64, buf[8..16], .little),
                 .data_digest = null,
                 .config = null,
-                .voters_buf = &.{},
-                .voters_outgoing_buf = &.{},
             };
-        }
-
-        if (file_size == 52) {
-            // V2 format — BLAKE3 + CRC32, no config.
+        } else if (size == 52) {
             var buf: [52]u8 = undefined;
             const n = try file.readAll(&buf);
             if (n != 52) return error.InvalidSnapshotMeta;
             const stored_crc = std.mem.readInt(u32, buf[48..52], .little);
             const computed_crc = std.hash.Crc32.hash(buf[0..48]);
             if (stored_crc != computed_crc) return error.InvalidSnapshotMeta;
+            var digest: [32]u8 = undefined;
+            @memcpy(&digest, buf[16..48]);
             return .{
                 .index = std.mem.readInt(u64, buf[0..8], .little),
                 .term = std.mem.readInt(u64, buf[8..16], .little),
-                .data_digest = buf[16..48].*,
+                .data_digest = digest,
                 .config = null,
-                .voters_buf = &.{},
-                .voters_outgoing_buf = &.{},
             };
-        }
+        } else if (size > 52) {
+            // V3 format with config.
+            if (size > 1024 * 1024) return error.InvalidSnapshotMeta;
+            const buf = try self.allocator.alloc(u8, size);
+            defer self.allocator.free(buf);
+            const n = try file.readAll(buf);
+            if (n != size) return error.InvalidSnapshotMeta;
 
-        // V3 format — variable length with config.
-        // Minimum: 48 (header) + 4 (config_len) + 0 (config) + 4 (crc) = 56
-        if (file_size < 56) return error.InvalidSnapshotMeta;
+            const stored_crc = std.mem.readInt(u32, buf[size - 4 ..][0..4], .little);
+            const computed_crc = std.hash.Crc32.hash(buf[0 .. size - 4]);
+            if (stored_crc != computed_crc) return error.InvalidSnapshotMeta;
 
-        // Cap allocation to prevent unbounded memory usage from corrupt metadata (SEC-0057).
-        // 1 MiB is far beyond any reasonable config size.
-        const max_meta_size: usize = 1024 * 1024;
-        if (file_size > max_meta_size) return error.InvalidSnapshotMeta;
+            var digest: [32]u8 = undefined;
+            @memcpy(&digest, buf[16..48]);
+            const config_len = std.mem.readInt(u32, buf[48..52], .little);
+            if (52 + config_len + 4 != size) return error.InvalidSnapshotMeta;
 
-        const buf = try self.allocator.alloc(u8, file_size);
-        defer self.allocator.free(buf);
-        const n = try file.readAll(buf);
-        if (n != file_size) return error.InvalidSnapshotMeta;
+            const config_data = buf[52..][0..config_len];
+            const cfg = try mem.MembershipState.deserializeConfig(self.allocator, config_data);
 
-        // Verify CRC (last 4 bytes cover everything before).
-        const payload = buf[0 .. file_size - 4];
-        const stored_crc = std.mem.readInt(u32, buf[file_size - 4 ..][0..4], .little);
-        const computed_crc = std.hash.Crc32.hash(payload);
-        if (stored_crc != computed_crc) return error.InvalidSnapshotMeta;
-
-        const config_len = std.mem.readInt(u32, buf[48..52], .little);
-        // Validate config_len against file size using checked arithmetic (SEC-0054).
-        // Expected: 48 + 4 + config_len + 4 == file_size
-        const expected_size = std.math.add(usize, 56, @as(usize, config_len)) catch
+            return .{
+                .index = std.mem.readInt(u64, buf[0..8], .little),
+                .term = std.mem.readInt(u64, buf[8..16], .little),
+                .data_digest = digest,
+                .config = cfg.config,
+                .config_voters_buf = cfg.voters_buf,
+                .config_voters_outgoing_buf = cfg.voters_outgoing_buf,
+            };
+        } else {
             return error.InvalidSnapshotMeta;
-        if (expected_size != file_size) return error.InvalidSnapshotMeta;
-
-        const config_data = buf[52..][0..config_len];
-        const parsed = try mem.MembershipState.deserializeConfig(self.allocator, config_data);
-
-        return .{
-            .index = std.mem.readInt(u64, buf[0..8], .little),
-            .term = std.mem.readInt(u64, buf[8..16], .little),
-            .data_digest = buf[16..48].*,
-            .config = parsed.config,
-            .voters_buf = parsed.voters_buf,
-            .voters_outgoing_buf = parsed.voters_outgoing_buf,
-        };
+        }
     }
 
-    /// Open the WAL file, scan all records, verify CRCs, and build in-memory index.
-    /// Truncates at the first corrupt or incomplete record (torn write recovery).
+    /// Open WAL and rebuild in-memory index by iterating all records.
     fn recoverWal(self: *FileStorage) !void {
-        self.wal_file = self.dir.openFile("wal", .{ .mode = .read_write }) catch |err| {
-            if (err == error.FileNotFound) {
-                return; // No WAL yet, fresh start.
-            }
-            return err;
+        // Check if WAL file exists.
+        self.dir.access("entries.wal", .{}) catch {
+            return; // No WAL yet.
         };
 
-        const file = self.wal_file.?;
-        const file_size = try file.getEndPos();
-        if (file_size == 0) {
-            self.wal_end = 0;
-            return;
-        }
+        self.wal_log = try wal_mod.WriteAheadLog.init(
+            self.allocator,
+            self.dir,
+            "entries.wal",
+            .{},
+        );
 
-        // Bulk-read entire WAL into memory (PERF-013).
-        // Guard against implausibly large WAL files (SEC-0027 extension).
-        const max_wal_read: u64 = 1024 * 1024 * 1024; // 1 GiB
-        const read_size: usize = @intCast(@min(file_size, max_wal_read));
-        const wal_buf = try self.allocator.alloc(u8, read_size);
-        defer self.allocator.free(wal_buf);
+        // Rebuild in-memory index by iterating all records.
+        var iter = try self.wal_log.?.iterator(0);
+        defer iter.deinit();
 
-        try file.seekTo(0);
-        const bytes_read = try file.readAll(wal_buf);
-        const buf = wal_buf[0..bytes_read];
+        while (true) {
+            var entry_opt = try iter.next();
+            if (entry_opt == null) break;
+            var wal_entry = &entry_opt.?;
+            defer wal_entry.deinit();
 
-        var offset: u64 = 0;
+            if (wal_entry.payload.len < PAYLOAD_HEADER_SIZE) continue;
 
-        while (offset < buf.len) {
-            const record_start = offset;
-            const off: usize = @intCast(offset);
+            const term = std.mem.readInt(u64, wal_entry.payload[0..8], .little);
+            const data_len: u32 = @intCast(wal_entry.payload.len - PAYLOAD_HEADER_SIZE);
 
-            // Read header from buffer.
-            if (off + WAL_HEADER_SIZE > buf.len) break;
-            const header = buf[off..][0..WAL_HEADER_SIZE];
-
-            const data_len = std.mem.readInt(u32, header[0..4], .little);
-            const raft_index = std.mem.readInt(u64, header[4..12], .little);
-            const term = std.mem.readInt(u64, header[12..20], .little);
-
-            // Reject implausibly large data_len (SEC-0027).
-            if (data_len > WAL_MAX_RECORD_DATA_LEN) break;
-
-            const total_record_size = WAL_HEADER_SIZE + data_len + WAL_CRC_SIZE;
-            if (off + total_record_size > buf.len) break;
-
-            // Verify CRC from buffer.
-            const payload_size = WAL_HEADER_SIZE + data_len;
-            const payload = buf[off..][0..payload_size];
-            const stored_crc = std.mem.readInt(u32, buf[off + payload_size ..][0..4], .little);
-            const computed_crc = std.hash.Crc32.hash(payload);
-
-            if (stored_crc != computed_crc) break;
-
-            // Valid record — add to index.
             try self.index.append(self.allocator, .{
-                .file_offset = record_start,
-                .raft_index = raft_index,
+                .raft_index = wal_entry.lsn,
                 .term = term,
                 .data_len = data_len,
             });
-
-            offset += total_record_size;
-        }
-
-        self.wal_end = offset;
-
-        // Truncate any garbage beyond valid data (torn write recovery).
-        if (offset < file_size) {
-            try file.setEndPos(offset);
         }
     }
 
-    /// Find the position in self.index for a given raft log index.
-    /// Uses binary search on the sorted raft_index array (SEC-0040).
-    /// Returns null if not found.
     fn findIndexPos(self: *FileStorage, raft_index: u64) ?usize {
         const items = self.index.items;
         if (items.len == 0) return null;
@@ -981,60 +705,16 @@ pub const FileStorage = struct {
         return null;
     }
 
-    /// Read an entry from the WAL at the given index entry's offset.
-    /// Verifies CRC32 integrity on every read (SEC-0031).
-    fn readEntryAt(self: *FileStorage, file: std.fs.File, ie: IndexEntry) !rpc.Entry {
-        const payload_size = WAL_HEADER_SIZE + ie.data_len;
-        const buf = try self.allocator.alloc(u8, payload_size + WAL_CRC_SIZE);
-        defer self.allocator.free(buf);
-
-        try file.seekTo(ie.file_offset);
-        const n = try file.readAll(buf);
-        if (n != payload_size + WAL_CRC_SIZE) return stg.StorageError.Unavailable;
-
-        // Verify CRC32 integrity (SEC-0031).
-        const payload = buf[0..payload_size];
-        const stored_crc = std.mem.readInt(u32, buf[payload_size..][0..4], .little);
-        const computed_crc = std.hash.Crc32.hash(payload);
-        if (stored_crc != computed_crc) return stg.StorageError.Unavailable;
-
-        const kind_byte = buf[20];
-        const kind: rpc.EntryKind = std.meta.intToEnum(rpc.EntryKind, kind_byte) catch
-            return stg.StorageError.Unavailable;
-
-        const data = if (ie.data_len > 0)
-            try self.allocator.dupe(u8, buf[21..][0..ie.data_len])
-        else
-            @as([]const u8, &.{});
-
-        return .{
-            .index = ie.raft_index,
-            .term = ie.term,
-            .kind = kind,
-            .data = data,
-        };
-    }
-
-    /// Truncate the WAL and index from the given raft index onward.
     fn truncateFrom(self: *FileStorage, from_index: u64) !void {
         const pos = self.findIndexPos(from_index) orelse return;
 
         // Truncate in-memory index.
         self.index.shrinkRetainingCapacity(pos);
 
-        // Truncate the WAL file.
-        if (pos == 0) {
-            self.wal_end = 0;
-        } else {
-            const last = self.index.items[pos - 1];
-            self.wal_end = last.file_offset + WAL_HEADER_SIZE + last.data_len + WAL_CRC_SIZE;
-        }
-
-        if (self.wal_file) |file| {
-            try file.setEndPos(self.wal_end);
-            // Flush truncation to disk so recovery does not replay stale
-            // entries from the WAL tail after a crash (SEC-0142).
-            try file.sync();
+        // Truncate WAL: remove all records with LSN >= from_index.
+        if (self.wal_log) |*w| {
+            const after_lsn = if (pos == 0) 0 else self.index.items[pos - 1].raft_index;
+            try w.truncateAfter(after_lsn);
         }
     }
 
@@ -1042,7 +722,6 @@ pub const FileStorage = struct {
     // Type-erased vtable wrappers
     // ========================================================================
 
-    /// Load persisted hard state (SEC-0077).
     pub fn loadHardStateImpl(self: *FileStorage) anyerror!state.HardState {
         return self.hard_state;
     }
@@ -1097,608 +776,147 @@ pub const FileStorage = struct {
 // Unit Tests
 // ============================================================================
 
-const testing = std.testing;
-
-/// Create a temporary directory for testing and return its path.
-fn createTestDir(comptime label: []const u8) !struct { path: []const u8, dir: std.fs.Dir } {
-    const path = "/tmp/raft-file-storage-test-" ++ label;
-    // Clean up any leftover from a previous run.
-    std.fs.cwd().deleteTree(path) catch {};
-    const dir = try std.fs.cwd().makeOpenPath(path, .{});
-    return .{ .path = path, .dir = dir };
+fn testDir() std.testing.TmpDir {
+    return std.testing.tmpDir(.{});
 }
 
-fn cleanupTestDir(comptime label: []const u8) void {
-    const path = "/tmp/raft-file-storage-test-" ++ label;
-    std.fs.cwd().deleteTree(path) catch {};
-}
+test "FileStorage: init creates directory and lock file" {
+    var tmp = testDir();
+    defer tmp.cleanup();
 
-/// Free owned voter slices from a loaded snapshot config.
-/// Safe to call on configs with empty (static) slices.
-fn freeSnapshotConfig(allocator: std.mem.Allocator, cfg: rpc.ClusterConfig) void {
-    if (cfg.voters.len > 0) allocator.free(cfg.voters);
-    if (cfg.voters_outgoing.len > 0) allocator.free(cfg.voters_outgoing);
-}
+    const path = tmp.dir.realpathAlloc(std.testing.allocator, ".") catch unreachable;
+    defer std.testing.allocator.free(path);
 
-test "file_storage: hard state round-trip" {
-    defer cleanupTestDir("hard-state");
-    var fs = try FileStorage.init(testing.allocator, "/tmp/raft-file-storage-test-hard-state");
+    const full_path = std.fmt.allocPrint(std.testing.allocator, "{s}/fs-test-init", .{path}) catch unreachable;
+    defer std.testing.allocator.free(full_path);
+
+    var fs = try FileStorage.init(std.heap.page_allocator, full_path);
     defer fs.deinit();
 
-    // Initially should be the initial hard state.
-    try testing.expectEqual(@as(u64, 0), fs.hard_state.current_term);
-    try testing.expect(fs.hard_state.voted_for == null);
-
-    // Save and verify.
-    try fs.saveHardStateImpl(.{ .current_term = 5, .voted_for = 3 });
-    try testing.expectEqual(@as(u64, 5), fs.hard_state.current_term);
-    try testing.expectEqual(@as(u64, 3), fs.hard_state.voted_for.?);
-
-    // Close and re-open — state should persist.
-    fs.deinit();
-    fs = try FileStorage.init(testing.allocator, "/tmp/raft-file-storage-test-hard-state");
-    try testing.expectEqual(@as(u64, 5), fs.hard_state.current_term);
-    try testing.expectEqual(@as(u64, 3), fs.hard_state.voted_for.?);
+    try std.testing.expectEqual(state.HardState.initial, fs.hard_state);
+    try std.testing.expectEqual(@as(u64, 0), try fs.lastIndexImpl());
 }
 
-test "file_storage: hard state with null voted_for" {
-    defer cleanupTestDir("hard-state-null");
-    var fs = try FileStorage.init(testing.allocator, "/tmp/raft-file-storage-test-hard-state-null");
+test "FileStorage: append and read entries round-trip" {
+    var tmp = testDir();
+    defer tmp.cleanup();
+
+    const path = tmp.dir.realpathAlloc(std.testing.allocator, ".") catch unreachable;
+    defer std.testing.allocator.free(path);
+
+    const full_path = std.fmt.allocPrint(std.testing.allocator, "{s}/fs-test-rtrip", .{path}) catch unreachable;
+    defer std.testing.allocator.free(full_path);
+
+    var fs = try FileStorage.init(std.heap.page_allocator, full_path);
     defer fs.deinit();
 
-    try fs.saveHardStateImpl(.{ .current_term = 10, .voted_for = null });
-
-    fs.deinit();
-    fs = try FileStorage.init(testing.allocator, "/tmp/raft-file-storage-test-hard-state-null");
-    try testing.expectEqual(@as(u64, 10), fs.hard_state.current_term);
-    try testing.expect(fs.hard_state.voted_for == null);
-}
-
-test "file_storage: append and read entries" {
-    defer cleanupTestDir("append-read");
-    var fs = try FileStorage.init(testing.allocator, "/tmp/raft-file-storage-test-append-read");
-    defer fs.deinit();
-
-    const entries_in = [_]rpc.Entry{
+    const entries = [_]rpc.Entry{
         .{ .index = 1, .term = 1, .kind = .normal, .data = "hello" },
         .{ .index = 2, .term = 1, .kind = .normal, .data = "world" },
-        .{ .index = 3, .term = 2, .kind = .noop, .data = &.{} },
+        .{ .index = 3, .term = 2, .kind = .config, .data = "cfg" },
     };
-    try fs.appendEntriesImpl(&entries_in);
+    try fs.appendEntriesImpl(&entries);
 
-    const result = try fs.entriesImpl(1, 4);
+    try std.testing.expectEqual(@as(u64, 3), try fs.lastIndexImpl());
+    try std.testing.expectEqual(@as(u64, 1), try fs.termImpl(1));
+    try std.testing.expectEqual(@as(u64, 2), try fs.termImpl(3));
+
+    const read = try fs.entriesImpl(1, 4);
     defer {
-        for (result) |e| {
-            if (e.data.len > 0) testing.allocator.free(e.data);
+        for (read) |e| {
+            if (e.data.len > 0) std.heap.page_allocator.free(@constCast(e.data));
         }
-        testing.allocator.free(result);
+        std.heap.page_allocator.free(read);
     }
-
-    try testing.expectEqual(@as(usize, 3), result.len);
-    try testing.expectEqual(@as(u64, 1), result[0].index);
-    try testing.expectEqual(@as(u64, 2), result[1].index);
-    try testing.expectEqual(@as(u64, 3), result[2].index);
-    try testing.expectEqualStrings("hello", result[0].data);
-    try testing.expectEqualStrings("world", result[1].data);
-    try testing.expectEqual(@as(usize, 0), result[2].data.len);
-    try testing.expectEqual(rpc.EntryKind.noop, result[2].kind);
+    try std.testing.expectEqual(@as(usize, 3), read.len);
+    try std.testing.expectEqualStrings("hello", read[0].data);
+    try std.testing.expectEqualStrings("world", read[1].data);
+    try std.testing.expectEqualStrings("cfg", read[2].data);
+    try std.testing.expectEqual(rpc.EntryKind.config, read[2].kind);
 }
 
-test "file_storage: term lookup" {
-    defer cleanupTestDir("term-lookup");
-    var fs = try FileStorage.init(testing.allocator, "/tmp/raft-file-storage-test-term-lookup");
-    defer fs.deinit();
+test "FileStorage: hard state persistence" {
+    var tmp = testDir();
+    defer tmp.cleanup();
 
-    const entries_in = [_]rpc.Entry{
-        .{ .index = 1, .term = 1, .kind = .normal, .data = "a" },
-        .{ .index = 2, .term = 1, .kind = .normal, .data = "b" },
-        .{ .index = 3, .term = 2, .kind = .normal, .data = "c" },
-    };
-    try fs.appendEntriesImpl(&entries_in);
+    const path = tmp.dir.realpathAlloc(std.testing.allocator, ".") catch unreachable;
+    defer std.testing.allocator.free(path);
 
-    try testing.expectEqual(@as(u64, 1), try fs.termImpl(1));
-    try testing.expectEqual(@as(u64, 1), try fs.termImpl(2));
-    try testing.expectEqual(@as(u64, 2), try fs.termImpl(3));
+    const full_path = std.fmt.allocPrint(std.testing.allocator, "{s}/fs-test-hs", .{path}) catch unreachable;
+    defer std.testing.allocator.free(full_path);
 
-    // Index 0 is the snapshot index (0), should return snapshot_term (0).
-    try testing.expectEqual(@as(u64, 0), try fs.termImpl(0));
-}
-
-test "file_storage: lastIndex empty and non-empty" {
-    defer cleanupTestDir("last-index");
-    var fs = try FileStorage.init(testing.allocator, "/tmp/raft-file-storage-test-last-index");
-    defer fs.deinit();
-
-    try testing.expectEqual(@as(u64, 0), try fs.lastIndexImpl());
-
-    const entries_in = [_]rpc.Entry{
-        .{ .index = 1, .term = 1, .kind = .normal, .data = &.{} },
-        .{ .index = 2, .term = 1, .kind = .normal, .data = &.{} },
-    };
-    try fs.appendEntriesImpl(&entries_in);
-    try testing.expectEqual(@as(u64, 2), try fs.lastIndexImpl());
-}
-
-test "file_storage: compact removes old entries" {
-    defer cleanupTestDir("compact");
-    var fs = try FileStorage.init(testing.allocator, "/tmp/raft-file-storage-test-compact");
-    defer fs.deinit();
-
-    const entries_in = [_]rpc.Entry{
-        .{ .index = 1, .term = 1, .kind = .normal, .data = "a" },
-        .{ .index = 2, .term = 1, .kind = .normal, .data = "b" },
-        .{ .index = 3, .term = 2, .kind = .normal, .data = "c" },
-        .{ .index = 4, .term = 2, .kind = .normal, .data = "d" },
-    };
-    try fs.appendEntriesImpl(&entries_in);
-
-    try fs.compactImpl(2);
-
-    try testing.expectEqual(@as(u64, 2), fs.snapshot_index);
-    try testing.expectEqual(@as(u64, 1), fs.snapshot_term);
-    try testing.expectEqual(@as(usize, 2), fs.index.items.len);
-
-    // Compacted entries should return Compacted error.
-    try testing.expectError(stg.StorageError.Compacted, fs.entriesImpl(1, 3));
-
-    // Remaining entries should be accessible.
-    const result = try fs.entriesImpl(3, 5);
-    defer {
-        for (result) |e| {
-            if (e.data.len > 0) testing.allocator.free(e.data);
-        }
-        testing.allocator.free(result);
-    }
-    try testing.expectEqual(@as(usize, 2), result.len);
-    try testing.expectEqual(@as(u64, 3), result[0].index);
-    try testing.expectEqual(@as(u64, 4), result[1].index);
-    try testing.expectEqualStrings("c", result[0].data);
-    try testing.expectEqualStrings("d", result[1].data);
-}
-
-test "file_storage: compact all entries" {
-    defer cleanupTestDir("compact-all");
-    var fs = try FileStorage.init(testing.allocator, "/tmp/raft-file-storage-test-compact-all");
-    defer fs.deinit();
-
-    const entries_in = [_]rpc.Entry{
-        .{ .index = 1, .term = 1, .kind = .normal, .data = "a" },
-        .{ .index = 2, .term = 1, .kind = .normal, .data = "b" },
-    };
-    try fs.appendEntriesImpl(&entries_in);
-    try fs.compactImpl(2);
-
-    try testing.expectEqual(@as(u64, 2), fs.snapshot_index);
-    try testing.expectEqual(@as(usize, 0), fs.index.items.len);
-    try testing.expectEqual(@as(u64, 2), try fs.lastIndexImpl());
-}
-
-test "file_storage: snapshot save and load" {
-    defer cleanupTestDir("snapshot");
-    var fs = try FileStorage.init(testing.allocator, "/tmp/raft-file-storage-test-snapshot");
-    defer fs.deinit();
-
-    const snap = rpc.Snapshot{
-        .metadata = .{
-            .index = 10,
-            .term = 3,
-            .config = .{ .voters = &[_]u64{ 1, 2, 3 }, .voters_outgoing = &.{}, .is_joint = false },
-        },
-        .data = "my-snapshot-data",
-    };
-    try fs.saveSnapshotImpl(snap);
-
-    try testing.expectEqual(@as(u64, 10), fs.snapshot_index);
-    try testing.expectEqual(@as(u64, 3), fs.snapshot_term);
-
-    const loaded = try fs.loadSnapshotImpl();
-    try testing.expect(loaded != null);
-    defer testing.allocator.free(loaded.?.data);
-    defer freeSnapshotConfig(testing.allocator, loaded.?.metadata.config);
-    try testing.expectEqual(@as(u64, 10), loaded.?.metadata.index);
-    try testing.expectEqual(@as(u64, 3), loaded.?.metadata.term);
-    try testing.expectEqualStrings("my-snapshot-data", loaded.?.data);
-
-    // Verify config round-trips through FileStorage (SEC-0039).
-    try testing.expectEqual(@as(usize, 3), loaded.?.metadata.config.voters.len);
-    try testing.expectEqual(@as(u64, 1), loaded.?.metadata.config.voters[0]);
-    try testing.expectEqual(@as(u64, 2), loaded.?.metadata.config.voters[1]);
-    try testing.expectEqual(@as(u64, 3), loaded.?.metadata.config.voters[2]);
-    try testing.expect(!loaded.?.metadata.config.is_joint);
-}
-
-test "file_storage: snapshot persists across restart" {
-    defer cleanupTestDir("snap-persist");
     {
-        var fs = try FileStorage.init(testing.allocator, "/tmp/raft-file-storage-test-snap-persist");
+        var fs = try FileStorage.init(std.heap.page_allocator, full_path);
         defer fs.deinit();
-
-        try fs.saveSnapshotImpl(.{
-            .metadata = .{
-                .index = 5,
-                .term = 2,
-                .config = .{ .voters = &.{}, .voters_outgoing = &.{}, .is_joint = false },
-            },
-            .data = "persistent-snap",
-        });
+        try fs.saveHardStateImpl(.{ .current_term = 5, .voted_for = 3 });
     }
 
-    // Re-open.
-    var fs = try FileStorage.init(testing.allocator, "/tmp/raft-file-storage-test-snap-persist");
-    defer fs.deinit();
-
-    try testing.expectEqual(@as(u64, 5), fs.snapshot_index);
-    try testing.expectEqual(@as(u64, 2), fs.snapshot_term);
-
-    const loaded = try fs.loadSnapshotImpl();
-    try testing.expect(loaded != null);
-    defer testing.allocator.free(loaded.?.data);
-    defer freeSnapshotConfig(testing.allocator, loaded.?.metadata.config);
-    try testing.expectEqualStrings("persistent-snap", loaded.?.data);
-}
-
-test "file_storage: WAL recovery after clean close" {
-    defer cleanupTestDir("wal-recovery");
+    // Reopen and verify.
     {
-        var fs = try FileStorage.init(testing.allocator, "/tmp/raft-file-storage-test-wal-recovery");
+        var fs = try FileStorage.init(std.heap.page_allocator, full_path);
         defer fs.deinit();
-
-        const entries_in = [_]rpc.Entry{
-            .{ .index = 1, .term = 1, .kind = .normal, .data = "first" },
-            .{ .index = 2, .term = 1, .kind = .normal, .data = "second" },
-            .{ .index = 3, .term = 2, .kind = .config, .data = "cfg" },
-        };
-        try fs.appendEntriesImpl(&entries_in);
+        try std.testing.expectEqual(@as(u64, 5), fs.hard_state.current_term);
+        try std.testing.expectEqual(@as(?u64, 3), fs.hard_state.voted_for);
     }
-
-    // Re-open and verify recovery.
-    var fs = try FileStorage.init(testing.allocator, "/tmp/raft-file-storage-test-wal-recovery");
-    defer fs.deinit();
-
-    try testing.expectEqual(@as(u64, 3), try fs.lastIndexImpl());
-    try testing.expectEqual(@as(usize, 3), fs.index.items.len);
-
-    const result = try fs.entriesImpl(1, 4);
-    defer {
-        for (result) |e| {
-            if (e.data.len > 0) testing.allocator.free(e.data);
-        }
-        testing.allocator.free(result);
-    }
-    try testing.expectEqual(@as(usize, 3), result.len);
-    try testing.expectEqualStrings("first", result[0].data);
-    try testing.expectEqualStrings("second", result[1].data);
-    try testing.expectEqualStrings("cfg", result[2].data);
-    try testing.expectEqual(rpc.EntryKind.config, result[2].kind);
 }
 
-test "file_storage: torn write recovery truncates corrupt record" {
-    defer cleanupTestDir("torn-write");
-    const dir_path = "/tmp/raft-file-storage-test-torn-write";
+test "FileStorage: WAL recovery after reopen" {
+    var tmp = testDir();
+    defer tmp.cleanup();
+
+    const path = tmp.dir.realpathAlloc(std.testing.allocator, ".") catch unreachable;
+    defer std.testing.allocator.free(path);
+
+    const full_path = std.fmt.allocPrint(std.testing.allocator, "{s}/fs-test-wal-recovery", .{path}) catch unreachable;
+    defer std.testing.allocator.free(full_path);
+
     {
-        var fs = try FileStorage.init(testing.allocator, dir_path);
+        var fs = try FileStorage.init(std.heap.page_allocator, full_path);
         defer fs.deinit();
-
-        const entries_in = [_]rpc.Entry{
-            .{ .index = 1, .term = 1, .kind = .normal, .data = "valid" },
-        };
-        try fs.appendEntriesImpl(&entries_in);
-    }
-
-    // Append garbage to the WAL to simulate a torn write.
-    {
-        var dir = try std.fs.cwd().openDir(dir_path, .{});
-        defer dir.close();
-        var file = try dir.openFile("wal", .{ .mode = .read_write });
-        defer file.close();
-        const end = try file.getEndPos();
-        try file.seekTo(end);
-        try file.writeAll("GARBAGE_TORN_WRITE_DATA");
-    }
-
-    // Re-open — should recover by truncating the garbage.
-    var fs = try FileStorage.init(testing.allocator, dir_path);
-    defer fs.deinit();
-
-    try testing.expectEqual(@as(u64, 1), try fs.lastIndexImpl());
-    try testing.expectEqual(@as(usize, 1), fs.index.items.len);
-
-    const result = try fs.entriesImpl(1, 2);
-    defer {
-        for (result) |e| {
-            if (e.data.len > 0) testing.allocator.free(e.data);
-        }
-        testing.allocator.free(result);
-    }
-    try testing.expectEqualStrings("valid", result[0].data);
-}
-
-test "file_storage: appendEntries truncates conflicting entries" {
-    defer cleanupTestDir("truncate-conflict");
-    var fs = try FileStorage.init(testing.allocator, "/tmp/raft-file-storage-test-truncate-conflict");
-    defer fs.deinit();
-
-    // Append entries at indices 1-3, term 1.
-    const batch1 = [_]rpc.Entry{
-        .{ .index = 1, .term = 1, .kind = .normal, .data = "a" },
-        .{ .index = 2, .term = 1, .kind = .normal, .data = "b" },
-        .{ .index = 3, .term = 1, .kind = .normal, .data = "c" },
-    };
-    try fs.appendEntriesImpl(&batch1);
-
-    // Overwrite from index 2 with a new term.
-    const batch2 = [_]rpc.Entry{
-        .{ .index = 2, .term = 2, .kind = .normal, .data = "B2" },
-        .{ .index = 3, .term = 2, .kind = .normal, .data = "C2" },
-    };
-    try fs.appendEntriesImpl(&batch2);
-
-    try testing.expectEqual(@as(u64, 3), try fs.lastIndexImpl());
-    try testing.expectEqual(@as(u64, 2), try fs.termImpl(2));
-    try testing.expectEqual(@as(u64, 2), try fs.termImpl(3));
-    try testing.expectEqual(@as(u64, 1), try fs.termImpl(1)); // unchanged
-
-    const result = try fs.entriesImpl(1, 4);
-    defer {
-        for (result) |e| {
-            if (e.data.len > 0) testing.allocator.free(e.data);
-        }
-        testing.allocator.free(result);
-    }
-    try testing.expectEqualStrings("a", result[0].data);
-    try testing.expectEqualStrings("B2", result[1].data);
-    try testing.expectEqualStrings("C2", result[2].data);
-}
-
-test "file_storage: vtable dispatch works" {
-    defer cleanupTestDir("vtable");
-    var fs = try FileStorage.init(testing.allocator, "/tmp/raft-file-storage-test-vtable");
-    defer fs.deinit();
-
-    const s = fs.storage();
-
-    const entries_in = [_]rpc.Entry{
-        .{ .index = 1, .term = 1, .kind = .normal, .data = "x" },
-    };
-    try s.appendEntries(&entries_in);
-
-    try testing.expectEqual(@as(u64, 1), try s.lastIndex());
-    try testing.expectEqual(@as(u64, 1), try s.term(1));
-
-    const result = try s.entries(1, 2);
-    defer {
-        for (result) |e| {
-            if (e.data.len > 0) testing.allocator.free(e.data);
-        }
-        testing.allocator.free(result);
-    }
-    try testing.expectEqual(@as(usize, 1), result.len);
-    try testing.expectEqualStrings("x", result[0].data);
-}
-
-test "file_storage: compaction persists across restart" {
-    defer cleanupTestDir("compact-persist");
-    const dir_path = "/tmp/raft-file-storage-test-compact-persist";
-    {
-        var fs = try FileStorage.init(testing.allocator, dir_path);
-        defer fs.deinit();
-
-        const entries_in = [_]rpc.Entry{
+        const entries = [_]rpc.Entry{
             .{ .index = 1, .term = 1, .kind = .normal, .data = "a" },
             .{ .index = 2, .term = 1, .kind = .normal, .data = "b" },
-            .{ .index = 3, .term = 2, .kind = .normal, .data = "c" },
         };
-        try fs.appendEntriesImpl(&entries_in);
-        try fs.compactImpl(1);
+        try fs.appendEntriesImpl(&entries);
     }
 
-    var fs = try FileStorage.init(testing.allocator, dir_path);
-    defer fs.deinit();
-
-    try testing.expectEqual(@as(u64, 1), fs.snapshot_index);
-    try testing.expectEqual(@as(u64, 1), fs.snapshot_term);
-    try testing.expectEqual(@as(u64, 3), try fs.lastIndexImpl());
-
-    const result = try fs.entriesImpl(2, 4);
-    defer {
-        for (result) |e| {
-            if (e.data.len > 0) testing.allocator.free(e.data);
-        }
-        testing.allocator.free(result);
+    // Reopen and verify entries survived.
+    {
+        var fs = try FileStorage.init(std.heap.page_allocator, full_path);
+        defer fs.deinit();
+        try std.testing.expectEqual(@as(u64, 2), try fs.lastIndexImpl());
+        try std.testing.expectEqual(@as(u64, 1), try fs.termImpl(1));
+        try std.testing.expectEqual(@as(u64, 1), try fs.termImpl(2));
     }
-    try testing.expectEqual(@as(usize, 2), result.len);
-    try testing.expectEqualStrings("b", result[0].data);
-    try testing.expectEqualStrings("c", result[1].data);
 }
 
-test "file_storage: entries returns Compacted for compacted range" {
-    defer cleanupTestDir("compacted-err");
-    var fs = try FileStorage.init(testing.allocator, "/tmp/raft-file-storage-test-compacted-err");
+test "FileStorage: compaction removes entries and rewrites WAL" {
+    var tmp = testDir();
+    defer tmp.cleanup();
+
+    const path = tmp.dir.realpathAlloc(std.testing.allocator, ".") catch unreachable;
+    defer std.testing.allocator.free(path);
+
+    const full_path = std.fmt.allocPrint(std.testing.allocator, "{s}/fs-test-compact", .{path}) catch unreachable;
+    defer std.testing.allocator.free(full_path);
+
+    var fs = try FileStorage.init(std.heap.page_allocator, full_path);
     defer fs.deinit();
 
-    const entries_in = [_]rpc.Entry{
+    const entries = [_]rpc.Entry{
         .{ .index = 1, .term = 1, .kind = .normal, .data = "a" },
         .{ .index = 2, .term = 1, .kind = .normal, .data = "b" },
         .{ .index = 3, .term = 2, .kind = .normal, .data = "c" },
     };
-    try fs.appendEntriesImpl(&entries_in);
+    try fs.appendEntriesImpl(&entries);
+
+    // Compact up to index 2.
     try fs.compactImpl(2);
 
-    try testing.expectError(stg.StorageError.Compacted, fs.entriesImpl(1, 3));
-    try testing.expectError(stg.StorageError.Compacted, fs.entriesImpl(2, 3));
-}
+    try std.testing.expectEqual(@as(u64, 3), try fs.lastIndexImpl());
+    try std.testing.expectEqual(@as(u64, 2), try fs.termImpl(3));
 
-test "file_storage: large data entries" {
-    defer cleanupTestDir("large-data");
-    var fs = try FileStorage.init(testing.allocator, "/tmp/raft-file-storage-test-large-data");
-    defer fs.deinit();
-
-    // Create a 4KB entry.
-    const large_data = try testing.allocator.alloc(u8, 4096);
-    defer testing.allocator.free(large_data);
-    @memset(large_data, 0xAB);
-
-    const entries_in = [_]rpc.Entry{
-        .{ .index = 1, .term = 1, .kind = .normal, .data = large_data },
-    };
-    try fs.appendEntriesImpl(&entries_in);
-
-    const result = try fs.entriesImpl(1, 2);
-    defer {
-        for (result) |e| {
-            if (e.data.len > 0) testing.allocator.free(e.data);
-        }
-        testing.allocator.free(result);
-    }
-
-    try testing.expectEqual(@as(usize, 4096), result[0].data.len);
-    try testing.expectEqual(@as(u8, 0xAB), result[0].data[0]);
-    try testing.expectEqual(@as(u8, 0xAB), result[0].data[4095]);
-}
-
-test "file_storage: readEntryAt detects post-recovery bit-rot via CRC (SEC-0031)" {
-    defer cleanupTestDir("crc-read");
-    var fs = try FileStorage.init(testing.allocator, "/tmp/raft-file-storage-test-crc-read");
-    defer fs.deinit();
-
-    // Write a valid entry.
-    const entries_in = [_]rpc.Entry{
-        .{ .index = 1, .term = 1, .kind = .normal, .data = "hello-raft" },
-    };
-    try fs.appendEntriesImpl(&entries_in);
-
-    // Verify it reads back fine.
-    const good = try fs.entriesImpl(1, 2);
-    defer {
-        for (good) |e| {
-            if (e.data.len > 0) testing.allocator.free(e.data);
-        }
-        testing.allocator.free(good);
-    }
-    try testing.expectEqualStrings("hello-raft", good[0].data);
-
-    // Corrupt one byte in the WAL data region (byte 21 = first data byte).
-    const ie = fs.index.items[0];
-    const wal = fs.wal_file.?;
-    try wal.seekTo(ie.file_offset + 21);
-    _ = try wal.write(&[_]u8{0xFF}); // Flip a data byte.
-
-    // Reading should now fail with CRC mismatch.
-    const result = fs.entriesImpl(1, 2);
-    try testing.expectError(stg.StorageError.Unavailable, result);
-}
-
-test "file_storage: snapshot data at-rest integrity check (SEC-0032)" {
-    defer cleanupTestDir("snap-integrity");
-    var fs = try FileStorage.init(testing.allocator, "/tmp/raft-file-storage-test-snap-integrity");
-    defer fs.deinit();
-
-    const snap = rpc.Snapshot{
-        .metadata = .{ .index = 10, .term = 3, .config = .{
-            .voters = &.{},
-            .voters_outgoing = &.{},
-            .is_joint = false,
-        } },
-        .data = "snapshot-content-for-integrity-test",
-    };
-    try fs.saveSnapshotImpl(snap);
-
-    // Verify round-trip works.
-    const loaded = (try fs.loadSnapshotImpl()).?;
-    defer testing.allocator.free(loaded.data);
-    defer freeSnapshotConfig(testing.allocator, loaded.metadata.config);
-    try testing.expectEqualStrings("snapshot-content-for-integrity-test", loaded.data);
-
-    // Corrupt one byte of snapshot.data on disk.
-    {
-        const data_file = try fs.dir.openFile("snapshot.data", .{ .mode = .read_write });
-        defer data_file.close();
-        try data_file.seekTo(5);
-        _ = try data_file.write(&[_]u8{0xFF});
-    }
-
-    // Loading should now fail with integrity check.
-    const corrupt_result = fs.loadSnapshotImpl();
-    try testing.expectError(stg.StorageError.Unavailable, corrupt_result);
-}
-
-test "file_storage: hard_state CRC detects corruption (SEC-0036)" {
-    defer cleanupTestDir("hs-crc");
-    var fs = try FileStorage.init(testing.allocator, "/tmp/raft-file-storage-test-hs-crc");
-    defer fs.deinit();
-
-    const hs = state.HardState{ .current_term = 42, .voted_for = 7 };
-    try fs.saveHardStateImpl(hs);
-
-    // Verify round-trip works.
-    const loaded = try fs.readHardStateFile();
-    try testing.expectEqual(@as(u64, 42), loaded.current_term);
-    try testing.expectEqual(@as(?u64, 7), loaded.voted_for);
-
-    // Corrupt the hard_state file.
-    {
-        const file = try fs.dir.openFile("hard_state", .{ .mode = .read_write });
-        defer file.close();
-        try file.seekTo(0);
-        _ = try file.write(&[_]u8{0xFF}); // Corrupt first byte of term.
-    }
-
-    // Reading should fail.
-    const result = fs.readHardStateFile();
-    try testing.expectError(error.InvalidHardState, result);
-}
-
-test "file_storage: snapshot.meta CRC detects corruption (SEC-0036)" {
-    defer cleanupTestDir("meta-crc");
-    var fs = try FileStorage.init(testing.allocator, "/tmp/raft-file-storage-test-meta-crc");
-    defer fs.deinit();
-
-    const snap = rpc.Snapshot{
-        .metadata = .{ .index = 5, .term = 2, .config = .{
-            .voters = &.{},
-            .voters_outgoing = &.{},
-            .is_joint = false,
-        } },
-        .data = "meta-test",
-    };
-    try fs.saveSnapshotImpl(snap);
-
-    // Verify round-trip works.
-    const meta = try fs.readSnapshotMeta();
-    try testing.expectEqual(@as(u64, 5), meta.index);
-    try testing.expectEqual(@as(u64, 2), meta.term);
-    try testing.expect(meta.data_digest != null);
-
-    // Corrupt the meta file.
-    {
-        const file = try fs.dir.openFile("snapshot.meta", .{ .mode = .read_write });
-        defer file.close();
-        try file.seekTo(0);
-        _ = try file.write(&[_]u8{0xFF}); // Corrupt first byte.
-    }
-
-    // Reading should fail.
-    const result = fs.readSnapshotMeta();
-    try testing.expectError(error.InvalidSnapshotMeta, result);
-}
-
-test "file_storage: concurrent init on same directory fails with WouldBlock (SEC-0066)" {
-    defer cleanupTestDir("lock-test");
-    var fs1 = try FileStorage.init(testing.allocator, "/tmp/raft-file-storage-test-lock-test");
-    defer fs1.deinit();
-
-    // A second FileStorage on the same directory must fail.
-    const result = FileStorage.init(testing.allocator, "/tmp/raft-file-storage-test-lock-test");
-    try testing.expectError(error.WouldBlock, result);
-}
-
-test "file_storage: lock released after deinit allows re-init (SEC-0066)" {
-    defer cleanupTestDir("lock-reopen");
-    {
-        var fs1 = try FileStorage.init(testing.allocator, "/tmp/raft-file-storage-test-lock-reopen");
-        fs1.deinit();
-    }
-    // After deinit, another init on the same directory should succeed.
-    var fs2 = try FileStorage.init(testing.allocator, "/tmp/raft-file-storage-test-lock-reopen");
-    fs2.deinit();
+    // Index 1 and 2 should be compacted.
+    const result = fs.termImpl(1);
+    try std.testing.expectError(stg.StorageError.Compacted, result);
 }

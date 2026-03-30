@@ -183,7 +183,7 @@ const TestCluster = struct {
 
         for (snapshot) |pm| {
             const node = self.getNode(pm.to) orelse continue;
-            try node.step(pm.from, pm.msg, null);
+            try node.step(pm.from, pm.msg);
         }
 
         // Drain extra messages from step responses.
@@ -194,7 +194,7 @@ const TestCluster = struct {
 
         for (extra) |pm| {
             const node = self.getNode(pm.to) orelse continue;
-            try node.step(pm.from, pm.msg, null);
+            try node.step(pm.from, pm.msg);
         }
 
         // Phase 3: ready / advance.
@@ -491,7 +491,7 @@ test "file_storage: torn_write_recovery" {
         var dir = try std.fs.cwd().openDir(base, .{});
         defer dir.close();
 
-        var wal_file = try dir.openFile("wal", .{ .mode = .read_write });
+        var wal_file = try dir.openFile("entries.wal", .{ .mode = .read_write });
         defer wal_file.close();
 
         // Seek to end and append garbage.
