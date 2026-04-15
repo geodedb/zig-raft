@@ -2,7 +2,7 @@
 // Copyright (c) 2024-2025 CodePros
 
 const std = @import("std");
-const spice = @import("spice");
+const tp = @import("thread_pool");
 const rpc = @import("rpc.zig");
 const membership = @import("membership.zig");
 
@@ -97,7 +97,7 @@ pub const SnapshotState = struct {
     /// Build InstallSnapshot messages (chunks) for sending to a lagging follower.
     /// Returns a list of Message values, each containing one chunk.
     ///
-    /// When `task` is non-null, spice parallelism may be used for hash
+    /// When `pool` is non-null, thread-pool parallelism may be used for hash
     /// computation and chunk construction on large snapshots. Currently
     /// sequential: Zig's Blake3 API does not expose parallel tree hashing,
     /// and per-chunk work is trivially cheap.
@@ -108,9 +108,9 @@ pub const SnapshotState = struct {
         snapshot: rpc.Snapshot,
         term: u64,
         leader_id: u64,
-        task: ?*spice.Task,
+        pool: ?*tp.ThreadPool,
     ) ![]rpc.Message {
-        _ = task; // Reserved for future parallel hashing when Blake3 tree API available.
+        _ = pool; // Reserved for future parallel hashing when Blake3 tree API available.
         const data = snapshot.data;
 
         // Compute BLAKE3 digest of the full snapshot data.

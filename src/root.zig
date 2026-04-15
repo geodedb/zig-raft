@@ -8,7 +8,7 @@
 //! joint consensus membership changes, snapshotting, and chunked snapshot transfer.
 
 const std = @import("std");
-pub const spice = @import("spice");
+pub const thread_pool = @import("thread_pool");
 
 // All modules
 pub const state = @import("state.zig");

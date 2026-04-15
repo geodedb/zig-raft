@@ -27,12 +27,12 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Spice dependency (fork/join parallelism)
-    const spice_dep = b.dependency("spice", .{
+    // Thread-pool dependency
+    const tp_dep = b.dependency("thread_pool", .{
         .target = target,
         .optimize = optimize,
     });
-    const spice_module = spice_dep.module("spice");
+    const tp_module = tp_dep.module("thread_pool");
 
     // WAL dependency (write-ahead log)
     const wal_dep = b.dependency("wal", .{
@@ -43,7 +43,7 @@ pub fn build(b: *std.Build) void {
 
     // Common import sets used across test modules.
     const raft_lib_imports: []const Import = &.{
-        .{ .name = "spice", .module = spice_module },
+        .{ .name = "thread_pool", .module = tp_module },
         .{ .name = "wal", .module = wal_module },
     };
 
@@ -137,9 +137,9 @@ pub fn build(b: *std.Build) void {
     // Benchmarks (PERF-016)
     // PERF-027: Create a separate ReleaseFast raft module for benchmarks so
     // the raft dependency is compiled with ReleaseFast, not the CLI optimize
-    // option (which defaults to Debug). This includes a ReleaseFast spice
+    // option (which defaults to Debug). This includes a ReleaseFast thread-pool
     // dependency so the entire transitive closure is optimized.
-    const bench_spice_dep = b.dependency("spice", .{
+    const bench_tp_dep = b.dependency("thread_pool", .{
         .target = target,
         .optimize = .ReleaseFast,
     });
@@ -152,7 +152,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = .ReleaseFast,
         .imports = &.{
-            .{ .name = "spice", .module = bench_spice_dep.module("spice") },
+            .{ .name = "thread_pool", .module = bench_tp_dep.module("thread_pool") },
             .{ .name = "wal", .module = bench_wal_dep.module("wal") },
         },
     });

@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2024-2025 CodePros
 //
-// Scenario tests for spice parallel code paths (PAR-003).
-// These tests exercise the fork/join logic in sendHeartbeats() by passing
-// a real spice.Task through tick().
+// Scenario tests for thread-pool parallel code paths (PAR-003).
+// These tests exercise the submitBatch/WaitGroup logic in sendHeartbeats()
+// by passing a real *tp.ThreadPool through tick().
 
 const std = @import("std");
 const raft = @import("raft");
 const harness = @import("harness");
 const checker = @import("checker");
-const spice = raft.spice;
+const tp = raft.thread_pool;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -28,15 +28,11 @@ fn electLeader(net: *harness.Network) !u64 {
     return error.NoLeaderElected;
 }
 
-/// Tick a single node using a spice ThreadPool, exercising the parallel path.
+/// Tick a single node using a thread-pool ThreadPool, exercising the parallel path.
 /// Returns true on error.
-fn parallelTickNode(pool: *spice.ThreadPool, node: *raft.RaftNode) bool {
-    return pool.call(bool, struct {
-        fn run(task: *spice.Task, n: *raft.RaftNode) bool {
-            n.tick(task) catch return true;
-            return false;
-        }
-    }.run, node);
+fn parallelTickNode(pool: *tp.ThreadPool, node: *raft.RaftNode) bool {
+    node.tick(pool) catch return true;
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -50,14 +46,13 @@ test "parallel heartbeats: leader sends correct AppendEntries via fork/join" {
     const leader_id = try electLeader(&net);
     const leader = net.nodes.get(leader_id).?;
 
-    var pool = spice.ThreadPool.init(std.heap.page_allocator);
-    pool.start(.{});
+    var pool = tp.ThreadPool.init(std.heap.page_allocator, .{}) catch @panic("thread-pool init failed");
     defer pool.deinit();
 
     // Drain election messages.
     net.queue.list.clearRetainingCapacity();
 
-    // Parallel tick exercises sendHeartbeats() fork/join path.
+    // Parallel tick exercises sendHeartbeats() submitBatch/WaitGroup path.
     try std.testing.expect(!parallelTickNode(&pool, leader));
 
     // Verify heartbeat messages were queued for both peers.
@@ -93,8 +88,7 @@ test "parallel heartbeats: messages match sequential path output" {
     try leader_seq.tick(null);
 
     // Parallel tick.
-    var pool = spice.ThreadPool.init(std.heap.page_allocator);
-    pool.start(.{});
+    var pool = tp.ThreadPool.init(std.heap.page_allocator, .{}) catch @panic("thread-pool init failed");
     defer pool.deinit();
 
     try std.testing.expect(!parallelTickNode(&pool, leader_par));
@@ -144,8 +138,7 @@ test "parallel tick: full cluster round-trip with parallel heartbeats" {
     try leader.propose("entry-1");
     try leader.propose("entry-2");
 
-    var pool = spice.ThreadPool.init(std.heap.page_allocator);
-    pool.start(.{});
+    var pool = tp.ThreadPool.init(std.heap.page_allocator, .{}) catch @panic("thread-pool init failed");
     defer pool.deinit();
 
     // Run 5 tick-deliver-advance rounds with parallel leader ticks.

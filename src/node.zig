@@ -2,7 +2,7 @@
 // Copyright (c) 2024-2025 CodePros
 
 const std = @import("std");
-const spice = @import("spice");
+const tp = @import("thread_pool");
 const st = @import("state.zig");
 const rpc = @import("rpc.zig");
 const raft_log = @import("log.zig");
@@ -106,12 +106,12 @@ pub const RaftNode = struct {
     /// The allocator used for all internal allocations.
     ///
     /// **Thread-safety requirement (SEC-0067):** When passing a non-null
-    /// `spice.Task` to `tick()` or `step()`, parallel worker threads will
+    /// `*tp.ThreadPool` to `tick()` or `step()`, parallel worker threads will
     /// allocate from this allocator concurrently (e.g. in `parallelBuildAE`).
     /// In that case, the
     /// allocator **must** be thread-safe. For example, use
     /// `std.heap.GeneralPurposeAllocator(.{ .thread_safe = true })` or
-    /// `std.heap.page_allocator`. If `task` is always null (sequential mode),
+    /// `std.heap.page_allocator`. If `pool` is always null (sequential mode),
     /// any allocator is safe.
     allocator: std.mem.Allocator,
     /// Stack buffer for dynamicPeers() — avoids heap allocation for clusters
@@ -126,8 +126,8 @@ pub const RaftNode = struct {
 
     /// Initialize a new RaftNode.
     ///
-    /// The `allocator` must be thread-safe if spice parallelism will be used
-    /// (i.e. non-null `task` parameters passed to `tick()`/`step()`). See
+    /// The `allocator` must be thread-safe if thread-pool parallelism will be
+    /// used (i.e. non-null `pool` parameters passed to `tick()`/`step()`). See
     /// the `allocator` field doc comment for details (SEC-0067).
     pub fn init(allocator: std.mem.Allocator, config: Config, storage_impl: stg.Storage) !RaftNode {
         try config.validate();
@@ -405,15 +405,15 @@ pub const RaftNode = struct {
     }
 
     /// Advance internal timers and trigger leader/follower actions.
-    /// When `task` is non-null, spice parallelism is used for building
+    /// When `pool` is non-null, thread-pool parallelism is used for building
     /// AppendEntries payloads in parallel during leader heartbeats.
-    pub fn tick(self: *RaftNode, task: ?*spice.Task) !void {
+    pub fn tick(self: *RaftNode, pool: ?*tp.ThreadPool) !void {
         self.perf_stats.ticks += 1;
         if (self.role == .leader) {
             self.election_state.tickHeartbeat();
             if (self.election_state.heartbeatTimeoutElapsed()) {
                 self.election_state.resetHeartbeatElapsed();
-                try self.sendHeartbeats(task);
+                try self.sendHeartbeats(pool);
             }
 
             // Check if joint config committed and needs phase-2.
@@ -1099,9 +1099,9 @@ pub const RaftNode = struct {
     }
 
     /// Build and send AppendEntries heartbeats to all peers.
-    /// When `task` is non-null, AppendEntries payloads for each peer
-    /// are constructed in parallel using spice fork/join.
-    fn sendHeartbeats(self: *RaftNode, task: ?*spice.Task) !void {
+    /// When `pool` is non-null, AppendEntries payloads for each peer
+    /// are constructed in parallel using thread-pool submitBatch/WaitGroup.
+    fn sendHeartbeats(self: *RaftNode, pool: ?*tp.ThreadPool) !void {
         var rs = &(self.replication_state orelse return);
         self.perf_stats.heartbeats_sent += 1;
 
@@ -1109,28 +1109,35 @@ pub const RaftNode = struct {
         const peers = try self.dynamicPeers();
         defer if (peers.len > 16) self.allocator.free(peers);
 
-        if (task) |t| {
-            // Parallel path: fork one Future per peer, then join and send.
-            // Results are written into a shared array because rpc.Message
-            // exceeds spice's 32-byte Future return slot.
-            // Use stack buffers for typical cluster sizes (PERF-012).
-            var futures_stack: [MAX_STACK_PEERS]BuildAEFuture = undefined;
+        if (pool) |p| {
+            // Parallel path: submit one task per peer, wait for all, then send.
+            // Results are written into a shared array (PERF-012).
+            // Stack-allocated; safe because wg.wait() blocks until all tasks complete.
+            var inputs_stack: [MAX_STACK_PEERS]BuildAEInput = undefined;
             var results_stack: [MAX_STACK_PEERS]?rpc.Message = undefined;
-            const futures = if (peers.len <= 16)
-                futures_stack[0..peers.len]
+            var batch_stack: [MAX_STACK_PEERS]tp.BatchTask = undefined;
+
+            const inputs = if (peers.len <= 16)
+                inputs_stack[0..peers.len]
             else
-                try self.allocator.alloc(BuildAEFuture, peers.len);
-            defer if (peers.len > 16) self.allocator.free(futures);
+                try self.allocator.alloc(BuildAEInput, peers.len);
+            defer if (peers.len > 16) self.allocator.free(inputs);
+
             const results = if (peers.len <= 16)
                 results_stack[0..peers.len]
             else
                 try self.allocator.alloc(?rpc.Message, peers.len);
             defer if (peers.len > 16) self.allocator.free(results);
 
+            const batch = if (peers.len <= 16)
+                batch_stack[0..peers.len]
+            else
+                try self.allocator.alloc(tp.BatchTask, peers.len);
+            defer if (peers.len > 16) self.allocator.free(batch);
+
             for (peers, 0..) |peer, i| {
                 results[i] = null;
-                futures[i] = BuildAEFuture.init();
-                futures[i].fork(t, parallelBuildAE, .{
+                inputs[i] = .{
                     .rs = rs,
                     .peer = peer,
                     .log = &self.log,
@@ -1140,32 +1147,28 @@ pub const RaftNode = struct {
                     .max_entries_per_msg = self.config.max_entries_per_msg,
                     .max_bytes_per_msg = self.config.max_bytes_per_msg,
                     .out = &results[i],
-                });
+                };
+                batch[i] = .{ .task_fn = &parallelBuildAE, .ctx = @ptrCast(&inputs[i]) };
             }
 
-            // Join in reverse order (LIFO) — spice's work queue is a stack,
-            // so queued jobs must be popped from the tail first.
-            {
-                var j: usize = peers.len;
-                while (j > 0) {
-                    j -= 1;
-                    const did_run = futures[j].join(t);
-                    if (did_run == null) {
-                        // Future wasn't picked up; build sequentially.
-                        results[j] = rs.buildAppendEntries(
-                            peers[j],
-                            &self.log,
-                            self.current_term,
-                            self.id,
-                            self.log.committed,
-                            self.config.max_entries_per_msg,
-                            self.config.max_bytes_per_msg,
-                        ) catch null;
-                    }
+            var wg = p.waitGroup();
+            _ = p.submitBatch(batch, .{ .wait_group = &wg }) catch {
+                // Queue full: fall back to sequential build.
+                for (peers, 0..) |peer, i| {
+                    results[i] = rs.buildAppendEntries(
+                        peer,
+                        &self.log,
+                        self.current_term,
+                        self.id,
+                        self.log.committed,
+                        self.config.max_entries_per_msg,
+                        self.config.max_bytes_per_msg,
+                    ) catch null;
                 }
-            }
+            };
+            wg.wait();
 
-            // Send in forward order (message ordering is independent of join order).
+            // Send results.
             for (peers, 0..) |peer, i| {
                 if (results[i]) |m| {
                     self.sendMsg(peer, m);
@@ -1200,8 +1203,8 @@ pub const RaftNode = struct {
     }
 
     /// Input for parallel AppendEntries construction.
-    /// Results are written to `out` rather than returned through the Future
-    /// (rpc.Message is too large for spice's 32-byte return slot).
+    /// Results are written to `out` rather than returned through the task
+    /// (rpc.Message is too large to return by value safely across threads).
     const BuildAEInput = struct {
         rs: *repl.ReplicationState,
         peer: u64,
@@ -1214,9 +1217,8 @@ pub const RaftNode = struct {
         out: *?rpc.Message,
     };
 
-    const BuildAEFuture = spice.Future(BuildAEInput, void);
-
-    fn parallelBuildAE(_: *spice.Task, input: BuildAEInput) void {
+    fn parallelBuildAE(ctx_ptr: *anyopaque, _: *tp.TaskContext) void {
+        const input: *BuildAEInput = @ptrCast(@alignCast(ctx_ptr));
         input.out.* = input.rs.buildAppendEntries(
             input.peer,
             input.log,

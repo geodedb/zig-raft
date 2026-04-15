@@ -306,7 +306,7 @@ test "bench: leader-tick" {
 
 test "bench: leader-tick-parallel" {
     const allocator = std.heap.page_allocator;
-    const spice = raft.spice;
+    const tp = raft.thread_pool;
 
     var mem_store = raft.InMemoryStorage.init(allocator);
     defer mem_store.deinit();
@@ -340,18 +340,12 @@ test "bench: leader-tick-parallel" {
     const ns_seq = elapsed_seq / BENCH_ITERS;
 
     // Parallel path.
-    var pool = spice.ThreadPool.init(allocator);
-    pool.start(.{});
+    var pool = tp.ThreadPool.init(allocator, .{}) catch @panic("thread-pool init failed");
     defer pool.deinit();
 
     var timer_par = std.time.Timer.start() catch @panic("timer");
     for (0..BENCH_ITERS) |_| {
-        _ = pool.call(bool, struct {
-            fn run(task: *spice.Task, n: *raft.RaftNode) bool {
-                n.tick(task) catch return true;
-                return false;
-            }
-        }.run, &node);
+        node.tick(&pool) catch {};
         std.mem.doNotOptimizeAway(&node);
     }
     const elapsed_par = timer_par.read();
