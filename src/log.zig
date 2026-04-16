@@ -29,7 +29,7 @@ pub const RaftLog = struct {
 
         return .{
             .storage = storage,
-            .unstable_entries = .{},
+            .unstable_entries = .empty,
             .committed = snap_idx,
             .applied = snap_idx,
             .snapshot_index = snap_idx,

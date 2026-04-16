@@ -26,8 +26,8 @@ pub const ReadyState = struct {
         return .{
             .prev_hard_state = initial_hs,
             .has_pending_ready = false,
-            .pending_messages = .{},
-            .pending_committed_entries = .{},
+            .pending_messages = .empty,
+            .pending_committed_entries = .empty,
             .pending_snapshot = null,
             .pending_should_snapshot = false,
             .allocator = allocator,

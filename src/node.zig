@@ -166,7 +166,7 @@ pub const RaftNode = struct {
                 }
             } else {
                 // Snapshot has no config — fall back to static peers.
-                var all_voters = std.ArrayList(u64){};
+                var all_voters = std.ArrayList(u64).empty;
                 defer all_voters.deinit(allocator);
                 try all_voters.append(allocator, config.id);
                 try all_voters.appendSlice(allocator, config.peers);
@@ -174,7 +174,7 @@ pub const RaftNode = struct {
             }
         } else {
             // No snapshot — use static config.peers.
-            var all_voters = std.ArrayList(u64){};
+            var all_voters = std.ArrayList(u64).empty;
             defer all_voters.deinit(allocator);
             try all_voters.append(allocator, config.id);
             try all_voters.appendSlice(allocator, config.peers);
@@ -655,7 +655,7 @@ pub const RaftNode = struct {
 
         // Remove peers that are no longer in the voter set.
         // Build a list of keys to remove (can't modify during iteration).
-        var to_remove = std.ArrayList(u64){};
+        var to_remove = std.ArrayList(u64).empty;
         defer to_remove.deinit(self.allocator);
         var it = rs.peers.iterator();
         while (it.next()) |kv| {

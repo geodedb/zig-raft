@@ -36,11 +36,11 @@ pub const MembershipState = struct {
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, initial_voters: []const u64) !MembershipState {
-        var voters = std.ArrayList(u64){};
+        var voters = std.ArrayList(u64).empty;
         try voters.appendSlice(allocator, initial_voters);
         return .{
             .voters = voters,
-            .voters_outgoing = .{},
+            .voters_outgoing = .empty,
             .is_joint = false,
             .pending_config_change = false,
             .prepared_voters = null,
@@ -80,7 +80,7 @@ pub const MembershipState = struct {
         errdefer self.allocator.free(data);
 
         // Pre-allocate new voter list so commitProposeChange is infallible.
-        var new_voter_list = std.ArrayList(u64){};
+        var new_voter_list = std.ArrayList(u64).empty;
         try new_voter_list.appendSlice(self.allocator, new_voters);
         errdefer new_voter_list.deinit(self.allocator);
 
@@ -178,11 +178,11 @@ pub const MembershipState = struct {
         }
 
         // Perform all fallible copies before mutating state.
-        var new_voters = std.ArrayList(u64){};
+        var new_voters = std.ArrayList(u64).empty;
         try new_voters.appendSlice(self.allocator, parsed.voters);
         errdefer new_voters.deinit(self.allocator);
 
-        var new_outgoing = std.ArrayList(u64){};
+        var new_outgoing = std.ArrayList(u64).empty;
         if (parsed.is_joint) {
             try new_outgoing.appendSlice(self.allocator, parsed.voters_outgoing);
         }
@@ -224,11 +224,11 @@ pub const MembershipState = struct {
         }
 
         // Perform all fallible copies before mutating state.
-        var new_voters = std.ArrayList(u64){};
+        var new_voters = std.ArrayList(u64).empty;
         try new_voters.appendSlice(self.allocator, cfg.voters);
         errdefer new_voters.deinit(self.allocator);
 
-        var new_outgoing = std.ArrayList(u64){};
+        var new_outgoing = std.ArrayList(u64).empty;
         if (cfg.is_joint) {
             try new_outgoing.appendSlice(self.allocator, cfg.voters_outgoing);
         }

@@ -181,16 +181,16 @@ pub const SnapshotState = struct {
             try validateSnapshotConfig(msg.config);
 
             // Copy config voter IDs into owned storage (SEC-0030).
-            var config_voters = std.ArrayList(u64){};
+            var config_voters = std.ArrayList(u64).empty;
             errdefer config_voters.deinit(self.allocator);
             try config_voters.appendSlice(self.allocator, msg.config.voters);
 
-            var config_voters_outgoing = std.ArrayList(u64){};
+            var config_voters_outgoing = std.ArrayList(u64).empty;
             errdefer config_voters_outgoing.deinit(self.allocator);
             try config_voters_outgoing.appendSlice(self.allocator, msg.config.voters_outgoing);
 
             self.pending_snapshot = .{
-                .data = .{},
+                .data = .empty,
                 .last_included_index = msg.last_included_index,
                 .last_included_term = msg.last_included_term,
                 .expected_offset = 0,

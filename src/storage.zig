@@ -70,7 +70,7 @@ pub fn freeSnapshot(allocator: std.mem.Allocator, snap: rpc.Snapshot) void {
 }
 
 pub const InMemoryStorage = struct {
-    log: std.ArrayList(rpc.Entry) = .{},
+    log: std.ArrayList(rpc.Entry) = .empty,
     hard_state: state.HardState = state.HardState.initial,
     snapshot_data: ?rpc.Snapshot = null,
     snapshot_index: u64 = 0,

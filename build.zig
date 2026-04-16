@@ -19,6 +19,7 @@ fn addRaftModule(
         .root_source_file = root_source_file,
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
         .imports = imports,
     });
 }
@@ -52,6 +53,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
         .imports = raft_lib_imports,
     });
 
@@ -151,6 +153,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = .ReleaseFast,
+        .link_libc = true,
         .imports = &.{
             .{ .name = "thread_pool", .module = bench_tp_dep.module("thread_pool") },
             .{ .name = "wal", .module = bench_wal_dep.module("wal") },

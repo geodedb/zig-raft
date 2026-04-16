@@ -45,8 +45,8 @@ const VOTED_FOR_NONE: u64 = std.math.maxInt(u64);
 const PAYLOAD_HEADER_SIZE: usize = 8 + 1;
 
 pub const FileStorage = struct {
-    dir: std.fs.Dir,
-    lock_file: ?std.fs.File,
+    dir: std.Io.Dir,
+    lock_file: ?std.Io.File,
     wal_log: ?wal_mod.WriteAheadLog,
     index: std.ArrayList(IndexEntry),
     snapshot_index: u64,
@@ -70,32 +70,32 @@ pub const FileStorage = struct {
 
     /// Flush directory metadata to disk after a rename (SEC-0065).
     fn syncDir(self: *FileStorage) !void {
-        const sync_fd = try std.posix.openat(self.dir.fd, ".", .{ .DIRECTORY = true }, 0);
-        defer std.posix.close(sync_fd);
-        try std.posix.fsync(sync_fd);
+        const sync_fd = try std.posix.openat(self.dir.handle, ".", .{ .DIRECTORY = true }, 0);
+        defer _ = std.c.close(sync_fd);
+        if (std.c.fdatasync(sync_fd) != 0) return error.InputOutput;
     }
 
     pub fn init(allocator: std.mem.Allocator, dir_path: []const u8) !FileStorage {
-        var dir = try std.fs.cwd().makeOpenPath(dir_path, .{});
-        errdefer dir.close();
+        var dir = try std.Io.Dir.cwd().createDirPathOpen(std.Io.Threaded.global_single_threaded.io(), dir_path, .{});
+        errdefer dir.close(std.Io.Threaded.global_single_threaded.io());
 
-        const lock_file = try dir.createFile(".lock", .{
+        const lock_file = try dir.createFile(std.Io.Threaded.global_single_threaded.io(), ".lock", .{
             .lock = .exclusive,
             .lock_nonblocking = true,
             .truncate = false,
         });
-        errdefer lock_file.close();
+        errdefer lock_file.close(std.Io.Threaded.global_single_threaded.io());
 
         var fs = FileStorage{
             .dir = dir,
             .lock_file = lock_file,
             .wal_log = null,
-            .index = .{},
+            .index = .empty,
             .snapshot_index = 0,
             .snapshot_term = 0,
             .snapshot_data_digest = .{0} ** 32,
-            .snapshot_config_voters = .{},
-            .snapshot_config_voters_outgoing = .{},
+            .snapshot_config_voters = .empty,
+            .snapshot_config_voters_outgoing = .empty,
             .snapshot_config_is_joint = false,
             .hard_state = state.HardState.initial,
             .allocator = allocator,
@@ -107,7 +107,7 @@ pub const FileStorage = struct {
             if (fs.wal_log) |*w| w.deinit();
         }
 
-        dir.deleteFile("hard_state.tmp") catch {};
+        dir.deleteFile(std.Io.Threaded.global_single_threaded.io(), "hard_state.tmp") catch {};
 
         // Recover hard state.
         fs.hard_state = fs.readHardStateFile() catch state.HardState.initial;
@@ -129,8 +129,8 @@ pub const FileStorage = struct {
             }
         }
 
-        dir.deleteFile("snapshot.data.tmp") catch {};
-        dir.deleteFile("snapshot.meta.tmp") catch {};
+        dir.deleteFile(std.Io.Threaded.global_single_threaded.io(), "snapshot.data.tmp") catch {};
+        dir.deleteFile(std.Io.Threaded.global_single_threaded.io(), "snapshot.meta.tmp") catch {};
 
         // Open WAL and rebuild in-memory index.
         try fs.recoverWal();
@@ -143,8 +143,8 @@ pub const FileStorage = struct {
         self.index.deinit(self.allocator);
         self.snapshot_config_voters.deinit(self.allocator);
         self.snapshot_config_voters_outgoing.deinit(self.allocator);
-        if (self.lock_file) |lf| lf.close();
-        self.dir.close();
+        if (self.lock_file) |lf| lf.close(std.Io.Threaded.global_single_threaded.io());
+        self.dir.close(std.Io.Threaded.global_single_threaded.io());
     }
 
     pub fn storage(self: *FileStorage) stg.Storage {
@@ -177,16 +177,16 @@ pub const FileStorage = struct {
         const crc = std.hash.Crc32.hash(buf[0..16]);
         std.mem.writeInt(u32, buf[16..20], crc, .little);
 
-        var tmp = try self.dir.createFile("hard_state.tmp", .{});
+        var tmp = try self.dir.createFile(std.Io.Threaded.global_single_threaded.io(), "hard_state.tmp", .{});
         errdefer {
-            tmp.close();
-            self.dir.deleteFile("hard_state.tmp") catch {};
+            tmp.close(std.Io.Threaded.global_single_threaded.io());
+            self.dir.deleteFile(std.Io.Threaded.global_single_threaded.io(), "hard_state.tmp") catch {};
         }
-        try tmp.writeAll(&buf);
-        try tmp.sync();
-        tmp.close();
+        try tmp.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), &buf);
+        try tmp.sync(std.Io.Threaded.global_single_threaded.io());
+        tmp.close(std.Io.Threaded.global_single_threaded.io());
 
-        try self.dir.rename("hard_state.tmp", "hard_state");
+        try self.dir.rename("hard_state.tmp", self.dir, "hard_state", std.Io.Threaded.global_single_threaded.io());
         try self.syncDir();
         self.hard_state = hs;
     }
@@ -289,7 +289,7 @@ pub const FileStorage = struct {
             if (payload.len < PAYLOAD_HEADER_SIZE) return stg.StorageError.Unavailable;
 
             const term = std.mem.readInt(u64, payload[0..8], .little);
-            const kind: rpc.EntryKind = std.meta.intToEnum(rpc.EntryKind, payload[8]) catch
+            const kind: rpc.EntryKind = std.enums.fromInt(rpc.EntryKind, payload[8]) orelse
                 return stg.StorageError.Unavailable;
             const data_slice = payload[PAYLOAD_HEADER_SIZE..];
 
@@ -331,32 +331,32 @@ pub const FileStorage = struct {
         hasher.final(&data_digest);
 
         {
-            var tmp = try self.dir.createFile("snapshot.data.tmp", .{});
+            var tmp = try self.dir.createFile(std.Io.Threaded.global_single_threaded.io(), "snapshot.data.tmp", .{});
             errdefer {
-                tmp.close();
-                self.dir.deleteFile("snapshot.data.tmp") catch {};
+                tmp.close(std.Io.Threaded.global_single_threaded.io());
+                self.dir.deleteFile(std.Io.Threaded.global_single_threaded.io(), "snapshot.data.tmp") catch {};
             }
-            try tmp.writeAll(snap.data);
-            try tmp.sync();
-            tmp.close();
+            try tmp.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), snap.data);
+            try tmp.sync(std.Io.Threaded.global_single_threaded.io());
+            tmp.close(std.Io.Threaded.global_single_threaded.io());
         }
 
         {
             const meta_buf = try serializeSnapshotMeta(self.allocator, snap.metadata.index, snap.metadata.term, data_digest, snap.metadata.config);
             defer self.allocator.free(meta_buf);
 
-            var tmp = try self.dir.createFile("snapshot.meta.tmp", .{});
+            var tmp = try self.dir.createFile(std.Io.Threaded.global_single_threaded.io(), "snapshot.meta.tmp", .{});
             errdefer {
-                tmp.close();
-                self.dir.deleteFile("snapshot.meta.tmp") catch {};
+                tmp.close(std.Io.Threaded.global_single_threaded.io());
+                self.dir.deleteFile(std.Io.Threaded.global_single_threaded.io(), "snapshot.meta.tmp") catch {};
             }
-            try tmp.writeAll(meta_buf);
-            try tmp.sync();
-            tmp.close();
+            try tmp.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), meta_buf);
+            try tmp.sync(std.Io.Threaded.global_single_threaded.io());
+            tmp.close(std.Io.Threaded.global_single_threaded.io());
         }
 
-        try self.dir.rename("snapshot.meta.tmp", "snapshot.meta");
-        try self.dir.rename("snapshot.data.tmp", "snapshot.data");
+        try self.dir.rename("snapshot.meta.tmp", self.dir, "snapshot.meta", std.Io.Threaded.global_single_threaded.io());
+        try self.dir.rename("snapshot.data.tmp", self.dir, "snapshot.data", std.Io.Threaded.global_single_threaded.io());
         try self.syncDir();
 
         self.snapshot_index = snap.metadata.index;
@@ -383,14 +383,14 @@ pub const FileStorage = struct {
             return err;
         };
 
-        const data_file = self.dir.openFile("snapshot.data", .{}) catch |err| {
+        const data_file = self.dir.openFile(std.Io.Threaded.global_single_threaded.io(), "snapshot.data", .{}) catch |err| {
             if (err == error.FileNotFound) {
-                self.dir.rename("snapshot.data.tmp", "snapshot.data") catch {
+                self.dir.rename("snapshot.data.tmp", self.dir, "snapshot.data", std.Io.Threaded.global_single_threaded.io()) catch {
                     meta.freeConfig(self.allocator);
                     return null;
                 };
                 self.syncDir() catch {};
-                const recovered = self.dir.openFile("snapshot.data", .{}) catch {
+                const recovered = self.dir.openFile(std.Io.Threaded.global_single_threaded.io(), "snapshot.data", .{}) catch {
                     meta.freeConfig(self.allocator);
                     return null;
                 };
@@ -403,18 +403,18 @@ pub const FileStorage = struct {
         return self.finishLoadSnapshot(meta, data_file);
     }
 
-    fn finishLoadSnapshot(self: *FileStorage, meta: SnapshotMeta, data_file: std.fs.File) !?rpc.Snapshot {
+    fn finishLoadSnapshot(self: *FileStorage, meta: SnapshotMeta, data_file: std.Io.File) !?rpc.Snapshot {
         var m = meta;
-        defer data_file.close();
+        defer data_file.close(std.Io.Threaded.global_single_threaded.io());
         errdefer m.freeConfig(self.allocator);
 
-        const size = try data_file.getEndPos();
+        const size = try data_file.length(std.Io.Threaded.global_single_threaded.io());
         if (size > self.max_snapshot_size) {
             return stg.StorageError.Unavailable;
         }
         const data = try self.allocator.alloc(u8, size);
         errdefer self.allocator.free(data);
-        const bytes_read = try data_file.readAll(data);
+        const bytes_read = try data_file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), data, 0);
         if (bytes_read != size) {
             self.allocator.free(data);
             m.freeConfig(self.allocator);
@@ -473,7 +473,7 @@ pub const FileStorage = struct {
                 w.deinit();
                 self.wal_log = null;
             }
-            self.dir.deleteFile("entries.wal") catch {};
+            self.dir.deleteFile(std.Io.Threaded.global_single_threaded.io(), "entries.wal") catch {};
             self.syncDir() catch {};
             return;
         }
@@ -493,15 +493,15 @@ pub const FileStorage = struct {
         const meta_buf = try serializeSnapshotMeta(self.allocator, snap_index, snap_term, data_digest, cfg);
         defer self.allocator.free(meta_buf);
 
-        var tmp = try self.dir.createFile("snapshot.meta.tmp", .{});
+        var tmp = try self.dir.createFile(std.Io.Threaded.global_single_threaded.io(), "snapshot.meta.tmp", .{});
         errdefer {
-            tmp.close();
-            self.dir.deleteFile("snapshot.meta.tmp") catch {};
+            tmp.close(std.Io.Threaded.global_single_threaded.io());
+            self.dir.deleteFile(std.Io.Threaded.global_single_threaded.io(), "snapshot.meta.tmp") catch {};
         }
-        try tmp.writeAll(meta_buf);
-        try tmp.sync();
-        tmp.close();
-        try self.dir.rename("snapshot.meta.tmp", "snapshot.meta");
+        try tmp.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), meta_buf);
+        try tmp.sync(std.Io.Threaded.global_single_threaded.io());
+        tmp.close(std.Io.Threaded.global_single_threaded.io());
+        try self.dir.rename("snapshot.meta.tmp", self.dir, "snapshot.meta", std.Io.Threaded.global_single_threaded.io());
         try self.syncDir();
     }
 
@@ -537,14 +537,14 @@ pub const FileStorage = struct {
     }
 
     fn readHardStateFile(self: *FileStorage) !state.HardState {
-        const file = try self.dir.openFile("hard_state", .{});
-        defer file.close();
-        const size = try file.getEndPos();
+        const file = try self.dir.openFile(std.Io.Threaded.global_single_threaded.io(), "hard_state", .{});
+        defer file.close(std.Io.Threaded.global_single_threaded.io());
+        const size = try file.length(std.Io.Threaded.global_single_threaded.io());
 
         if (size == 16) {
             // Legacy format without CRC.
             var buf: [16]u8 = undefined;
-            const n = try file.readAll(&buf);
+            const n = try file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), &buf, 0);
             if (n != 16) return error.InvalidHardState;
             const term = std.mem.readInt(u64, buf[0..8], .little);
             const vf_raw = std.mem.readInt(u64, buf[8..16], .little);
@@ -554,7 +554,7 @@ pub const FileStorage = struct {
             };
         } else if (size == 20) {
             var buf: [20]u8 = undefined;
-            const n = try file.readAll(&buf);
+            const n = try file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), &buf, 0);
             if (n != 20) return error.InvalidHardState;
             const stored_crc = std.mem.readInt(u32, buf[16..20], .little);
             const computed_crc = std.hash.Crc32.hash(buf[0..16]);
@@ -587,13 +587,13 @@ pub const FileStorage = struct {
     };
 
     fn readSnapshotMeta(self: *FileStorage) !SnapshotMeta {
-        const file = try self.dir.openFile("snapshot.meta", .{});
-        defer file.close();
-        const size = try file.getEndPos();
+        const file = try self.dir.openFile(std.Io.Threaded.global_single_threaded.io(), "snapshot.meta", .{});
+        defer file.close(std.Io.Threaded.global_single_threaded.io());
+        const size = try file.length(std.Io.Threaded.global_single_threaded.io());
 
         if (size == 16) {
             var buf: [16]u8 = undefined;
-            const n = try file.readAll(&buf);
+            const n = try file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), &buf, 0);
             if (n != 16) return error.InvalidSnapshotMeta;
             return .{
                 .index = std.mem.readInt(u64, buf[0..8], .little),
@@ -603,7 +603,7 @@ pub const FileStorage = struct {
             };
         } else if (size == 52) {
             var buf: [52]u8 = undefined;
-            const n = try file.readAll(&buf);
+            const n = try file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), &buf, 0);
             if (n != 52) return error.InvalidSnapshotMeta;
             const stored_crc = std.mem.readInt(u32, buf[48..52], .little);
             const computed_crc = std.hash.Crc32.hash(buf[0..48]);
@@ -621,7 +621,7 @@ pub const FileStorage = struct {
             if (size > 1024 * 1024) return error.InvalidSnapshotMeta;
             const buf = try self.allocator.alloc(u8, size);
             defer self.allocator.free(buf);
-            const n = try file.readAll(buf);
+            const n = try file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), buf, 0);
             if (n != size) return error.InvalidSnapshotMeta;
 
             const stored_crc = std.mem.readInt(u32, buf[size - 4 ..][0..4], .little);
@@ -652,7 +652,7 @@ pub const FileStorage = struct {
     /// Open WAL and rebuild in-memory index by iterating all records.
     fn recoverWal(self: *FileStorage) !void {
         // Check if WAL file exists.
-        self.dir.access("entries.wal", .{}) catch {
+        self.dir.access(std.Io.Threaded.global_single_threaded.io(), "entries.wal", .{}) catch {
             return; // No WAL yet.
         };
 
@@ -780,14 +780,17 @@ fn testDir() std.testing.TmpDir {
     return std.testing.tmpDir(.{});
 }
 
+/// Construct a path for FileStorage.init from a TmpDir, relative to cwd.
+/// The returned string is allocator-owned and must be freed by the caller.
+fn testPath(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir, suffix: []const u8) []const u8 {
+    return std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, suffix }) catch unreachable;
+}
+
 test "FileStorage: init creates directory and lock file" {
     var tmp = testDir();
     defer tmp.cleanup();
 
-    const path = tmp.dir.realpathAlloc(std.testing.allocator, ".") catch unreachable;
-    defer std.testing.allocator.free(path);
-
-    const full_path = std.fmt.allocPrint(std.testing.allocator, "{s}/fs-test-init", .{path}) catch unreachable;
+    const full_path = testPath(std.testing.allocator, &tmp, "fs-test-init");
     defer std.testing.allocator.free(full_path);
 
     var fs = try FileStorage.init(std.heap.page_allocator, full_path);
@@ -801,10 +804,7 @@ test "FileStorage: append and read entries round-trip" {
     var tmp = testDir();
     defer tmp.cleanup();
 
-    const path = tmp.dir.realpathAlloc(std.testing.allocator, ".") catch unreachable;
-    defer std.testing.allocator.free(path);
-
-    const full_path = std.fmt.allocPrint(std.testing.allocator, "{s}/fs-test-rtrip", .{path}) catch unreachable;
+    const full_path = testPath(std.testing.allocator, &tmp, "fs-test-rtrip");
     defer std.testing.allocator.free(full_path);
 
     var fs = try FileStorage.init(std.heap.page_allocator, full_path);
@@ -839,10 +839,7 @@ test "FileStorage: hard state persistence" {
     var tmp = testDir();
     defer tmp.cleanup();
 
-    const path = tmp.dir.realpathAlloc(std.testing.allocator, ".") catch unreachable;
-    defer std.testing.allocator.free(path);
-
-    const full_path = std.fmt.allocPrint(std.testing.allocator, "{s}/fs-test-hs", .{path}) catch unreachable;
+    const full_path = testPath(std.testing.allocator, &tmp, "fs-test-hs");
     defer std.testing.allocator.free(full_path);
 
     {
@@ -864,10 +861,7 @@ test "FileStorage: WAL recovery after reopen" {
     var tmp = testDir();
     defer tmp.cleanup();
 
-    const path = tmp.dir.realpathAlloc(std.testing.allocator, ".") catch unreachable;
-    defer std.testing.allocator.free(path);
-
-    const full_path = std.fmt.allocPrint(std.testing.allocator, "{s}/fs-test-wal-recovery", .{path}) catch unreachable;
+    const full_path = testPath(std.testing.allocator, &tmp, "fs-test-wal-recovery");
     defer std.testing.allocator.free(full_path);
 
     {
@@ -894,10 +888,7 @@ test "FileStorage: compaction removes entries and rewrites WAL" {
     var tmp = testDir();
     defer tmp.cleanup();
 
-    const path = tmp.dir.realpathAlloc(std.testing.allocator, ".") catch unreachable;
-    defer std.testing.allocator.free(path);
-
-    const full_path = std.fmt.allocPrint(std.testing.allocator, "{s}/fs-test-compact", .{path}) catch unreachable;
+    const full_path = testPath(std.testing.allocator, &tmp, "fs-test-compact");
     defer std.testing.allocator.free(full_path);
 
     var fs = try FileStorage.init(std.heap.page_allocator, full_path);

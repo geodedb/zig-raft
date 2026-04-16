@@ -12,9 +12,29 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const raft = @import("raft");
-const spice = raft.spice;
+const thread_pool = raft.thread_pool;
 
 const print = std.debug.print;
+
+/// Simple monotonic timer using libc clock_gettime (replacement for removed std.time.Timer).
+const MonoTimer = struct {
+    start_ns: u128,
+
+    fn start() MonoTimer {
+        return .{ .start_ns = nowNs() };
+    }
+
+    fn read(self: MonoTimer) u64 {
+        const now = nowNs();
+        return @intCast(now - self.start_ns);
+    }
+
+    fn nowNs() u128 {
+        var ts: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+        return @as(u128, @intCast(ts.sec)) * 1_000_000_000 + @as(u128, @intCast(ts.nsec));
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -79,12 +99,13 @@ const TierResult = struct {
 // ---------------------------------------------------------------------------
 
 const StdoutWriter = struct {
-    file: std.fs.File,
+    file: std.Io.File,
     buf: [8192]u8 = undefined,
-    writer: ?std.fs.File.Writer = null,
+    writer: ?std.Io.File.Writer = null,
 
     fn open(self: *StdoutWriter) void {
-        self.writer = self.file.writer(&self.buf);
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.writer = self.file.writerStreaming(io, &self.buf);
     }
 
     fn writeAll(self: *StdoutWriter, data: []const u8) !void {
@@ -148,7 +169,7 @@ fn benchPropose(allocator: std.mem.Allocator, iters: usize) !f64 {
         try node.advance();
     }
 
-    var timer = std.time.Timer.start() catch @panic("timer");
+    var timer = MonoTimer.start();
     for (0..iters) |_| {
         try node.propose("bench-payload-data-64bytes-padded-to-be-realistic!!");
         _ = try node.ready();
@@ -160,7 +181,7 @@ fn benchPropose(allocator: std.mem.Allocator, iters: usize) !f64 {
 
 /// Benchmark: tick() latency for a leader with N peers (sequential).
 fn benchTick(allocator: std.mem.Allocator, peer_count: u64, iters: usize) !f64 {
-    var peers = std.ArrayList(u64){};
+    var peers = std.ArrayList(u64).empty;
     defer peers.deinit(allocator);
     for (0..peer_count) |i| {
         try peers.append(allocator, @as(u64, @intCast(i)) + 2);
@@ -184,7 +205,7 @@ fn benchTick(allocator: std.mem.Allocator, peer_count: u64, iters: usize) !f64 {
         node.advance() catch {};
     }
 
-    var timer = std.time.Timer.start() catch @panic("timer");
+    var timer = MonoTimer.start();
     for (0..iters) |_| {
         node.tick(null) catch {};
         _ = node.ready() catch unreachable;
@@ -194,11 +215,11 @@ fn benchTick(allocator: std.mem.Allocator, peer_count: u64, iters: usize) !f64 {
     return @as(f64, @floatFromInt(elapsed)) / @as(f64, @floatFromInt(iters));
 }
 
-/// Benchmark: tick() latency for a leader with N peers (parallel via spice).
-fn benchTickParallel(allocator: std.mem.Allocator, pool: *spice.ThreadPool, peer_count: u64, iters: usize) !f64 {
+/// Benchmark: tick() latency for a leader with N peers (parallel via thread-pool).
+fn benchTickParallel(allocator: std.mem.Allocator, pool: *thread_pool.ThreadPool, peer_count: u64, iters: usize) !f64 {
     if (peer_count == 0) return 0;
 
-    var peers = std.ArrayList(u64){};
+    var peers = std.ArrayList(u64).empty;
     defer peers.deinit(allocator);
     for (0..peer_count) |i| {
         try peers.append(allocator, @as(u64, @intCast(i)) + 2);
@@ -213,26 +234,29 @@ fn benchTickParallel(allocator: std.mem.Allocator, pool: *spice.ThreadPool, peer
     _ = try node.ready();
     try node.advance();
 
+    const TickCtx = struct {
+        node: *raft.RaftNode,
+
+        fn run(ctx: *anyopaque, _: *thread_pool.TaskContext) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.node.tick(null) catch {};
+        }
+    };
+
+    var tick_ctx = TickCtx{ .node = node };
+
     // Warmup
     for (0..WARMUP_ITERS) |_| {
-        _ = pool.call(bool, struct {
-            fn run(task: *spice.Task, n: *raft.RaftNode) bool {
-                n.tick(task) catch return true;
-                return false;
-            }
-        }.run, node);
+        const handle = try pool.submit(&TickCtx.run, @ptrCast(&tick_ctx), .{ .waitable = true });
+        try pool.wait(handle);
         _ = node.ready() catch unreachable;
         node.advance() catch {};
     }
 
-    var timer = std.time.Timer.start() catch @panic("timer");
+    var timer = MonoTimer.start();
     for (0..iters) |_| {
-        _ = pool.call(bool, struct {
-            fn run(task: *spice.Task, n: *raft.RaftNode) bool {
-                n.tick(task) catch return true;
-                return false;
-            }
-        }.run, node);
+        const handle = try pool.submit(&TickCtx.run, @ptrCast(&tick_ctx), .{ .waitable = true });
+        try pool.wait(handle);
         _ = node.ready() catch unreachable;
         node.advance() catch {};
     }
@@ -276,7 +300,7 @@ fn benchStepAE(allocator: std.mem.Allocator, iters: usize) !f64 {
         node.advance() catch {};
     }
 
-    var timer = std.time.Timer.start() catch @panic("timer");
+    var timer = MonoTimer.start();
     for (0..iters) |iter| {
         const base_idx = @as(u64, @intCast(WARMUP_ITERS + iter)) * 10 + 1;
         for (&ae_entries, 0..) |*e, i| {
@@ -327,7 +351,7 @@ fn benchLogAppend(allocator: std.mem.Allocator, iters: usize) !f64 {
         }
     }
 
-    var timer = std.time.Timer.start() catch @panic("timer");
+    var timer = MonoTimer.start();
     for (0..iters) |iter| {
         const base = @as(u64, @intCast(WARMUP_ITERS + iter)) * 64 + 1;
         for (&entries, 0..) |*e, i| {
@@ -361,7 +385,7 @@ fn benchReadyAdvance(allocator: std.mem.Allocator, iters: usize) !f64 {
         try node.advance();
     }
 
-    var timer = std.time.Timer.start() catch @panic("timer");
+    var timer = MonoTimer.start();
     for (0..iters) |_| {
         try node.propose("ready-advance-bench-payload");
         _ = try node.ready();
@@ -373,7 +397,7 @@ fn benchReadyAdvance(allocator: std.mem.Allocator, iters: usize) !f64 {
 
 /// Benchmark: heartbeat throughput (ticks that trigger heartbeats).
 fn benchHeartbeatThroughput(allocator: std.mem.Allocator, peer_count: u64, iters: usize) !f64 {
-    var peers = std.ArrayList(u64){};
+    var peers = std.ArrayList(u64).empty;
     defer peers.deinit(allocator);
     for (0..peer_count) |i| {
         try peers.append(allocator, @as(u64, @intCast(i)) + 2);
@@ -393,7 +417,7 @@ fn benchHeartbeatThroughput(allocator: std.mem.Allocator, peer_count: u64, iters
         node.advance() catch {};
     }
 
-    var timer = std.time.Timer.start() catch @panic("timer");
+    var timer = MonoTimer.start();
     for (0..iters) |_| {
         node.tick(null) catch {};
     }
@@ -418,7 +442,7 @@ fn benchReplicationThroughput(allocator: std.mem.Allocator, iters: usize) !f64 {
         try node.advance();
     }
 
-    var timer = std.time.Timer.start() catch @panic("timer");
+    var timer = MonoTimer.start();
     for (0..iters) |_| {
         try node.propose("replication-throughput-payload");
         _ = try node.ready();
@@ -436,7 +460,7 @@ fn benchReplicationThroughput(allocator: std.mem.Allocator, iters: usize) !f64 {
 // Tier runner
 // ---------------------------------------------------------------------------
 
-fn runTier(allocator: std.mem.Allocator, pool: *spice.ThreadPool, tier: Tier) TierResult {
+fn runTier(allocator: std.mem.Allocator, pool: *thread_pool.ThreadPool, tier: Tier) TierResult {
     const peer_count = if (tier.node_count > 1) tier.node_count - 1 else 0;
     const iters = benchIters(tier.node_count);
 
@@ -506,8 +530,9 @@ fn writeJsonOutput(out: *StdoutWriter, results: []const TierResult) !void {
     try out.writeAll("  \"version\": 1,\n");
 
     // Timestamp
-    const ts = std.time.timestamp();
-    const epoch_secs: u64 = @intCast(ts);
+    var realtime_ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &realtime_ts);
+    const epoch_secs: u64 = @intCast(realtime_ts.sec);
     const es = std.time.epoch.EpochSeconds{ .secs = epoch_secs };
     const day_secs = es.getDaySeconds();
     const year_day = es.getEpochDay().calculateYearDay();
@@ -607,11 +632,11 @@ fn writeSummary(results: []const TierResult) void {
 // Main
 // ---------------------------------------------------------------------------
 
-pub fn main() !void {
-    const allocator = std.heap.page_allocator;
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
 
     // Parse optional max-tier argument.
-    var args = std.process.args();
+    var args = std.process.Args.Iterator.init(init.minimal.args);
     _ = args.next(); // skip program name
 
     var max_tier_count: usize = tiers.len;
@@ -625,8 +650,7 @@ pub fn main() !void {
     }
 
     // Create thread pool for parallel benchmarks.
-    var pool = spice.ThreadPool.init(allocator);
-    pool.start(.{});
+    var pool = try thread_pool.ThreadPool.init(allocator, .{});
     defer pool.deinit();
 
     var results: [tiers.len]TierResult = undefined;
@@ -649,7 +673,7 @@ pub fn main() !void {
 
     writeSummary(results[0..completed]);
 
-    var out = StdoutWriter{ .file = .{ .handle = std.posix.STDOUT_FILENO } };
+    var out = StdoutWriter{ .file = .{ .handle = std.posix.STDOUT_FILENO, .flags = .{ .nonblocking = false } } };
     out.open();
     try writeJsonOutput(&out, results[0..completed]);
 }

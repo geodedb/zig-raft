@@ -18,12 +18,16 @@ pub const ElectionState = struct {
     election_elapsed: u32,
     votes_received: std.AutoHashMap(u64, bool),
     prng: std.Random.DefaultPrng,
-    use_crypto_random: bool,
     allocator: Allocator,
 
     pub fn init(allocator: Allocator, election_tick: u32, heartbeat_tick: u32, rng_seed: ?u64) ElectionState {
-        const use_crypto = rng_seed == null;
-        const prng = std.Random.DefaultPrng.init(rng_seed orelse 0);
+        const seed = rng_seed orelse blk: {
+            var buf: [8]u8 = undefined;
+            const io = std.Io.Threaded.global_single_threaded.io();
+            io.random(&buf);
+            break :blk std.mem.readInt(u64, &buf, .little);
+        };
+        const prng = std.Random.DefaultPrng.init(seed);
 
         return .{
             .election_tick = election_tick,
@@ -33,7 +37,6 @@ pub const ElectionState = struct {
             .election_elapsed = 0,
             .votes_received = std.AutoHashMap(u64, bool).init(allocator),
             .prng = prng,
-            .use_crypto_random = use_crypto,
             .allocator = allocator,
         };
     }
@@ -46,11 +49,7 @@ pub const ElectionState = struct {
         const lower = self.election_tick;
         const upper = std.math.mul(u32, 2, self.election_tick) catch std.math.maxInt(u32);
 
-        if (self.use_crypto_random) {
-            self.election_timeout = std.crypto.random.intRangeLessThan(u32, lower, upper);
-        } else {
-            self.election_timeout = self.prng.random().intRangeLessThan(u32, lower, upper);
-        }
+        self.election_timeout = self.prng.random().intRangeLessThan(u32, lower, upper);
     }
 
     pub fn electionTimeoutElapsed(self: *const ElectionState) bool {

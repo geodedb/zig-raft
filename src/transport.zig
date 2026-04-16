@@ -56,7 +56,7 @@ pub const InProcessTransport = struct {
 
     /// Register a node so it can receive messages.
     pub fn register(self: *InProcessTransport, id: u64) !void {
-        try self.inboxes.put(id, .{});
+        try self.inboxes.put(id, .empty);
     }
 
     /// Get a Transport handle. The returned Transport's send() delivers messages
