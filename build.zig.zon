@@ -5,12 +5,12 @@
     .minimum_zig_version = "0.15.1",
     .dependencies = .{
         .thread_pool = .{
-            .url = "git+https://gitlab.com/devnw/zig/thread-pool.git#ba05fa5c7cbf0e6186cefa4dc10d06b05f8d0a26",
-            .hash = "thread_pool-0.2.0-11B1Bi0FQwDEQZSzqiOWdpLYED5XQkzGcNYoupSn1VDu",
+            .url = "git+https://gitlab.com/devnw/zig/thread-pool.git#a572f2c255f6d1d7163bacdad266b3f199854822",
+            .hash = "thread_pool-0.2.0-11B1BnYIQwCpbLn6Mm8gNc8_0eN-z0BaN6B3yNU0Y1-q",
         },
         .wal = .{
-            .url = "git+https://gitlab.com/devnw/zig/wal.git#5c104ddf357d9be658ec325f66417dcc7a3a236e",
-            .hash = "wal-0.1.0-EqPqpirJAwBCAyraKblbnGuqKscxP3IxSkp4IPywlX2o",
+            .url = "git+https://gitlab.com/devnw/zig/wal.git#05865e6111eda99ffc05f384417f9490a0bfd67e",
+            .hash = "wal-0.1.0-EqPqpofJAwCTcTvn2mCVhPcBvtI_cZiSwVnwq8VuETle",
         },
     },
     .paths = .{
