@@ -211,8 +211,25 @@ pub fn build(b: *std.Build) void {
         .root_module = addRaftModule(b, b.path("examples/basic.zig"), target, optimize, &.{}),
     });
     const run_example = b.addRunArtifact(example);
-    const example_step = b.step("example", "Run the basic example");
+    const example_step = b.step("example-basic", "Run the basic example");
     example_step.dependOn(&run_example.step);
+
+    // --- Example: single-node parallel tick loop --------------------------
+    const parallel_example = b.addExecutable(.{
+        .name = "single_node_parallel",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/single_node_parallel.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "raft", .module = module },
+            },
+        }),
+    });
+    const run_parallel_example = b.addRunArtifact(parallel_example);
+    const parallel_example_step = b.step("example", "Build and run the single-node parallel example");
+    parallel_example_step.dependOn(&run_parallel_example.step);
 
     // Check step for IDE integration (fast syntax validation)
     const check_step = b.step("check", "Check for compilation errors");
