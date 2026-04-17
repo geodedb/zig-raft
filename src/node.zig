@@ -78,6 +78,13 @@ pub const Stats = struct {
     became_leader: u64 = 0,
     /// Number of heartbeat rounds sent (leader only).
     heartbeats_sent: u64 = 0,
+    /// Number of heartbeat rounds where `submitBatch` returned a partial
+    /// result — some peers were not submitted to the pool and fell
+    /// through to the `emptyHeartbeat` fallback. A rising value here
+    /// signals pool saturation; operators should inspect the pool's
+    /// `statsSnapshot().queue_depth_peak` and consider raising
+    /// `Config.queue_capacity` or reducing concurrent submit pressure.
+    heartbeat_partial_submits: u64 = 0,
     /// Number of snapshots installed (follower receiving from leader).
     snapshots_installed: u64 = 0,
     /// Number of ticks processed.
@@ -1181,8 +1188,18 @@ pub const RaftNode = struct {
             }
 
             var wg = p.waitGroup();
-            _ = p.submitBatch(batch, .{ .wait_group = &wg }) catch {
-                // Queue full: fall back to sequential build.
+            if (p.submitBatch(batch, .{ .wait_group = &wg })) |result| {
+                // Partial-submit visibility: thread-pool accepted `result.submitted`
+                // peers and silently dropped the rest. Track the count so operators
+                // can observe pool saturation. Peers that weren't submitted keep
+                // `results[i] = null` and fall through to `emptyHeartbeat` in the
+                // send loop below — valid Raft, but an operator-visible signal.
+                if (result.submitted < batch.len) {
+                    self.perf_stats.heartbeat_partial_submits += 1;
+                }
+            } else |_| {
+                // Queue full / total failure: fall back to sequential build.
+                self.perf_stats.heartbeat_partial_submits += 1;
                 for (peers, 0..) |peer, i| {
                     results[i] = rs.buildAppendEntries(
                         peer,
@@ -1194,7 +1211,7 @@ pub const RaftNode = struct {
                         self.config.max_bytes_per_msg,
                     ) catch null;
                 }
-            };
+            }
             wg.wait();
 
             // Send results.

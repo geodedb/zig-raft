@@ -62,6 +62,11 @@ test "parallel heartbeats: leader sends correct AppendEntries via fork/join" {
     }
     // Leader should send to all peers (2 in a 3-node cluster).
     try std.testing.expectEqual(@as(u32, 2), peer_count);
+
+    // Under a healthy pool with ample queue capacity, submitBatch succeeds
+    // for every peer and heartbeat_partial_submits must stay at 0. A rising
+    // counter in production would indicate pool saturation.
+    try std.testing.expectEqual(@as(u64, 0), leader.perf_stats.heartbeat_partial_submits);
 }
 
 test "parallel heartbeats: messages match sequential path output" {
