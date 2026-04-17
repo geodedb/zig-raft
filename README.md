@@ -144,7 +144,7 @@ capacity should stay at `0`. A rising value signals pool saturation;
 raise `Config.queue_capacity` or spread work across more submitters.
 
 See [`examples/single_node_parallel.zig`](examples/single_node_parallel.zig)
-for a complete runnable demo (`zig build example`).
+for a complete runnable demo (`zig build example-parallel`).
 
 ## Requirements
 

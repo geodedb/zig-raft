@@ -7,37 +7,8 @@
 //! the per-submitter fast path.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const raft = @import("raft");
 const tp = raft.thread_pool;
-
-/// Cross-platform nanosecond sleep that works on Zig 0.16.0. The std lib
-/// removed `std.Thread.sleep`; callers now reach for `std.posix.nanosleep`
-/// on POSIX and `kernel32.Sleep` on Windows.
-fn sleepNs(nanoseconds: u64) void {
-    if (builtin.os.tag == .windows) {
-        const ms: u32 = @intCast(@min(nanoseconds / std.time.ns_per_ms, @as(u64, std.math.maxInt(u32))));
-        std.os.windows.kernel32.Sleep(ms);
-        return;
-    }
-    const ns_per_s = std.time.ns_per_s;
-    var req: std.posix.timespec = .{
-        .sec = @intCast(nanoseconds / ns_per_s),
-        .nsec = @intCast(nanoseconds % ns_per_s),
-    };
-    var rem: std.posix.timespec = undefined;
-    while (true) {
-        const rc = std.posix.system.nanosleep(&req, &rem);
-        switch (std.posix.errno(rc)) {
-            .SUCCESS => return,
-            .INTR => {
-                req = rem;
-                continue;
-            },
-            else => return,
-        }
-    }
-}
 
 pub fn main() !void {
     var gpa: std.heap.DebugAllocator(.{ .thread_safe = true }) = .init;
@@ -87,7 +58,7 @@ pub fn main() !void {
     var tick_count: u32 = 0;
     while (tick_count < 100) : (tick_count += 1) {
         try node.tick(&pool);
-        sleepNs(5 * std.time.ns_per_ms);
+        tp.clock.sleep(5 * std.time.ns_per_ms);
     }
 
     // 5. Inspect the partial-submit counter. A healthy pool with

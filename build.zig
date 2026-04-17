@@ -207,11 +207,11 @@ pub fn build(b: *std.Build) void {
 
     // Example executable (QA-038: compile examples to prevent silent rot)
     const example = b.addExecutable(.{
-        .name = "example-basic",
+        .name = "example",
         .root_module = addRaftModule(b, b.path("examples/basic.zig"), target, optimize, &.{}),
     });
     const run_example = b.addRunArtifact(example);
-    const example_step = b.step("example-basic", "Run the basic example");
+    const example_step = b.step("example", "Run the basic example");
     example_step.dependOn(&run_example.step);
 
     // --- Example: single-node parallel tick loop --------------------------
@@ -228,7 +228,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_parallel_example = b.addRunArtifact(parallel_example);
-    const parallel_example_step = b.step("example", "Build and run the single-node parallel example");
+    const parallel_example_step = b.step("example-parallel", "Build and run the single-node parallel example");
     parallel_example_step.dependOn(&run_parallel_example.step);
 
     // Check step for IDE integration (fast syntax validation)
