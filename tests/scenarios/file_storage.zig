@@ -24,6 +24,11 @@
 
 const std = @import("std");
 const raft = @import("raft");
+
+fn rio() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
 const Checker = @import("checker").Checker;
 
 const FileStorage = raft.FileStorage;
@@ -95,10 +100,10 @@ const TestCluster = struct {
         const allocator = std.heap.page_allocator;
 
         // Clean up from prior runs.
-        std.fs.cwd().deleteTree(base_path) catch {};
+        std.Io.Dir.cwd().deleteTree(rio(), base_path) catch {};
 
         const queue = try allocator.create(std.ArrayList(PendingMessage));
-        queue.* = .{};
+        queue.* = .empty;
 
         var cluster: TestCluster = .{
             .nodes = undefined,
@@ -379,7 +384,7 @@ test "file_storage integration: hard state persists across restarts" {
     }
 
     // Clean up.
-    std.fs.cwd().deleteTree(base) catch {};
+    std.Io.Dir.cwd().deleteTree(rio(), base) catch {};
 }
 
 test "file_storage integration: snapshot save and load in cluster" {
@@ -465,7 +470,7 @@ test "file_storage: torn_write_recovery" {
     const base = "/tmp/raft-fs-torn-write";
 
     // Clean up from prior runs.
-    std.fs.cwd().deleteTree(base) catch {};
+    std.Io.Dir.cwd().deleteTree(rio(), base) catch {};
 
     const allocator = std.heap.page_allocator;
 
@@ -488,20 +493,17 @@ test "file_storage: torn_write_recovery" {
 
     // Phase 2: Corrupt the WAL by appending garbage bytes (simulating a torn write).
     {
-        var dir = try std.fs.cwd().openDir(base, .{});
-        defer dir.close();
+        const io = rio();
+        var dir = try std.Io.Dir.cwd().openDir(io, base, .{});
+        defer dir.close(io);
 
-        var wal_file = try dir.openFile("entries.wal", .{ .mode = .read_write });
-        defer wal_file.close();
+        var wal_file = try dir.openFile(io, "entries.wal", .{ .mode = .read_write });
+        defer wal_file.close(io);
 
-        // Seek to end and append garbage.
-        const end_pos = try wal_file.getEndPos();
-        try wal_file.seekTo(end_pos);
-
-        // Write a partial header + random garbage (simulates a torn write
-        // where the process crashed mid-write).
+        // Append garbage at end (0.16 uses positional I/O).
+        const end_pos = try wal_file.length(io);
         const garbage = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00, 0x00, 0x03, 0xFF, 0xFF };
-        try wal_file.writeAll(&garbage);
+        try wal_file.writePositionalAll(io, &garbage, end_pos);
     }
 
     // Phase 3: Re-open the storage. recoverWal should detect the CRC mismatch
@@ -541,5 +543,5 @@ test "file_storage: torn_write_recovery" {
     }
 
     // Clean up.
-    std.fs.cwd().deleteTree(base) catch {};
+    std.Io.Dir.cwd().deleteTree(rio(), base) catch {};
 }

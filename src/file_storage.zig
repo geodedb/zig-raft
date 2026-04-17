@@ -363,11 +363,11 @@ pub const FileStorage = struct {
         self.snapshot_term = snap.metadata.term;
         self.snapshot_data_digest = data_digest;
 
-        var new_voters = std.ArrayList(u64){};
+        var new_voters: std.ArrayList(u64) = .empty;
         try new_voters.appendSlice(self.allocator, snap.metadata.config.voters);
         errdefer new_voters.deinit(self.allocator);
 
-        var new_outgoing = std.ArrayList(u64){};
+        var new_outgoing: std.ArrayList(u64) = .empty;
         try new_outgoing.appendSlice(self.allocator, snap.metadata.config.voters_outgoing);
 
         self.snapshot_config_voters.deinit(self.allocator);
