@@ -141,6 +141,15 @@ test "parallel tick: full cluster round-trip with parallel heartbeats" {
     var pool = tp.ThreadPool.init(std.heap.page_allocator, .{}) catch @panic("thread-pool init failed");
     defer pool.deinit();
 
+    // Opt into the per-submitter fast path for the tick-driving thread.
+    // sendHeartbeats() submits a batch on every heartbeat; the same thread
+    // repeats this call, so per-submitter descriptor caching is a win.
+    const submitter_slot = try leader.registerAsSubmitter(&pool);
+    defer leader.releaseAsSubmitter(&pool, submitter_slot);
+
+    // Slot must be a valid index into the 64-slot bitmap.
+    try std.testing.expect(submitter_slot < 64);
+
     // Run 5 tick-deliver-advance rounds with parallel leader ticks.
     for (0..5) |_| {
         // Tick: leader parallel, followers sequential.
@@ -193,6 +202,36 @@ test "parallel tick: full cluster round-trip with parallel heartbeats" {
 
     // Entries should be committed.
     try std.testing.expect(leader.log.committed >= 2);
+}
+
+test "registerAsSubmitter: returns a valid slot and releases cleanly" {
+    var net = try harness.Network.init(std.testing.allocator, 3);
+    defer net.deinit();
+
+    const leader_id = try electLeader(&net);
+    const leader = net.nodes.get(leader_id).?;
+
+    var pool = tp.ThreadPool.init(std.heap.page_allocator, .{}) catch @panic("thread-pool init failed");
+    defer pool.deinit();
+
+    // Single registration must succeed and return a slot within the pool's
+    // 64-slot submitter bitmap.
+    const slot = try leader.registerAsSubmitter(&pool);
+    try std.testing.expect(slot < 64);
+
+    // A parallel tick after registration must still succeed — the fast-path
+    // submit route is transparent to callers of submitBatch.
+    net.queue.list.clearRetainingCapacity();
+    try leader.tick(&pool);
+
+    // Release cleans up without error.
+    leader.releaseAsSubmitter(&pool, slot);
+
+    // Subsequent registration on the same thread yields another valid slot
+    // (each call claims fresh from the bitmap).
+    const slot2 = try leader.registerAsSubmitter(&pool);
+    try std.testing.expect(slot2 < 64);
+    leader.releaseAsSubmitter(&pool, slot2);
 }
 
 test "parallel tick: safety invariants hold after parallel rounds" {

@@ -239,6 +239,35 @@ pub const RaftNode = struct {
         self.transport = t;
     }
 
+    /// Opt the calling thread into the thread-pool's per-submitter fast path
+    /// (PERF-027). Raft heartbeats are submitted in bursts from the same
+    /// driving thread (the caller of `tick()`); registering that thread as a
+    /// dedicated submitter lets `submitBatch` bypass global-freelist CAS
+    /// traffic for descriptor acquisition.
+    ///
+    /// Call **once** on the thread that will drive `tick()` before entering
+    /// the tick loop; pair with exactly one `releaseAsSubmitter` on the same
+    /// thread before the loop exits. Each call claims a fresh slot from the
+    /// pool's 64-slot submitter bitmap, so do not call repeatedly — wrap the
+    /// acquisition around the tick loop and reuse the returned slot for the
+    /// loop's lifetime.
+    ///
+    /// Returns `error.NoSubmitterSlots` if the pool's 64-slot bitmap is full.
+    /// Callers that cannot afford to fail may ignore the error and fall back
+    /// to the default submit path (correct but slower under contention).
+    pub fn registerAsSubmitter(_: *RaftNode, pool: *tp.ThreadPool) !usize {
+        return pool.registerSubmitter();
+    }
+
+    /// Release a submitter slot previously acquired via `registerAsSubmitter`.
+    /// Must be called on the same thread that registered the slot for the
+    /// per-slot descriptor cache to drain correctly. Out-of-range `idx` is
+    /// silently ignored. Safe to double-release a given `idx` — the pool's
+    /// CAS on the free-mask bails on the second call rather than racing.
+    pub fn releaseAsSubmitter(_: *RaftNode, pool: *tp.ThreadPool, idx: usize) void {
+        pool.releaseSubmitter(idx);
+    }
+
     /// Return the current dynamic voter set excluding self (SEC-0044).
     /// Uses membership_state.voters (which tracks config changes) instead
     /// of the static config.peers. Caller must free the returned slice.
