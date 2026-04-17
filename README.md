@@ -65,6 +65,87 @@ pub fn main() !void {
 }
 ```
 
+## Thread-pool integration
+
+`RaftNode.tick` and `RaftNode.sendHeartbeats` accept an optional
+`*tp.ThreadPool`. When supplied, the heartbeat `AppendEntries` fan-out is
+built in parallel across peers via `pool.submitBatch`, with a single
+`WaitGroup` awaited before the heartbeats are sent. Passing `null` keeps
+everything on the tick-driving thread (correct, just serial).
+
+For the tick-driving thread, the canonical integration uses the
+per-submitter fast path. Register the thread **once** before the loop,
+release **once** after. This claims a dedicated submitter slot with its
+own descriptor cache — heartbeat bursts from the same thread then bypass
+global-freelist CAS traffic for task-descriptor acquisition.
+
+```zig
+const std = @import("std");
+const raft = @import("raft");
+const tp = raft.thread_pool;
+
+pub fn run(allocator: std.mem.Allocator) !void {
+    var storage = raft.InMemoryStorage.init(allocator);
+    defer storage.deinit();
+
+    var node = try raft.RaftNode.init(allocator, .{
+        .id = 1,
+        .peers = &.{ 2, 3 },
+    }, storage.storage());
+    defer node.deinit();
+
+    // Reserve at least one slot in the submitter bitmap.
+    var pool = try tp.ThreadPool.init(allocator, .{
+        .max_threads = 4,
+        .scheduler_variant = .work_stealing,
+        .max_submitter_queues = 1,
+    });
+    defer {
+        _ = pool.shutdown(.drain, 5 * std.time.ns_per_s) catch {};
+        pool.deinit();
+    }
+
+    // Register ONCE before the loop on the thread that drives tick().
+    const slot = try node.registerAsSubmitter(&pool);
+    defer node.releaseAsSubmitter(&pool, slot);
+
+    while (running()) {
+        try node.tick(&pool);
+        // ... step/ready/advance as usual ...
+    }
+}
+```
+
+### Lifecycle rules
+
+- `registerAsSubmitter` must be called on the **same thread** that will
+  call `tick(&pool)`. The per-slot descriptor cache is single-writer and
+  assumes a stable producer identity.
+- Call it **once** per tick loop, not per tick. Each call claims a fresh
+  slot from the pool's 64-slot submitter bitmap.
+- Pair it with exactly **one** `releaseAsSubmitter` on the same thread
+  before the loop exits. The release drains the slot's descriptor cache
+  back to the pool's global freelist.
+- The pool's `max_submitter_queues` config option must be set to at
+  least 1 (rounded up to a power of two internally). The default is 0,
+  which leaves the bitmap empty and causes `registerAsSubmitter` to
+  return `error.NoSubmitterSlots`.
+- `registerAsSubmitter` returns `error.NoSubmitterSlots` when the bitmap
+  is full. Callers that cannot afford to fail may ignore the error and
+  fall back to the default submit path — correct, just slower under
+  contention.
+
+### Operator visibility
+
+`RaftNode.perf_stats.heartbeat_partial_submits` counts heartbeat rounds
+where `submitBatch` returned a partial result — some peers fell through
+to the `emptyHeartbeat` fallback. A healthy pool with adequate queue
+capacity should stay at `0`. A rising value signals pool saturation;
+raise `Config.queue_capacity` or spread work across more submitters.
+
+See [`examples/single_node_parallel.zig`](examples/single_node_parallel.zig)
+for a complete runnable demo (`zig build example`).
+
 ## Requirements
 
 - Zig 0.15.1 or later
