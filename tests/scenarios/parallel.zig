@@ -46,7 +46,7 @@ test "parallel heartbeats: leader sends correct AppendEntries via fork/join" {
     const leader_id = try electLeader(&net);
     const leader = net.nodes.get(leader_id).?;
 
-    var pool = tp.ThreadPool.init(std.heap.page_allocator, .{}) catch @panic("thread-pool init failed");
+    var pool = tp.ThreadPool.init(std.heap.page_allocator, .{ .max_submitter_queues = 4 }) catch @panic("thread-pool init failed");
     defer pool.deinit();
 
     // Drain election messages.
@@ -93,7 +93,7 @@ test "parallel heartbeats: messages match sequential path output" {
     try leader_seq.tick(null);
 
     // Parallel tick.
-    var pool = tp.ThreadPool.init(std.heap.page_allocator, .{}) catch @panic("thread-pool init failed");
+    var pool = tp.ThreadPool.init(std.heap.page_allocator, .{ .max_submitter_queues = 4 }) catch @panic("thread-pool init failed");
     defer pool.deinit();
 
     try std.testing.expect(!parallelTickNode(&pool, leader_par));
@@ -143,7 +143,7 @@ test "parallel tick: full cluster round-trip with parallel heartbeats" {
     try leader.propose("entry-1");
     try leader.propose("entry-2");
 
-    var pool = tp.ThreadPool.init(std.heap.page_allocator, .{}) catch @panic("thread-pool init failed");
+    var pool = tp.ThreadPool.init(std.heap.page_allocator, .{ .max_submitter_queues = 4 }) catch @panic("thread-pool init failed");
     defer pool.deinit();
 
     // Opt into the per-submitter fast path for the tick-driving thread.
@@ -216,7 +216,7 @@ test "registerAsSubmitter: returns a valid slot and releases cleanly" {
     const leader_id = try electLeader(&net);
     const leader = net.nodes.get(leader_id).?;
 
-    var pool = tp.ThreadPool.init(std.heap.page_allocator, .{}) catch @panic("thread-pool init failed");
+    var pool = tp.ThreadPool.init(std.heap.page_allocator, .{ .max_submitter_queues = 4 }) catch @panic("thread-pool init failed");
     defer pool.deinit();
 
     // Single registration must succeed and return a slot within the pool's
