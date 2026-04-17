@@ -22,7 +22,7 @@ pub const PendingMessage = struct {
 /// Allocated on the heap so that pointers remain stable after Network
 /// is returned by value from `init`.
 const MessageQueue = struct {
-    list: std.ArrayList(PendingMessage) = .{},
+    list: std.ArrayList(PendingMessage) = .empty,
     allocator: std.mem.Allocator,
 
     fn init(allocator: std.mem.Allocator) MessageQueue {
@@ -105,7 +105,7 @@ pub const Network = struct {
             .nodes = std.AutoHashMap(u64, *raft.RaftNode).init(allocator),
             .storages = std.AutoHashMap(u64, *raft.InMemoryStorage).init(allocator),
             .transports = std.AutoHashMap(u64, *NodeTransport).init(allocator),
-            .node_ids = .{},
+            .node_ids = .empty,
             .paused_nodes = std.AutoHashMap(u64, void).init(allocator),
             .dropped_routes = std.AutoHashMap(RouteKey, void).init(allocator),
             .queue = q,
@@ -117,7 +117,7 @@ pub const Network = struct {
         var i: u64 = 1;
         while (i <= node_count) : (i += 1) {
             // Build peer list (all other node IDs).
-            var peers = std.ArrayList(u64){};
+            var peers: std.ArrayList(u64) = .empty;
             defer peers.deinit(allocator);
             var j: u64 = 1;
             while (j <= node_count) : (j += 1) {
@@ -149,7 +149,7 @@ pub const Network = struct {
             try net.storages.put(i, store);
             try net.transports.put(i, nt);
             try net.node_ids.append(allocator, i);
-            try net.committed.put(i, .{});
+            try net.committed.put(i, .empty);
         }
 
         return net;

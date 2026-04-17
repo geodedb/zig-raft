@@ -14,6 +14,25 @@ const raft = @import("raft");
 const WARMUP_ITERS = 100;
 const BENCH_ITERS = 10_000;
 
+// Zig 0.16 compat: std.time.Timer was removed. Use Io.Clock-based polyfill.
+const Timer = struct {
+    start_ns: i128,
+
+    fn start() error{}!Timer {
+        return .{ .start_ns = nanoTimestamp() };
+    }
+
+    fn read(self: *Timer) u64 {
+        const diff = nanoTimestamp() - self.start_ns;
+        return if (diff > 0) @intCast(diff) else 0;
+    }
+
+    fn nanoTimestamp() i128 {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        return std.Io.Clock.Timestamp.now(io, .real).raw.nanoseconds;
+    }
+};
+
 fn nsPerOp(comptime func: anytype, args: anytype) u64 {
     // Warmup.
     for (0..WARMUP_ITERS) |_| {
@@ -22,7 +41,7 @@ fn nsPerOp(comptime func: anytype, args: anytype) u64 {
         std.mem.doNotOptimizeAway(&result);
     }
 
-    var timer = std.time.Timer.start() catch @panic("timer");
+    var timer = Timer.start() catch @panic("timer");
     for (0..BENCH_ITERS) |_| {
         const result = @call(.auto, func, args);
         std.mem.doNotOptimizeAway(&result);
@@ -135,7 +154,7 @@ test "bench: follower_step_append_entries" {
         };
     }
 
-    var timer = std.time.Timer.start() catch @panic("timer");
+    var timer = Timer.start() catch @panic("timer");
     for (0..BENCH_ITERS) |iter| {
         // Re-index entries to append sequentially.
         const base_idx = @as(u64, @intCast(iter)) * 10 + 1;
@@ -188,7 +207,7 @@ test "bench: log-append-64" {
         };
     }
 
-    var timer = std.time.Timer.start() catch @panic("timer");
+    var timer = Timer.start() catch @panic("timer");
     for (0..BENCH_ITERS) |iter| {
         // Re-index entries so they don't conflict with existing.
         const base = @as(u64, @intCast(iter)) * 64 + 1;
@@ -235,7 +254,7 @@ test "bench: log-slice-unstable" {
     }
     try log.append(&entries);
 
-    var timer = std.time.Timer.start() catch @panic("timer");
+    var timer = Timer.start() catch @panic("timer");
     for (0..BENCH_ITERS) |_| {
         // Borrow (zero-copy) path.
         if (log.borrowUnstable(500, 600)) |borrowed| {
@@ -286,7 +305,7 @@ test "bench: leader-tick" {
     _ = try node.ready();
     try node.advance();
 
-    var timer = std.time.Timer.start() catch @panic("timer");
+    var timer = Timer.start() catch @panic("timer");
     for (0..BENCH_ITERS) |_| {
         node.tick(null) catch {};
         // Drain ready to prevent accumulation.
@@ -331,7 +350,7 @@ test "bench: leader-tick-parallel" {
     // Since we can't auto-elect with peers and no transport, measure tick overhead.
 
     // Sequential baseline (no transport, tick does heartbeat timeout check only).
-    var timer_seq = std.time.Timer.start() catch @panic("timer");
+    var timer_seq = Timer.start() catch @panic("timer");
     for (0..BENCH_ITERS) |_| {
         node.tick(null) catch {};
         std.mem.doNotOptimizeAway(&node);
@@ -343,7 +362,7 @@ test "bench: leader-tick-parallel" {
     var pool = tp.ThreadPool.init(allocator, .{}) catch @panic("thread-pool init failed");
     defer pool.deinit();
 
-    var timer_par = std.time.Timer.start() catch @panic("timer");
+    var timer_par = Timer.start() catch @panic("timer");
     for (0..BENCH_ITERS) |_| {
         node.tick(&pool) catch {};
         std.mem.doNotOptimizeAway(&node);
@@ -368,7 +387,7 @@ test "bench: stableTo" {
     var log = try raft.log.RaftLog.init(allocator, mem_store.storage(), 0, 0);
     defer log.deinit();
 
-    var timer = std.time.Timer.start() catch @panic("timer");
+    var timer = Timer.start() catch @panic("timer");
     for (0..BENCH_ITERS) |iter| {
         // Append 10 entries.
         var entries: [10]raft.Entry = undefined;
@@ -405,8 +424,8 @@ test "bench: file_storage_append" {
     const base = "/tmp/raft-bench-fs-append";
 
     // Clean up from prior runs.
-    std.fs.cwd().deleteTree(base) catch {};
-    defer std.fs.cwd().deleteTree(base) catch {};
+    std.Io.Dir.cwd().deleteTree(std.Io.Threaded.global_single_threaded.io(), base) catch {};
+    defer std.Io.Dir.cwd().deleteTree(std.Io.Threaded.global_single_threaded.io(), base) catch {};
 
     var store = try raft.FileStorage.init(allocator, base);
     defer store.deinit();
@@ -422,7 +441,7 @@ test "bench: file_storage_append" {
         };
     }
 
-    var timer = std.time.Timer.start() catch @panic("timer");
+    var timer = Timer.start() catch @panic("timer");
     for (0..FS_BENCH_ITERS) |iter| {
         const base_idx = @as(u64, @intCast(iter)) * 64 + 1;
         for (&entries, 0..) |*e, i| {
@@ -445,8 +464,8 @@ test "bench: file_storage_read" {
     const base = "/tmp/raft-bench-fs-read";
 
     // Clean up from prior runs.
-    std.fs.cwd().deleteTree(base) catch {};
-    defer std.fs.cwd().deleteTree(base) catch {};
+    std.Io.Dir.cwd().deleteTree(std.Io.Threaded.global_single_threaded.io(), base) catch {};
+    defer std.Io.Dir.cwd().deleteTree(std.Io.Threaded.global_single_threaded.io(), base) catch {};
 
     var store = try raft.FileStorage.init(allocator, base);
     defer store.deinit();
@@ -463,7 +482,7 @@ test "bench: file_storage_read" {
     }
     try store.appendEntriesImpl(&entries);
 
-    var timer = std.time.Timer.start() catch @panic("timer");
+    var timer = Timer.start() catch @panic("timer");
     for (0..FS_BENCH_ITERS) |_| {
         // Read a 100-entry range from the middle of the WAL.
         const result = try store.entriesImpl(400, 500);
@@ -490,8 +509,8 @@ test "bench: file_storage_compact" {
     const COMPACT_ITERS: u64 = 200;
 
     // Clean up from prior runs.
-    std.fs.cwd().deleteTree(base) catch {};
-    defer std.fs.cwd().deleteTree(base) catch {};
+    std.Io.Dir.cwd().deleteTree(std.Io.Threaded.global_single_threaded.io(), base) catch {};
+    defer std.Io.Dir.cwd().deleteTree(std.Io.Threaded.global_single_threaded.io(), base) catch {};
 
     // PERF-031: Create FileStorage once outside the timing loop. Each
     // iteration populates entries and measures only the compaction step,
@@ -499,7 +518,7 @@ test "bench: file_storage_compact" {
     var store = try raft.FileStorage.init(allocator, base);
     defer store.deinit();
 
-    var timer = std.time.Timer.start() catch @panic("timer");
+    var timer = Timer.start() catch @panic("timer");
     for (0..COMPACT_ITERS) |round| {
         // Populate 200 entries starting after the current snapshot index.
         const round_base = @as(u64, @intCast(round)) * 200 + 1;

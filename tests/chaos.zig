@@ -19,7 +19,7 @@ fn getSeed() u64 {
     const opt_seed: ?u64 = chaos_options.seed;
     return opt_seed orelse blk: {
         var buf: [8]u8 = undefined;
-        std.posix.getrandom(&buf) catch break :blk 0xcafe_beef_dead_c0de;
+        std.Io.Threaded.global_single_threaded.io().random(&buf);
         break :blk std.mem.readInt(u64, &buf, .little);
     };
 }
