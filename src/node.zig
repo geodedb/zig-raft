@@ -13,6 +13,11 @@ const snap = @import("snapshot.zig");
 const rd = @import("ready.zig");
 const stg = @import("storage.zig");
 const trans = @import("transport.zig");
+// Observability seam (otel). Comptime no-op when -Dwith_otel=false; the
+// compiler eliminates every span-related instruction at the call sites
+// below. When the flag is on, each helper forwards to a tracer-bound
+// `otel.api.trace.Span` with `rpc.system="raft"` semantic conventions.
+const observability = @import("observability");
 
 /// Maximum number of peers that can be served from a stack buffer
 /// without heap allocation (PERF-004, QA-006). Covers clusters up to
@@ -712,6 +717,15 @@ pub const RaftNode = struct {
     }
 
     fn startElection(self: *RaftNode, pre_vote: bool) !void {
+        // One span per election fan-out (client-side). The whole
+        // RequestVote broadcast is the unit of work. `target=0` is the
+        // broadcast sentinel (Raft node IDs start at 1, so 0 cannot
+        // collide with a real peer ID — see Config.validate's
+        // InvalidId rejection of id == 0). Telemetry is non-fatal.
+        var __obs_span = observability.startRpcClientSpan("RequestVote", 0);
+        defer __obs_span.end(null);
+        errdefer observability.endRpcClientSpan(__obs_span, false, -1);
+
         if (pre_vote) {
             self.is_pre_vote_election = true;
             // Don't increment term or set voted_for for pre-vote.
@@ -758,10 +772,20 @@ pub const RaftNode = struct {
         for (peers) |peer| {
             self.sendMsg(peer, msg);
         }
+        observability.endRpcClientSpan(__obs_span, true, 0);
     }
 
     fn handleRequestVote(self: *RaftNode, from: u64, msg: rpc.RequestVote) !void {
-        _ = from;
+        // One span per inbound RequestVote (server-side). The whole RPC
+        // is the unit of work — sub-helpers (sendMsg, log lookups) are
+        // not separately spanned. Telemetry is non-fatal: any failure
+        // inside the seam is `catch {}`-discarded; consensus continues.
+        // The deferred `end(null)` always runs; the trailing
+        // `endRpcServerSpan(true, 0)` annotates the success status. On
+        // error returns the `errdefer` annotates the failure status.
+        var __obs_span = observability.startRpcServerSpan("RequestVote", from);
+        defer __obs_span.end(null);
+        errdefer observability.endRpcServerSpan(__obs_span, false, -1);
 
         // Reject messages from node ID 0 — invalid sender (SEC-0135).
         if (msg.candidate_id == 0) return;
@@ -832,6 +856,7 @@ pub const RaftNode = struct {
             .pre_vote = msg.pre_vote,
         } };
         self.sendMsg(msg.candidate_id, response);
+        observability.endRpcServerSpan(__obs_span, true, 0);
     }
 
     fn handleRequestVoteResponse(self: *RaftNode, from: u64, msg: rpc.RequestVoteResponse) !void {
@@ -869,7 +894,13 @@ pub const RaftNode = struct {
     }
 
     fn handleAppendEntries(self: *RaftNode, from: u64, msg: rpc.AppendEntries) !void {
-        _ = from;
+        // One span per inbound AppendEntries batch (server-side). Per
+        // the Raft paper, the whole batch is one logical replication
+        // operation — we do NOT span individual log entries (would be
+        // too high-volume). Telemetry is non-fatal.
+        var __obs_span = observability.startRpcServerSpan("AppendEntries", from);
+        defer __obs_span.end(null);
+        errdefer observability.endRpcServerSpan(__obs_span, false, -1);
 
         // Reject messages from node ID 0 — invalid sender (SEC-0146).
         if (msg.leader_id == 0) return;
@@ -898,6 +929,7 @@ pub const RaftNode = struct {
 
         // Phase 3: Log consistency check and entry application.
         try self.applyAppendEntries(msg);
+        observability.endRpcServerSpan(__obs_span, true, 0);
     }
 
     /// Send a rejection AppendEntries response to the given leader (QA-002).
@@ -1039,7 +1071,15 @@ pub const RaftNode = struct {
     }
 
     fn handleInstallSnapshot(self: *RaftNode, from: u64, msg: rpc.InstallSnapshot) !void {
-        _ = from;
+        // One span per inbound InstallSnapshot chunk (server-side).
+        // Snapshot transfer is chunked, so each `handleInstallSnapshot`
+        // call is one chunk — we do NOT try to span the whole multi-RPC
+        // transfer here (the receiver doesn't see the boundaries until
+        // `done=true`). Per-chunk spans give the right granularity for
+        // exporters to correlate via the same trace context.
+        var __obs_span = observability.startRpcServerSpan("InstallSnapshot", from);
+        defer __obs_span.end(null);
+        errdefer observability.endRpcServerSpan(__obs_span, false, -1);
 
         // Reject messages from node ID 0 — invalid sender (SEC-0135).
         if (msg.leader_id == 0) return;
@@ -1103,6 +1143,7 @@ pub const RaftNode = struct {
                 .success = true,
             } });
         }
+        observability.endRpcServerSpan(__obs_span, true, 0);
     }
 
     fn handleInstallSnapshotResponse(self: *RaftNode, from: u64, msg: rpc.InstallSnapshotResponse) !void {
@@ -1138,6 +1179,16 @@ pub const RaftNode = struct {
     /// When `pool` is non-null, AppendEntries payloads for each peer
     /// are constructed in parallel using thread-pool submitBatch/WaitGroup.
     fn sendHeartbeats(self: *RaftNode, pool: ?*tp.ThreadPool) !void {
+        // One span per heartbeat broadcast (client-side). Per the
+        // constraint "Span the entire AppendEntries batch as one
+        // operation", we wrap the full fan-out (parallel + sequential
+        // paths) in a single span rather than emitting one span per
+        // peer — that would be too high-volume at heartbeat cadence.
+        // `target=0` is the broadcast sentinel (Raft IDs start at 1).
+        var __obs_span = observability.startRpcClientSpan("AppendEntries", 0);
+        defer __obs_span.end(null);
+        errdefer observability.endRpcClientSpan(__obs_span, false, -1);
+
         var rs = &(self.replication_state orelse return);
         self.perf_stats.heartbeats_sent += 1;
 
@@ -1246,6 +1297,7 @@ pub const RaftNode = struct {
                 }
             }
         }
+        observability.endRpcClientSpan(__obs_span, true, 0);
     }
 
     /// Input for parallel AppendEntries construction.
