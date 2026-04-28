@@ -146,6 +146,74 @@ raise `Config.queue_capacity` or spread work across more submitters.
 See [`examples/single_node_parallel.zig`](examples/single_node_parallel.zig)
 for a complete runnable demo (`zig build example-parallel`).
 
+## Observability
+
+Raft ships with an OpenTelemetry instrumentation seam that is **off by
+default and zero-cost when off**. Builds with the default flag value
+contain no `otel`/`observability` linked symbols (verified by
+[`otel/scripts/verify-consumer-noop.sh`](https://gitlab.com/devnw/zig/otel)).
+
+### Enabling instrumentation
+
+Compile with `-Dwith_otel=true`:
+
+```bash
+zig build -Dwith_otel=true
+```
+
+When the flag is on, the [otel](https://gitlab.com/devnw/zig/otel)
+dependency is resolved and the seam forwards every span site to
+`otel.api.trace`. When off, every helper in `raft.observability`
+collapses to a comptime-known no-op the optimiser eliminates.
+
+### What gets traced
+
+| Site | Span name | Kind | Notes |
+| --- | --- | --- | --- |
+| `handleAppendEntries` | `raft.AppendEntries` | server | one span per inbound batch (per-entry would be too high-volume) |
+| `handleRequestVote` | `raft.RequestVote` | server | one span per inbound vote request |
+| `handleInstallSnapshot` | `raft.InstallSnapshot` | server | one span per inbound chunk |
+| `sendHeartbeats` | `raft.AppendEntries` | client | one span per heartbeat broadcast (parallel + sequential paths) |
+| `startElection` | `raft.RequestVote` | client | one span per RequestVote fan-out (covers pre-vote + real-vote) |
+
+Span attributes follow the OpenTelemetry RPC semantic conventions:
+`rpc.system="raft"`, `rpc.method="AppendEntries"|...`, plus
+`raft.target_node_id` (client side) or `raft.source_node_id` (server
+side). Telemetry is non-fatal — a failing exporter never propagates
+into Raft consensus.
+
+### Wiring otel into your application
+
+The Raft library is consumer-driven: it does not call init itself. The
+embedding application owns the otel lifecycle. From `main()`:
+
+```zig
+const std = @import("std");
+const raft = @import("raft");
+
+pub fn main() !void {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // `Otel` must be parked at a stable address before publishing
+    // the global tracer pointer — `installGlobals` writes
+    // `&otel.tracer` into `raft.observability.global.tracer`.
+    var otel = try raft.observability_init.Otel.init(allocator, "my-raft-service");
+    defer otel.deinit();
+    otel.installGlobals();
+
+    // ... drive your RaftNode here ...
+}
+```
+
+Configuration follows the standard OpenTelemetry environment
+variables: `OTEL_SERVICE_NAME`, `OTEL_EXPORTER_OTLP_ENDPOINT`,
+`OTEL_TRACES_SAMPLER`, etc. The default exporter is OTLP/HTTP to
+`http://localhost:4318` with a 5% parent-based sampler. See the
+[otel rollout recipe](https://gitlab.com/devnw/zig/otel/-/blob/main/docs/integration/RECIPE.md)
+for the full configuration surface.
+
 ## Requirements
 
 - Zig 0.15.1 or later
