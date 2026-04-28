@@ -96,12 +96,35 @@ pub fn build(b: *std.Build) void {
     // `observability` module. When `with_otel == false`, this block does
     // not run and `b.lazyDependency` is never called — so the package
     // manager skips fetching `.otel` from build.zig.zon entirely.
+    //
+    // We capture the optional bootstrap module so subsequent `addTest`
+    // sites that compile `src/root.zig` as their own root (unit tests,
+    // bench module, check step) can attach the same import. Gating the
+    // attach on `observability_init_mod != null` means flag-off builds
+    // never reference the otel namespace from any module.
+    var observability_init_mod_opt: ?*std.Build.Module = null;
     if (with_otel) {
         const otel_dep = b.lazyDependency("otel", .{
             .target = target,
             .optimize = optimize,
         }) orelse return;
-        observability_mod.addImport("otel", otel_dep.module("otel"));
+        const otel_module = otel_dep.module("otel");
+        observability_mod.addImport("otel", otel_module);
+
+        // Bootstrap helper. Only registered when `-Dwith_otel=true` so
+        // the disabled build never compiles otel-touching code. Gated
+        // from src/root.zig via
+        // `if (observability.enabled) @import("observability_init")`.
+        const observability_init_mod = b.addModule("observability_init", .{
+            .root_source_file = b.path("src/observability_init.zig"),
+            .target = target,
+            .imports = &.{
+                .{ .name = "otel", .module = otel_module },
+                .{ .name = "observability", .module = observability_mod },
+            },
+        });
+        module.addImport("observability_init", observability_init_mod);
+        observability_init_mod_opt = observability_init_mod;
     }
 
     const raft_imports: []const Import = &.{
@@ -113,6 +136,13 @@ pub fn build(b: *std.Build) void {
     const unit_tests = b.addTest(.{
         .root_module = addRaftModule(b, b.path("src/root.zig"), target, optimize, raft_lib_imports),
     });
+    // Mirror the `module.addImport("observability_init", ...)` gate so
+    // the unit-test root (which is a separate copy of src/root.zig)
+    // also resolves the optional `@import("observability_init")` when
+    // the flag is on.
+    if (observability_init_mod_opt) |m| {
+        unit_tests.root_module.addImport("observability_init", m);
+    }
     const run_unit_tests = b.addRunArtifact(unit_tests);
     test_step.dependOn(&run_unit_tests.step);
 
@@ -128,6 +158,32 @@ pub fn build(b: *std.Build) void {
     });
     const run_observability_disabled_tests = b.addRunArtifact(observability_disabled_tests);
     test_step.dependOn(&run_observability_disabled_tests.step);
+
+    // Observability enabled-mode smoke test. Skips under
+    // `-Dwith_otel=false`; under `-Dwith_otel=true` it installs an
+    // in-memory recorder, drives one client-side AppendEntries span and
+    // one server-side RequestVote span via the raft seam, and asserts
+    // both land in the recorder with span name "raft.{method}".
+    const observability_enabled_tests = b.addTest(.{
+        .root_module = addRaftModule(b, b.path("tests/observability_enabled_test.zig"), target, optimize, &.{
+            .{ .name = "raft", .module = module },
+            .{ .name = "build_options", .module = build_options_mod },
+        }),
+    });
+    if (with_otel) {
+        // Re-resolve the otel module under the same `with_otel` guard
+        // so the test root sees the same module instance the seam
+        // imports. The earlier `lazyDependency` call wired `otel` into
+        // `observability_mod`; the test root needs `otel` directly so
+        // it can construct the in-memory recorder.
+        const otel_dep = b.lazyDependency("otel", .{
+            .target = target,
+            .optimize = optimize,
+        }) orelse return;
+        observability_enabled_tests.root_module.addImport("otel", otel_dep.module("otel"));
+    }
+    const run_observability_enabled_tests = b.addRunArtifact(observability_enabled_tests);
+    test_step.dependOn(&run_observability_enabled_tests.step);
 
     // Test harness module (shared by integration and chaos tests)
     const harness_module = addRaftModule(b, b.path("tests/harness.zig"), target, optimize, raft_imports);
@@ -224,6 +280,12 @@ pub fn build(b: *std.Build) void {
             .{ .name = "build_options", .module = build_options_mod },
         },
     });
+    // Match the named "raft" module's optional `observability_init` so
+    // src/root.zig resolves under -Dwith_otel=true even when consumed
+    // through the bench module.
+    if (observability_init_mod_opt) |m| {
+        bench_raft_module.addImport("observability_init", m);
+    }
 
     const bench_step = b.step("bench", "Run benchmarks");
     const bench_tests = b.addTest(.{
@@ -301,5 +363,8 @@ pub fn build(b: *std.Build) void {
     const check = b.addTest(.{
         .root_module = addRaftModule(b, b.path("src/root.zig"), target, optimize, raft_lib_imports),
     });
+    if (observability_init_mod_opt) |m| {
+        check.root_module.addImport("observability_init", m);
+    }
     check_step.dependOn(&check.step);
 }

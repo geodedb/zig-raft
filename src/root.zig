@@ -33,6 +33,17 @@ pub const node = @import("node.zig");
 // trip Zig's "file exists in modules X and Y" error).
 pub const observability = @import("observability");
 
+/// Bootstrap helper: builds OTEL TracerProvider/MeterProvider/LoggerProvider
+/// from OTEL_* env vars and publishes Tracer/Meter handles to
+/// `observability.global`. Application entry-point code calls
+/// `raft.observability_init.Otel.init` then `installGlobals()` to publish
+/// providers; when `-Dwith_otel=false` this collapses to an empty
+/// struct so the import never resolves the otel namespace.
+pub const observability_init = if (observability.enabled)
+    @import("observability_init")
+else
+    struct {};
+
 // Top-level convenience re-exports
 pub const RaftNode = node.RaftNode;
 pub const Config = node.Config;
