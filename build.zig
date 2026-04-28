@@ -28,6 +28,39 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // -Dwith_otel: compile in otel instrumentation. OFF by default;
+    // when off the otel dependency is never resolved and the seam
+    // collapses to a comptime-known no-op (verified by
+    // otel/scripts/verify-consumer-noop.sh).
+    const with_otel = b.option(
+        bool,
+        "with_otel",
+        "Compile in otel instrumentation (off by default; zero overhead when off)",
+    ) orelse false;
+
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "with_otel", with_otel);
+    // Materialize ONE shared `build_options` module. Each consumer module
+    // imports the SAME module instance via `addImport` to avoid Zig's
+    // "file exists in modules X and X0" error when two independent
+    // `addOptions` modules end up sharing a transitive file path.
+    const build_options_mod = build_options.createModule();
+
+    // Observability seam (otel). Declared as a SHARED NAMED MODULE so
+    // every consumer (lib, tests, examples) resolves to the same source
+    // file via `@import("observability")`. The seam's `enabled` flag
+    // tracks `build_options.with_otel`; when off, every helper compiles
+    // to a comptime-known no-op and the otel dependency is never
+    // resolved. The optional `otel` import is wired below inside the
+    // `if (with_otel)` block.
+    const observability_mod = b.addModule("observability", .{
+        .root_source_file = b.path("src/observability.zig"),
+        .target = target,
+        .imports = &.{
+            .{ .name = "build_options", .module = build_options_mod },
+        },
+    });
+
     // Thread-pool dependency
     const tp_dep = b.dependency("thread_pool", .{
         .target = target,
@@ -46,6 +79,8 @@ pub fn build(b: *std.Build) void {
     const raft_lib_imports: []const Import = &.{
         .{ .name = "thread_pool", .module = tp_module },
         .{ .name = "wal", .module = wal_module },
+        .{ .name = "observability", .module = observability_mod },
+        .{ .name = "build_options", .module = build_options_mod },
     };
 
     // Main library module
@@ -56,6 +91,18 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
         .imports = raft_lib_imports,
     });
+
+    // Conditionally wire the otel dependency into the shared
+    // `observability` module. When `with_otel == false`, this block does
+    // not run and `b.lazyDependency` is never called — so the package
+    // manager skips fetching `.otel` from build.zig.zon entirely.
+    if (with_otel) {
+        const otel_dep = b.lazyDependency("otel", .{
+            .target = target,
+            .optimize = optimize,
+        }) orelse return;
+        observability_mod.addImport("otel", otel_dep.module("otel"));
+    }
 
     const raft_imports: []const Import = &.{
         .{ .name = "raft", .module = module },
@@ -68,6 +115,19 @@ pub fn build(b: *std.Build) void {
     });
     const run_unit_tests = b.addRunArtifact(unit_tests);
     test_step.dependOn(&run_unit_tests.step);
+
+    // Observability disabled-mode no-op tests. Verifies
+    // `build_options.with_otel == false` (the default) and that the
+    // seam helpers compile to comptime no-ops with stable signatures.
+    // Under `-Dwith_otel=true` these tests skip rather than misreport.
+    const observability_disabled_tests = b.addTest(.{
+        .root_module = addRaftModule(b, b.path("tests/observability_disabled_test.zig"), target, optimize, &.{
+            .{ .name = "raft", .module = module },
+            .{ .name = "build_options", .module = build_options_mod },
+        }),
+    });
+    const run_observability_disabled_tests = b.addRunArtifact(observability_disabled_tests);
+    test_step.dependOn(&run_observability_disabled_tests.step);
 
     // Test harness module (shared by integration and chaos tests)
     const harness_module = addRaftModule(b, b.path("tests/harness.zig"), target, optimize, raft_imports);
@@ -157,6 +217,11 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "thread_pool", .module = bench_tp_dep.module("thread_pool") },
             .{ .name = "wal", .module = bench_wal_dep.module("wal") },
+            // root.zig imports the named "observability" module, so the
+            // bench module needs the same name in scope. The seam is a
+            // comptime no-op when -Dwith_otel=false (default for benches).
+            .{ .name = "observability", .module = observability_mod },
+            .{ .name = "build_options", .module = build_options_mod },
         },
     });
 

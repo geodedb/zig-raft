@@ -12,6 +12,15 @@
             .url = "git+https://gitlab.com/devnw/zig/wal.git#6e0a640692e6fc9d7e56e04a3854798f758ad133",
             .hash = "wal-0.1.0-EqPqpnXcAwALKsyB25l-luqNQOgYfrI_avthpcSxQtDQ",
         },
+        // Gated otel dependency — only fetched when `-Dwith_otel=true`
+        // because `b.lazyDependency("otel", ...)` is called only inside
+        // the `if (with_otel)` block in build.zig. When the flag is off,
+        // the package manager never resolves this entry.
+        .otel = .{
+            .url = "git+https://gitlab.com/devnw/zig/otel#20078af231c069d88eaeb79dcf950b94366be624",
+            .hash = "otel-0.1.0-B0v3lsl9MwCHrG8GDrxdFebugqjybfr4KAiplOJKCRG7",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",

@@ -25,6 +25,14 @@ pub const snapshot_mod = @import("snapshot.zig");
 pub const ready = @import("ready.zig");
 pub const node = @import("node.zig");
 
+// Observability seam (otel). Surfaced via the public root so consumers
+// (tests, downstream apps) can import as `raft.observability`. The seam
+// itself is the named module declared in build.zig — re-exporting it
+// here keeps a single source of truth (no duplicate
+// `@import("observability.zig")` from multiple modules, which would
+// trip Zig's "file exists in modules X and Y" error).
+pub const observability = @import("observability");
+
 // Top-level convenience re-exports
 pub const RaftNode = node.RaftNode;
 pub const Config = node.Config;
