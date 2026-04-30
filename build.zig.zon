@@ -5,12 +5,12 @@
     .minimum_zig_version = "0.15.1",
     .dependencies = .{
         .thread_pool = .{
-            .url = "git+https://gitlab.com/devnw/zig/thread-pool.git#1674ebbeb0eed7107e6e488cc9fd7b97a8036966",
-            .hash = "thread_pool-0.2.1-11B1BqycdgAPt02YXm95pvBtazxHeJlzMBIUHZ0yTzSa",
+            .url = "git+https://gitlab.com/devnw/zig/thread-pool.git#7fb7501563b447bec3ef253be14d9f8d8f0443ef",
+            .hash = "thread_pool-0.2.1-11B1BoLIdgChPpTBcutApyan1-i28GNwa8xB1ojizPL0",
         },
         .wal = .{
-            .url = "git+https://gitlab.com/devnw/zig/wal.git#09cd440d11e0739ab7e3998fa609833a40df9b47",
-            .hash = "wal-0.1.0-EqPqpjs7BAB-dsQiJttXHtTuWcMaR8qSsUXfsoSKqCWu",
+            .url = "git+https://gitlab.com/devnw/zig/wal.git#6806da219cb1fff5f91eec1fec439e79bf85b780",
+            .hash = "wal-0.1.0-EqPqps1ABAAXOpV3tZaTDM-C7jFDNzuxGU36b_G8i3uE",
         },
         // Gated otel dependency — only fetched when `-Dwith_otel=true`
         // because `b.lazyDependency("otel", ...)` is called only inside
