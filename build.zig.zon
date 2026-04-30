@@ -9,16 +9,16 @@
             .hash = "thread_pool-0.2.1-11B1BsqSdgCqx_EsSPzdPqfGhNFzonijUGYfDuy0fpTb",
         },
         .wal = .{
-            .url = "git+https://gitlab.com/devnw/zig/wal.git#f915877361de90fad2f75774cb56ef2c7f8b64f9",
-            .hash = "wal-0.1.0-EqPqptFABACqWaABEz3lU-Ey6IvaR_chyfvYt82bBHL-",
+            .url = "git+https://gitlab.com/devnw/zig/wal.git#ad232c504a1b8242987c91731d69ff0ab3287b68",
+            .hash = "wal-0.1.0-EqPqptFABACCQSE-ag9MWKAw6-QaM6DfXorUSb4icbkj",
         },
         // Gated otel dependency — only fetched when `-Dwith_otel=true`
         // because `b.lazyDependency("otel", ...)` is called only inside
         // the `if (with_otel)` block in build.zig. When the flag is off,
         // the package manager never resolves this entry.
         .otel = .{
-            .url = "git+https://gitlab.com/devnw/zig/otel.git#57ef1f221930e5fd85e50297588c253e04361733",
-            .hash = "otel-0.1.0-B0v3lrgNNAA5vn53MsLSUUunxIAdI88cPgcgpgg5JMKr",
+            .url = "git+https://gitlab.com/devnw/zig/otel.git#7deab7fa53ff47f3e01b934ea01a139bcfed0c72",
+            .hash = "otel-0.1.0-B0v3lrgNNABguHBo8K_wuApcbbDJzyV0iUu2U0E4tLao",
             .lazy = true,
         },
     },
