@@ -9,8 +9,8 @@
             .hash = "thread_pool-0.2.4-11B1BnyUdgCUNlqgBwHNvE4plLwP1s1MAyCjODPafrpo",
         },
         .wal = .{
-            .url = "git+https://gitlab.com/devnw/zig/wal.git#b4ffad0c94a06619546809d3155247fe4e4d8c50",
-            .hash = "wal-0.1.3-EqPqpkhCBADHCNIneUwjeqNLao3nMyiNnQijkxp-Zjqn",
+            .url = "git+https://gitlab.com/devnw/zig/wal.git#d1202c9b734aed33c33aa3df0bb9a065b4712410",
+            .hash = "wal-0.1.3-EqPqpkhCBAD5DE5jgdTjNB6PP2XrHgD706-XW2N6W0yX",
         },
         // Gated otel dependency — only fetched when `-Dwith_otel=true`
         // because `b.lazyDependency("otel", ...)` is called only inside
