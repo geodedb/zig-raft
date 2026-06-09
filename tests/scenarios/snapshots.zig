@@ -432,3 +432,291 @@ test "scenario: chunked_snapshot_transfer" {
 
     try checkInvariants(allocator, &net);
 }
+
+// ---------------------------------------------------------------------------
+// 7. Leader AUTO-drives InstallSnapshot to a compacted laggard (REGRESSION)
+// ---------------------------------------------------------------------------
+//
+// Regression for the "replication driver never auto-drives InstallSnapshot"
+// bug: `buildAppendEntries` returns null on StorageError.Compacted
+// (src/replication.zig:94-97 and :122-125), and all three driver call sites
+// in src/node.zig mishandle that null — the two sendHeartbeats paths fall
+// through to `emptyHeartbeat` and the handleAppendEntriesResponse rejection
+// branch silently does nothing. `buildInstallSnapshotMessages`
+// (src/snapshot.zig) is never called by library code, so a peer whose needed
+// entries were compacted NEVER catches up.
+//
+// Unlike `snapshot_catches_up_laggard` (test 5 above), this test performs NO
+// manual buildInstallSnapshotMessages / step delivery. It heals the partition
+// and then only `net.tickAll()`s in a bounded loop, asserting the library
+// itself drives the catch-up. This MUST fail at HEAD (laggard stays behind,
+// snapshots_installed == 0) and pass once the driver escalates to
+// InstallSnapshot automatically.
+test "scenario: leader auto-sends InstallSnapshot to compacted laggard" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var net = try harness.Network.init(allocator, 3);
+    defer net.deinit();
+
+    const leader_id = try net.waitForLeader(50);
+    const leader = net.nodes.get(leader_id).?;
+
+    // Commit an initial batch fully replicated to all three nodes.
+    var i: u32 = 0;
+    while (i < 3) : (i += 1) {
+        try net.propose("pre-snapshot");
+    }
+    try net.waitForCommit(leader.log.lastIndex(), 50);
+
+    // Pick a follower to partition (the "laggard").
+    var laggard_id: u64 = 0;
+    for (net.node_ids.items) |id| {
+        if (id != leader_id) {
+            laggard_id = id;
+            break;
+        }
+    }
+    const laggard = net.nodes.get(laggard_id).?;
+
+    // Record where the laggard is before it falls behind.
+    const laggard_applied_before = laggard.log.applied;
+
+    // Partition the laggard from every other node.
+    for (net.node_ids.items) |id| {
+        if (id != laggard_id) {
+            try net.partition(laggard_id, id);
+        }
+    }
+
+    // Commit ~8 more entries on the surviving quorum (leader + 1 follower).
+    i = 0;
+    while (i < 8) : (i += 1) {
+        try net.propose("post-partition");
+    }
+    try net.waitForCommit(leader.log.lastIndex(), 50);
+
+    // Snapshot + compact the leader's log past the laggard's next_index, so
+    // the laggard can no longer be caught up via AppendEntries.
+    try leader.reportSnapshot("auto-laggard-snapshot-data");
+    try leader.advance();
+    try std.testing.expect(leader.log.snapshot_index > laggard_applied_before);
+
+    const leader_applied = leader.log.applied;
+    try std.testing.expect(leader_applied > laggard_applied_before);
+
+    // Heal the partition and let the cluster converge with ONLY tickAll —
+    // no manual snapshot construction or delivery. The library must drive
+    // InstallSnapshot on its own.
+    for (net.node_ids.items) |id| {
+        if (id != laggard_id) {
+            net.heal(laggard_id, id);
+        }
+    }
+
+    var rounds: u32 = 0;
+    const max_rounds: u32 = 200;
+    while (rounds < max_rounds) : (rounds += 1) {
+        try net.tickAll();
+        // Early exit once the laggard has caught up to the leader.
+        if (laggard.log.applied >= leader.log.applied and
+            laggard.stats().snapshots_installed > 0)
+        {
+            break;
+        }
+    }
+
+    // The laggard must have installed a snapshot (proving the leader
+    // auto-drove InstallSnapshot) and caught up to the leader's applied index.
+    try std.testing.expect(laggard.stats().snapshots_installed > 0);
+    try std.testing.expectEqual(leader.log.applied, laggard.log.applied);
+
+    try checkInvariants(allocator, &net);
+}
+
+// ---------------------------------------------------------------------------
+// 8. Driver escalation signal: outbox carries InstallSnapshot, not an empty
+//    AppendEntries heartbeat, once the peer needs a compacted snapshot.
+// ---------------------------------------------------------------------------
+//
+// Unit-level observable assertion of the same bug at the message-traffic
+// layer. After the leader compacts past the laggard's next_index, a single
+// leader heartbeat tick must enqueue an `install_snapshot` message addressed
+// to the laggard. At HEAD the driver enqueues an empty `append_entries`
+// heartbeat instead (the `emptyHeartbeat` fallback), so no install_snapshot
+// message is ever produced. This test inspects the harness message queue
+// directly (it compiles at HEAD; only the assertion fails).
+test "scenario: compacted laggard heartbeat enqueues install_snapshot not empty append_entries" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var net = try harness.Network.init(allocator, 3);
+    defer net.deinit();
+
+    const leader_id = try net.waitForLeader(50);
+    const leader = net.nodes.get(leader_id).?;
+
+    // Commit an initial batch fully replicated to all three nodes.
+    var i: u32 = 0;
+    while (i < 3) : (i += 1) {
+        try net.propose("pre-snapshot");
+    }
+    try net.waitForCommit(leader.log.lastIndex(), 50);
+
+    // Pick a follower to partition (the "laggard").
+    var laggard_id: u64 = 0;
+    for (net.node_ids.items) |id| {
+        if (id != leader_id) {
+            laggard_id = id;
+            break;
+        }
+    }
+
+    // Partition the laggard.
+    for (net.node_ids.items) |id| {
+        if (id != laggard_id) {
+            try net.partition(laggard_id, id);
+        }
+    }
+
+    // Commit more entries on the surviving quorum, then compact past the
+    // laggard's next_index.
+    i = 0;
+    while (i < 8) : (i += 1) {
+        try net.propose("post-partition");
+    }
+    try net.waitForCommit(leader.log.lastIndex(), 50);
+    try leader.reportSnapshot("escalation-snapshot");
+    try leader.advance();
+
+    // Drain any queued traffic so the next tick's outbox is clean.
+    net.queue.list.clearRetainingCapacity();
+
+    // A single leader heartbeat tick (heartbeat_tick == 1 fires every tick).
+    // This populates the outbox with whatever the driver decides to send the
+    // laggard — at HEAD an empty AppendEntries heartbeat, after the fix an
+    // InstallSnapshot.
+    try leader.tick(null);
+
+    var saw_install_snapshot_to_laggard = false;
+    var saw_empty_append_entries_to_laggard = false;
+    for (net.queue.list.items) |pm| {
+        if (pm.from != leader_id or pm.to != laggard_id) continue;
+        switch (pm.msg) {
+            .install_snapshot => saw_install_snapshot_to_laggard = true,
+            .append_entries => |ae| {
+                if (ae.entries.len == 0) saw_empty_append_entries_to_laggard = true;
+            },
+            else => {},
+        }
+    }
+
+    // The leader must escalate to InstallSnapshot for the compacted laggard,
+    // NOT fall back to an empty heartbeat that can never make it progress.
+    try std.testing.expect(saw_install_snapshot_to_laggard);
+    try std.testing.expect(!saw_empty_append_entries_to_laggard);
+
+    try checkInvariants(allocator, &net);
+}
+
+// ---------------------------------------------------------------------------
+// 9. Re-send throttle / duplicate-ack safety: repeated auto snapshot drive
+//    must not corrupt or regress the laggard, and forward progress continues.
+// ---------------------------------------------------------------------------
+//
+// After auto catch-up, the leader keeps ticking (potentially re-sending
+// snapshots before the in-flight ack lands). `receiveChunk` already rejects
+// StaleSnapshot, so repeated sends must not regress the laggard. We then
+// commit one more entry and assert it replicates to the laggard via normal
+// AppendEntries — proving a late/duplicate InstallSnapshotResponse did not
+// regress next_index and the leader still makes forward progress. This test
+// reuses the auto-drive path, so it also fails at HEAD (the laggard never
+// catches up in the first place).
+test "scenario: auto snapshot re-send does not regress laggard and forward progress continues" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var net = try harness.Network.init(allocator, 3);
+    defer net.deinit();
+
+    const leader_id = try net.waitForLeader(50);
+    const leader = net.nodes.get(leader_id).?;
+
+    var i: u32 = 0;
+    while (i < 3) : (i += 1) {
+        try net.propose("pre-snapshot");
+    }
+    try net.waitForCommit(leader.log.lastIndex(), 50);
+
+    var laggard_id: u64 = 0;
+    for (net.node_ids.items) |id| {
+        if (id != leader_id) {
+            laggard_id = id;
+            break;
+        }
+    }
+    const laggard = net.nodes.get(laggard_id).?;
+
+    for (net.node_ids.items) |id| {
+        if (id != laggard_id) {
+            try net.partition(laggard_id, id);
+        }
+    }
+
+    i = 0;
+    while (i < 8) : (i += 1) {
+        try net.propose("post-partition");
+    }
+    try net.waitForCommit(leader.log.lastIndex(), 50);
+    try leader.reportSnapshot("resend-snapshot");
+    try leader.advance();
+
+    // Heal and let the cluster converge purely via tickAll. Run a generous
+    // number of rounds so repeated snapshot drive / duplicate acks are
+    // exercised even after the first install lands.
+    for (net.node_ids.items) |id| {
+        if (id != laggard_id) {
+            net.heal(laggard_id, id);
+        }
+    }
+
+    var rounds: u32 = 0;
+    while (rounds < 200) : (rounds += 1) {
+        try net.tickAll();
+        if (laggard.log.applied >= leader.log.applied and
+            laggard.stats().snapshots_installed > 0)
+        {
+            break;
+        }
+        // Invariants must hold on EVERY round — repeated snapshot sends must
+        // never corrupt the laggard.
+        try checkInvariants(allocator, &net);
+    }
+
+    // Laggard caught up cleanly via the auto-driven snapshot.
+    try std.testing.expect(laggard.stats().snapshots_installed > 0);
+    try std.testing.expectEqual(leader.log.applied, laggard.log.applied);
+    const caught_up_index = laggard.log.applied;
+
+    // Forward progress: commit one MORE entry. It must reach the laggard via
+    // normal AppendEntries (a late/duplicate InstallSnapshotResponse must not
+    // have regressed the leader's next_index for this peer).
+    try net.propose("after-catchup");
+    const target = leader.log.lastIndex();
+    try std.testing.expect(target > caught_up_index);
+
+    rounds = 0;
+    while (rounds < 100) : (rounds += 1) {
+        try net.tickAll();
+        if (laggard.log.applied >= leader.log.applied) break;
+        try checkInvariants(allocator, &net);
+    }
+
+    try std.testing.expectEqual(leader.log.applied, laggard.log.applied);
+    try std.testing.expect(laggard.log.applied >= target);
+
+    try checkInvariants(allocator, &net);
+}
