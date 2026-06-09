@@ -11,6 +11,25 @@ const node_mod = @import("node.zig");
 pub const PeerProgress = struct {
     next_index: u64,
     match_index: u64,
+    /// Index of the snapshot currently being installed on this peer, or 0 when
+    /// no InstallSnapshot is in flight. Set by the leader when it escalates to
+    /// InstallSnapshot (the peer's needed entries were compacted), and cleared
+    /// when an InstallSnapshotResponse arrives. While non-zero the driver
+    /// throttles re-sends so it does not re-ship the whole snapshot every
+    /// heartbeat (SEC-0144).
+    pending_snapshot_index: u64 = 0,
+    /// Heartbeat rounds elapsed since the in-flight snapshot was (re)sent.
+    /// Used to bound the re-send retry interval while `pending_snapshot_index`
+    /// is non-zero, so a lost InstallSnapshot eventually retries (SEC-0144).
+    pending_snapshot_ticks: u32 = 0,
+
+    /// True when the entries this peer still needs have been compacted away
+    /// (next_index <= snapshot_index), so AppendEntries can never catch it up
+    /// and the leader must escalate to InstallSnapshot (SEC-0144).
+    pub fn needsSnapshot(self: *const PeerProgress, snapshot_index: u64) bool {
+        if (snapshot_index == 0) return false;
+        return self.next_index <= snapshot_index;
+    }
 
     /// After rejection with conflict hints, update next_index for fast backtracking.
     /// Returns true if next_index changed.
@@ -275,6 +294,29 @@ test "PeerProgress.maybeDecrTo backs off next_index using conflict hints" {
     // Never go below 1.
     try std.testing.expect(pp.maybeDecrTo(2, 0, 0));
     try std.testing.expectEqual(@as(u64, 1), pp.next_index);
+}
+
+test "PeerProgress.needsSnapshot detects compaction boundary (SEC-0144)" {
+    // No snapshot taken yet: never needs a snapshot regardless of next_index.
+    var fresh = PeerProgress{ .next_index = 1, .match_index = 0 };
+    try std.testing.expect(!fresh.needsSnapshot(0));
+
+    // next_index strictly above snapshot_index: catchable via AppendEntries.
+    var ahead = PeerProgress{ .next_index = 11, .match_index = 9 };
+    try std.testing.expect(!ahead.needsSnapshot(10));
+
+    // Boundary: next_index == snapshot_index means the entry at next_index is
+    // compacted, so the peer needs a snapshot.
+    var at_boundary = PeerProgress{ .next_index = 10, .match_index = 0 };
+    try std.testing.expect(at_boundary.needsSnapshot(10));
+
+    // next_index below snapshot_index: definitely needs a snapshot.
+    var behind = PeerProgress{ .next_index = 3, .match_index = 0 };
+    try std.testing.expect(behind.needsSnapshot(10));
+
+    // Defaults: in-flight markers start cleared.
+    try std.testing.expectEqual(@as(u64, 0), behind.pending_snapshot_index);
+    try std.testing.expectEqual(@as(u32, 0), behind.pending_snapshot_ticks);
 }
 
 test "ReplicationState.init peers initialized with correct next_index" {

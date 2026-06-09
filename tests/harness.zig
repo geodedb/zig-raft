@@ -71,6 +71,29 @@ const NodeTransport = struct {
                     } };
                 }
             },
+            // Deep-copy InstallSnapshot data + config the same way: the sender
+            // (sendSnapshotTo) frees the loaded snapshot once send() returns, so
+            // the queued slices must own their bytes to survive until delivery.
+            .install_snapshot => |is| {
+                const data_dup = self.queue.allocator.dupe(u8, is.data) catch return;
+                const voters_dup = self.queue.allocator.dupe(u64, is.config.voters) catch return;
+                const outgoing_dup = self.queue.allocator.dupe(u64, is.config.voters_outgoing) catch return;
+                queued_msg = raft.Message{ .install_snapshot = .{
+                    .term = is.term,
+                    .leader_id = is.leader_id,
+                    .last_included_index = is.last_included_index,
+                    .last_included_term = is.last_included_term,
+                    .offset = is.offset,
+                    .data = data_dup,
+                    .done = is.done,
+                    .checksum = is.checksum,
+                    .config = .{
+                        .voters = voters_dup,
+                        .voters_outgoing = outgoing_dup,
+                        .is_joint = is.config.is_joint,
+                    },
+                } };
+            },
             else => {},
         }
         self.queue.append(.{ .from = self.node_id, .to = to, .msg = queued_msg });

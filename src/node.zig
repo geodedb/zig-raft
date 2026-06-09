@@ -24,6 +24,12 @@ const observability = @import("observability");
 /// 16 voters which is well beyond practical Raft deployments (3-7).
 pub const MAX_STACK_PEERS: usize = 16;
 
+/// Heartbeat rounds to wait before re-sending an in-flight InstallSnapshot to a
+/// peer that has not yet acknowledged it. Bounds wasted bandwidth on the common
+/// case (ack arrives within a round or two) while still recovering from a lost
+/// snapshot or a follower that acked then crashed (SEC-0144).
+pub const SNAPSHOT_RESEND_TICKS: u32 = 8;
+
 pub const ConfigError = error{
     InvalidId,
     InvalidElectionTick,
@@ -92,6 +98,9 @@ pub const Stats = struct {
     heartbeat_partial_submits: u64 = 0,
     /// Number of snapshots installed (follower receiving from leader).
     snapshots_installed: u64 = 0,
+    /// Number of InstallSnapshot transfers initiated (leader auto-driving a
+    /// compacted laggard). Counts transfers, not individual chunks (SEC-0144).
+    snapshots_sent: u64 = 0,
     /// Number of ticks processed.
     ticks: u64 = 0,
     /// Number of messages stepped (RPC messages processed via step()).
@@ -539,6 +548,19 @@ pub const RaftNode = struct {
     /// network in parallel with disk I/O completion (PERF-006).
     pub fn advancePersist(self: *RaftNode) !void {
         const hs = self.currentHardState();
+
+        // Persist a follower-installed snapshot to durable storage BEFORE any
+        // entries, so the backing store's snapshot_index matches the in-memory
+        // RaftLog that handleInstallSnapshot already restored. Without this the
+        // store keeps stale pre-snapshot entries and later AppendEntries land at
+        // the wrong offset, desyncing lastIndex() from term()/entries()
+        // (SEC-0144). The leader-initiated path persists in reportSnapshot();
+        // this is the follower-side analogue. saveSnapshot advances the store's
+        // snapshot_index so the subsequent appendEntries truncates the stale
+        // tail correctly.
+        if (self.ready_state.pending_snapshot) |pending_snap| {
+            try self.storage.saveSnapshot(pending_snap);
+        }
 
         // Persist hard state if changed.
         if (!hs.eql(self.ready_state.prev_hard_state)) {
@@ -1065,6 +1087,13 @@ pub const RaftNode = struct {
                     self.sendMsg(from, m);
                     // Free the entries slice allocated by buildAppendEntries (SEC-0140).
                     self.freeAppendEntriesPayload(m);
+                } else {
+                    // The backed-off next_index now points into the compacted
+                    // region — the peer can only catch up via InstallSnapshot.
+                    // This also re-triggers the snapshot if a follower acked a
+                    // prior snapshot then crashed and lost it: its next rejection
+                    // lands here (SEC-0144).
+                    self.escalateOrHeartbeat(rs, from);
                 }
             }
         }
@@ -1170,8 +1199,21 @@ pub const RaftNode = struct {
             // Use log.snapshot_index (persisted) rather than
             // snapshot_state.snapshot_index which may have advanced since
             // the snapshot was sent (SEC-0113).
+            //
+            // maybeUpdate is forward-only, so a late/duplicate ack can never
+            // regress next_index (SEC-0113); clearing pending lets the driver
+            // resume normal AppendEntries replication for forward progress.
             _ = progress.maybeUpdate(self.log.snapshot_index);
+            progress.pending_snapshot_index = 0;
+            progress.pending_snapshot_ticks = 0;
             self.maybeCommit();
+        } else {
+            // Snapshot rejected (e.g. stale/validation failure on the follower).
+            // Clear the in-flight marker so the driver can re-escalate on the
+            // next heartbeat round rather than waiting out the retry interval
+            // against a snapshot the follower refused (SEC-0144).
+            progress.pending_snapshot_index = 0;
+            progress.pending_snapshot_ticks = 0;
         }
     }
 
@@ -1265,14 +1307,17 @@ pub const RaftNode = struct {
             }
             wg.wait();
 
-            // Send results.
+            // Send results. The parallel path only BUILDS AppendEntries on the
+            // pool (parallelBuildAE is snapshot-free); snapshot escalation runs
+            // here, sequentially on the main thread, since snapshots are rare
+            // and must not be fanned across the pool (SEC-0144).
             for (peers, 0..) |peer, i| {
                 if (results[i]) |m| {
                     self.sendMsg(peer, m);
                     // Free the entries slice allocated by buildAppendEntries (SEC-0140).
                     self.freeAppendEntriesPayload(m);
                 } else {
-                    self.sendMsg(peer, emptyHeartbeat(self.current_term, self.id, self.log.committed));
+                    self.escalateOrHeartbeat(rs, peer);
                 }
             }
         } else {
@@ -1293,7 +1338,10 @@ pub const RaftNode = struct {
                     // Free the entries slice allocated by buildAppendEntries (SEC-0140).
                     self.freeAppendEntriesPayload(m);
                 } else {
-                    self.sendMsg(peer, emptyHeartbeat(self.current_term, self.id, self.log.committed));
+                    // null means either a compaction gap (escalate to
+                    // InstallSnapshot) or a transient build error (heartbeat) —
+                    // escalateOrHeartbeat disambiguates (SEC-0144).
+                    self.escalateOrHeartbeat(rs, peer);
                 }
             }
         }
@@ -1326,6 +1374,82 @@ pub const RaftNode = struct {
             input.max_entries_per_msg,
             input.max_bytes_per_msg,
         ) catch null;
+    }
+
+    /// Decide what to send a peer when `buildAppendEntries` yielded null.
+    ///
+    /// `buildAppendEntries` returns null in two distinct cases:
+    ///   1. The peer's needed entries were compacted (next_index <=
+    ///      snapshot_index) — it can only be caught up via InstallSnapshot.
+    ///   2. A transient build error (e.g. OOM) — treat as a heartbeat round.
+    ///
+    /// Only case (1) escalates. We disambiguate via `needsSnapshot` rather than
+    /// blindly snapshotting on every null, so a genuine empty heartbeat is never
+    /// promoted to a full snapshot (SEC-0144).
+    ///
+    /// Throttle: while a snapshot is in flight (`pending_snapshot_index != 0`)
+    /// we send an empty heartbeat to maintain leadership and only re-ship the
+    /// snapshot after `SNAPSHOT_RESEND_TICKS` rounds, so a single laggard does
+    /// not cause the whole snapshot to be re-sent every heartbeat (SEC-0144).
+    fn escalateOrHeartbeat(self: *RaftNode, rs: *repl.ReplicationState, peer: u64) void {
+        const progress = rs.peers.getPtr(peer) orelse {
+            self.sendMsg(peer, emptyHeartbeat(self.current_term, self.id, self.log.committed));
+            return;
+        };
+
+        // Not a compaction gap — the null came from a transient build error.
+        // Keep the peer alive with an empty heartbeat; the next round retries
+        // the normal AppendEntries path.
+        if (!progress.needsSnapshot(self.log.snapshot_index)) {
+            self.sendMsg(peer, emptyHeartbeat(self.current_term, self.id, self.log.committed));
+            return;
+        }
+
+        // A snapshot is already in flight — throttle re-sends.
+        if (progress.pending_snapshot_index != 0) {
+            progress.pending_snapshot_ticks +|= 1;
+            if (progress.pending_snapshot_ticks < SNAPSHOT_RESEND_TICKS) {
+                self.sendMsg(peer, emptyHeartbeat(self.current_term, self.id, self.log.committed));
+                return;
+            }
+            // Retry interval elapsed — fall through and re-send the snapshot.
+        }
+
+        self.sendSnapshotTo(peer, progress) catch {
+            // No persisted snapshot available (or load/build failure): keep the
+            // peer alive with a heartbeat. The compaction gap persists, so the
+            // next round re-attempts escalation (SEC-0144 edge case).
+            self.sendMsg(peer, emptyHeartbeat(self.current_term, self.id, self.log.committed));
+        };
+    }
+
+    /// Load the leader's persisted snapshot and ship it to `peer` as a sequence
+    /// of InstallSnapshot chunks, recording the in-flight index on `progress`.
+    ///
+    /// The snapshot is loaded from durable storage (the authoritative copy that
+    /// also survived restart) and freed before returning — each chunk message
+    /// points into the loaded buffer, so the transport must have copied the
+    /// bytes out by the time `sendMsg` returns, which mirrors the
+    /// `freeAppendEntriesPayload` contract for AppendEntries (SEC-0144).
+    fn sendSnapshotTo(self: *RaftNode, peer: u64, progress: *repl.PeerProgress) !void {
+        const loaded = (try self.storage.loadSnapshot()) orelse return error.NoSnapshot;
+        defer stg.freeSnapshot(self.allocator, loaded);
+
+        const msgs = try self.snapshot_state.buildInstallSnapshotMessages(
+            loaded,
+            self.current_term,
+            self.id,
+            null, // Snapshots are rare; do not fan chunk-build across the pool.
+        );
+        defer self.allocator.free(msgs);
+
+        for (msgs) |m| {
+            self.sendMsg(peer, m);
+        }
+
+        progress.pending_snapshot_index = loaded.metadata.index;
+        progress.pending_snapshot_ticks = 0;
+        self.perf_stats.snapshots_sent += 1;
     }
 
     fn emptyHeartbeat(term: u64, leader_id: u64, leader_commit: u64) rpc.Message {
@@ -1754,4 +1878,189 @@ test "advancePersist then advanceApply produces same result as advance (QA-010)"
     try std.testing.expectEqual(node_a.log.applied, node_b.log.applied);
     try std.testing.expectEqual(node_a.stats().proposals, node_b.stats().proposals);
     try std.testing.expectEqual(node_a.stats().entries_applied, node_b.stats().entries_applied);
+}
+
+// ---------------------------------------------------------------------------
+// Auto-driven InstallSnapshot escalation (SEC-0144)
+// ---------------------------------------------------------------------------
+
+/// Capturing transport for snapshot-escalation tests. Records only the tag and
+/// scalar fields of each message (never the slices), so it is safe to read
+/// after `sendSnapshotTo` frees the loaded snapshot.
+const CapturingTransport = struct {
+    last_to: u64 = 0,
+    install_snapshot_count: u32 = 0,
+    empty_ae_count: u32 = 0,
+    nonempty_ae_count: u32 = 0,
+    last_snapshot_index: u64 = 0,
+
+    const vtable_inst = trans.Transport.VTable{ .send = &sendImpl };
+
+    fn transport(self: *CapturingTransport) trans.Transport {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable_inst };
+    }
+
+    fn sendImpl(ptr: *anyopaque, to: u64, msg: rpc.Message) void {
+        const self: *CapturingTransport = @ptrCast(@alignCast(ptr));
+        self.last_to = to;
+        switch (msg) {
+            .install_snapshot => |is| {
+                self.install_snapshot_count += 1;
+                self.last_snapshot_index = is.last_included_index;
+            },
+            .append_entries => |ae| {
+                if (ae.entries.len == 0) self.empty_ae_count += 1 else self.nonempty_ae_count += 1;
+            },
+            else => {},
+        }
+    }
+};
+
+/// Drive a single-voter leader (id 1, no peers) to leader, commit a few
+/// entries, then snapshot+compact so any peer below the snapshot boundary can
+/// only be caught up via InstallSnapshot. A single voter lets the leader commit
+/// on its own; `peer_id` is injected into replication_state afterwards so the
+/// escalation path has a target without needing a second live node.
+fn makeCompactedLeader(node: *RaftNode, peer_id: u64) !void {
+    var i: u32 = 0;
+    while (i < 20) : (i += 1) {
+        try node.tick(null);
+        if (node.role == .leader) break;
+    }
+    try std.testing.expectEqual(st.Role.leader, node.role);
+
+    // Apply the election noop, then propose + locally commit a few entries.
+    _ = try node.ready();
+    try node.advance();
+
+    var j: u32 = 0;
+    while (j < 4) : (j += 1) {
+        try node.propose("payload");
+    }
+    // Single-voter quorum is just the leader, so committing is immediate on tick.
+    try node.tick(null);
+    _ = try node.ready();
+    try node.advance();
+
+    // Snapshot at the applied index and compact the log past it.
+    try node.reportSnapshot("snap-payload");
+    try node.advance();
+
+    // Inject the laggard peer into replication_state as the snapshot target.
+    var rs = &(node.replication_state.?);
+    try rs.peers.put(peer_id, .{ .next_index = node.log.lastIndex() + 1, .match_index = 0 });
+}
+
+test "escalateOrHeartbeat sends InstallSnapshot for compacted peer and sets pending (SEC-0144)" {
+    var mem_store = stg.InMemoryStorage.init(std.testing.allocator);
+    defer mem_store.deinit();
+
+    var node = try RaftNode.init(std.testing.allocator, .{
+        .id = 1,
+        .peers = &.{},
+        .election_tick = 5,
+        .rng_seed = 42,
+        .pre_vote = false,
+    }, mem_store.storage());
+    defer node.deinit();
+
+    var capture = CapturingTransport{};
+    node.setTransport(capture.transport());
+
+    try makeCompactedLeader(&node, 2);
+    try std.testing.expect(node.log.snapshot_index > 0);
+
+    // Force the peer's next_index into the compacted region.
+    var rs = &(node.replication_state.?);
+    const progress = rs.peers.getPtr(2).?;
+    progress.next_index = node.log.snapshot_index; // <= snapshot_index => needs snapshot.
+    try std.testing.expect(progress.needsSnapshot(node.log.snapshot_index));
+
+    const sent_before = node.stats().snapshots_sent;
+    node.escalateOrHeartbeat(rs, 2);
+
+    // An InstallSnapshot must have been sent, pending set, stat incremented.
+    try std.testing.expectEqual(@as(u32, 1), capture.install_snapshot_count);
+    try std.testing.expectEqual(@as(u32, 0), capture.empty_ae_count);
+    try std.testing.expectEqual(node.log.snapshot_index, progress.pending_snapshot_index);
+    try std.testing.expectEqual(sent_before + 1, node.stats().snapshots_sent);
+}
+
+test "escalateOrHeartbeat throttles re-send while snapshot pending (SEC-0144)" {
+    var mem_store = stg.InMemoryStorage.init(std.testing.allocator);
+    defer mem_store.deinit();
+
+    var node = try RaftNode.init(std.testing.allocator, .{
+        .id = 1,
+        .peers = &.{},
+        .election_tick = 5,
+        .rng_seed = 42,
+        .pre_vote = false,
+    }, mem_store.storage());
+    defer node.deinit();
+
+    var capture = CapturingTransport{};
+    node.setTransport(capture.transport());
+
+    try makeCompactedLeader(&node, 2);
+
+    var rs = &(node.replication_state.?);
+    const progress = rs.peers.getPtr(2).?;
+    progress.next_index = node.log.snapshot_index;
+
+    // First call ships the snapshot.
+    node.escalateOrHeartbeat(rs, 2);
+    try std.testing.expectEqual(@as(u32, 1), capture.install_snapshot_count);
+
+    // Subsequent calls within the retry window send empty heartbeats, NOT a
+    // re-shipped snapshot, until SNAPSHOT_RESEND_TICKS rounds elapse.
+    var r: u32 = 0;
+    while (r < SNAPSHOT_RESEND_TICKS - 1) : (r += 1) {
+        node.escalateOrHeartbeat(rs, 2);
+    }
+    try std.testing.expectEqual(@as(u32, 1), capture.install_snapshot_count);
+    try std.testing.expectEqual(SNAPSHOT_RESEND_TICKS - 1, capture.empty_ae_count);
+
+    // The next call crosses the retry interval and re-ships the snapshot.
+    node.escalateOrHeartbeat(rs, 2);
+    try std.testing.expectEqual(@as(u32, 2), capture.install_snapshot_count);
+}
+
+test "handleInstallSnapshotResponse clears pending on success and failure (SEC-0144)" {
+    var mem_store = stg.InMemoryStorage.init(std.testing.allocator);
+    defer mem_store.deinit();
+
+    var node = try RaftNode.init(std.testing.allocator, .{
+        .id = 1,
+        .peers = &.{},
+        .election_tick = 5,
+        .rng_seed = 42,
+        .pre_vote = false,
+    }, mem_store.storage());
+    defer node.deinit();
+
+    var capture = CapturingTransport{};
+    node.setTransport(capture.transport());
+
+    try makeCompactedLeader(&node, 2);
+
+    var rs = &(node.replication_state.?);
+    const progress = rs.peers.getPtr(2).?;
+    progress.next_index = node.log.snapshot_index;
+    node.escalateOrHeartbeat(rs, 2);
+    try std.testing.expect(progress.pending_snapshot_index != 0);
+
+    // A successful ack advances next_index past the snapshot and clears pending.
+    try node.handleInstallSnapshotResponse(2, .{ .term = node.current_term, .success = true });
+    try std.testing.expectEqual(@as(u64, 0), progress.pending_snapshot_index);
+    try std.testing.expectEqual(@as(u32, 0), progress.pending_snapshot_ticks);
+    try std.testing.expect(progress.next_index > node.log.snapshot_index);
+
+    // Re-arm pending, then a failure ack must also clear it so the driver retries.
+    progress.next_index = node.log.snapshot_index;
+    node.escalateOrHeartbeat(rs, 2);
+    try std.testing.expect(progress.pending_snapshot_index != 0);
+    try node.handleInstallSnapshotResponse(2, .{ .term = node.current_term, .success = false });
+    try std.testing.expectEqual(@as(u64, 0), progress.pending_snapshot_index);
+    try std.testing.expectEqual(@as(u32, 0), progress.pending_snapshot_ticks);
 }
