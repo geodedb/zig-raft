@@ -267,3 +267,96 @@ test "scenario: noop_entry_enables_prior_term_commit" {
     defer std.testing.allocator.free(ptrs);
     try checker.Checker.checkAll(ptrs);
 }
+
+// ---------------------------------------------------------------------------
+// Scenario 7: candidate_demotes_on_quorum_prevote_rejection (RC-B)
+// ---------------------------------------------------------------------------
+//
+// Regression for the k8s pre_vote frozen-term split-vote livelock
+// (docs/bugs/2026-06-04-cluster-raft-no-stable-quorum-writes-time-out.md).
+//
+// etcd's stepCandidate demotes to follower on quorum.VoteLost. Without that,
+// a candidate denied by a quorum stays a candidate (only re-electing on its
+// timer), so a node that lost an election keeps cycling instead of stepping
+// down to grant a competitor's vote — the consensus-layer half of the
+// no-leader all-candidate livelock.
+
+/// Drive a single node into a pre-vote candidacy by ticking it in isolation
+/// until its (randomized) election timeout fires `startElection(pre_vote)`.
+fn driveToPreVoteCandidate(n: *raft.node.RaftNode) !void {
+    var t: u32 = 0;
+    while (t < 200 and n.role != .candidate) : (t += 1) {
+        try n.tick(null);
+    }
+}
+
+test "scenario: candidate_demotes_on_quorum_prevote_rejection" {
+    var net = try harness.Network.init(std.testing.allocator, 3);
+    defer net.deinit();
+
+    const n1 = net.nodes.get(1).?;
+    try driveToPreVoteCandidate(n1);
+
+    try std.testing.expectEqual(raft.Role.candidate, n1.role);
+    try std.testing.expect(n1.is_pre_vote_election);
+    const term_before = n1.current_term;
+
+    // A quorum (nodes 2 and 3) rejects the pre-vote at the same term — no
+    // higher-term signal, so the only thing that can step the candidate down
+    // is the VoteLost path.
+    try n1.step(2, raft.Message{ .request_vote_response = .{
+        .term = term_before,
+        .vote_granted = false,
+        .pre_vote = true,
+    } });
+    try n1.step(3, raft.Message{ .request_vote_response = .{
+        .term = term_before,
+        .vote_granted = false,
+        .pre_vote = true,
+    } });
+
+    // etcd parity: a quorum-denied candidate becomes a follower at the SAME
+    // term (pre-vote never incremented it), resetting its randomized election
+    // timer so it can grant a competitor's vote.
+    try std.testing.expectEqual(raft.Role.follower, n1.role);
+    try std.testing.expectEqual(term_before, n1.current_term);
+    try std.testing.expect(!n1.is_pre_vote_election);
+}
+
+test "scenario: candidate_demotes_on_quorum_realvote_rejection" {
+    var net = try harness.Network.init(std.testing.allocator, 3);
+    defer net.deinit();
+
+    const n1 = net.nodes.get(1).?;
+    try driveToPreVoteCandidate(n1);
+    try std.testing.expectEqual(raft.Role.candidate, n1.role);
+    const prevote_term = n1.current_term;
+
+    // Win the pre-vote (a single grant gives self+1 = 2/3 quorum), promoting
+    // node 1 to a REAL candidate at prevote_term + 1.
+    try n1.step(2, raft.Message{ .request_vote_response = .{
+        .term = prevote_term,
+        .vote_granted = true,
+        .pre_vote = true,
+    } });
+    try std.testing.expectEqual(raft.Role.candidate, n1.role);
+    try std.testing.expect(!n1.is_pre_vote_election);
+    const real_term = n1.current_term;
+    try std.testing.expectEqual(prevote_term + 1, real_term);
+
+    // A quorum now rejects the real election at the same term.
+    try n1.step(2, raft.Message{ .request_vote_response = .{
+        .term = real_term,
+        .vote_granted = false,
+        .pre_vote = false,
+    } });
+    try n1.step(3, raft.Message{ .request_vote_response = .{
+        .term = real_term,
+        .vote_granted = false,
+        .pre_vote = false,
+    } });
+
+    // VoteLost demotion: follower at the same (real) term.
+    try std.testing.expectEqual(raft.Role.follower, n1.role);
+    try std.testing.expectEqual(real_term, n1.current_term);
+}

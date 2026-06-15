@@ -356,10 +356,20 @@ test "chaos: cascade_failures" {
         try runner.tickClean();
     }
 
-    // A leader should exist among nodes 3, 4, 5.
-    const leader = net.getLeader();
-    try std.testing.expect(leader != null);
-    try std.testing.expect(leader.? >= 3);
+    // A leader should exist among the surviving (non-paused) nodes 3, 4, 5.
+    // Look at survivors only rather than net.getLeader(): a paused ex-leader
+    // retains role==.leader because, being crashed, it never receives the
+    // higher-term message that would step it down, so getLeader() (which scans
+    // by id order) can return the stale paused leader even though the survivors
+    // have correctly elected a fresh one.
+    var survivor_leader: ?u64 = null;
+    for (net.node_ids.items) |id| {
+        if (net.paused_nodes.contains(id)) continue;
+        const n = net.nodes.get(id).?;
+        if (n.role == .leader) survivor_leader = id;
+    }
+    try std.testing.expect(survivor_leader != null);
+    try std.testing.expect(survivor_leader.? >= 3);
 
     // Resume crashed nodes and stabilize.
     net.resumeNode(1);

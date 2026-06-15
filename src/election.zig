@@ -113,6 +113,26 @@ pub const ElectionState = struct {
         return self.hasQuorum(voters) and self.hasQuorum(voters_outgoing);
     }
 
+    /// True when a majority of `voters` have REJECTED — the election can no
+    /// longer be won in this voter set. Mirrors `hasQuorum` for the loss side
+    /// (etcd's `quorum.VoteLost`).
+    pub fn hasRejectQuorum(self: *const ElectionState, voters: []const u64) bool {
+        const tally = self.tallyVotes(voters);
+        return tally.rejected > voters.len / 2;
+    }
+
+    /// Joint-config loss: an election is lost the moment EITHER voter set can
+    /// no longer reach a granting majority (a rejecting majority in either
+    /// set). This is the dual of `hasJointQuorum`, which requires a granting
+    /// majority in BOTH sets to win.
+    pub fn hasJointRejectQuorum(self: *const ElectionState, voters: []const u64, voters_outgoing: []const u64) bool {
+        if (voters_outgoing.len == 0) {
+            return self.hasRejectQuorum(voters);
+        }
+
+        return self.hasRejectQuorum(voters) or self.hasRejectQuorum(voters_outgoing);
+    }
+
     pub fn resetVotes(self: *ElectionState) void {
         // Retain capacity to avoid re-allocation on next election (PERF-017).
         self.votes_received.clearRetainingCapacity();
@@ -270,6 +290,57 @@ test "hasJointQuorum both sets independently" {
     try es.recordVote(2, true);
     const empty = [_]u64{};
     try std.testing.expect(es.hasJointQuorum(&voters_new, &empty));
+}
+
+test "hasRejectQuorum majority rejection counting" {
+    const allocator = std.testing.allocator;
+
+    var es = ElectionState.init(allocator, 10, 3, @as(u64, 0));
+    defer es.deinit();
+
+    const voters = [_]u64{ 1, 2, 3 };
+
+    // Self-grant only: not yet lost.
+    try es.recordVote(1, true);
+    try std.testing.expect(!es.hasRejectQuorum(&voters));
+
+    // One rejection (1 of 3): still not a rejecting majority.
+    try es.recordVote(2, false);
+    try std.testing.expect(!es.hasRejectQuorum(&voters));
+
+    // Two rejections (2 of 3): election is lost.
+    try es.recordVote(3, false);
+    try std.testing.expect(es.hasRejectQuorum(&voters));
+    // And it is NOT a granting quorum.
+    try std.testing.expect(!es.hasQuorum(&voters));
+}
+
+test "hasJointRejectQuorum loses if either set rejects by majority" {
+    const allocator = std.testing.allocator;
+
+    var es = ElectionState.init(allocator, 10, 3, @as(u64, 0));
+    defer es.deinit();
+
+    const voters_new = [_]u64{ 1, 2, 3 };
+    const voters_old = [_]u64{ 4, 5, 6 };
+
+    // Rejecting majority in the new set only — still a joint loss.
+    try es.recordVote(1, false);
+    try es.recordVote(2, false);
+    try std.testing.expect(es.hasJointRejectQuorum(&voters_new, &voters_old));
+
+    // Empty outgoing falls back to single-set rejection.
+    es.resetVotes();
+    try es.recordVote(1, false);
+    try es.recordVote(2, false);
+    const empty = [_]u64{};
+    try std.testing.expect(es.hasJointRejectQuorum(&voters_new, &empty));
+
+    // No rejecting majority anywhere — not lost.
+    es.resetVotes();
+    try es.recordVote(1, false);
+    try es.recordVote(4, false);
+    try std.testing.expect(!es.hasJointRejectQuorum(&voters_new, &voters_old));
 }
 
 test "shouldGrantVote grants when log is up-to-date and not voted" {

@@ -912,6 +912,25 @@ pub const RaftNode = struct {
             } else {
                 try self.becomeLeader();
             }
+            return;
+        }
+
+        // VoteLost: a quorum has REJECTED this (pre-)election, so it can never
+        // be won at the current term. Step down to follower immediately rather
+        // than burning the whole election timeout still campaigning (etcd's
+        // `case quorum.VoteLost: r.becomeFollower(r.Term, None)`).
+        //
+        // This is the consensus-layer half of the k8s no-leader all-candidate
+        // livelock fix: a quorum-denied candidate (e.g. a node frozen behind
+        // the cluster under pre-vote) demotes and resets its randomized
+        // election timer, so it can grant a competitor's vote instead of
+        // perpetually self-voting in a split. becomeFollower keeps the current
+        // term (a denied real election does not advance it; pre-vote never
+        // incremented it), so this changes only liveness, never safety
+        // (docs/bugs/2026-06-04-cluster-raft-no-stable-quorum-writes-time-out.md
+        // RC-B).
+        if (self.election_state.hasJointRejectQuorum(cfg.voters, cfg.voters_outgoing)) {
+            self.becomeFollower(self.current_term, null);
         }
     }
 
