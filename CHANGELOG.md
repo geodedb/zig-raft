@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.9]
+
+### Fixed
+
+- **Candidate liveness backstop, part 2 (RC-B it.2): timer-based candidate
+  demotion + backoff.** v0.1.8's `VoteLost` demotion only fires when a *quorum
+  rejects* the candidate. A transport-degraded / isolated candidate — or a
+  pre-vote *mutual-grant* lockstep where peers grant each other's pre-votes so no
+  rejection quorum ever forms — collects neither a winning nor a rejecting
+  quorum and, without a timer, stays a candidate indefinitely (the residual half
+  of the geode k8s no-leader frozen-term state, observed on `v0.6.27-30`). Now,
+  after `Config.candidate_demote_threshold` (default 4) consecutive failed
+  candidate elections, the node steps down to follower and applies a growing,
+  capped, randomized election backoff (`ElectionState.applyElectionBackoff`),
+  desynchronizing lockstep peers so one campaigns ahead and wins. Liveness-only —
+  no term/log change, no safety property affected; `candidate_demote_threshold=0`
+  restores the prior re-elect-forever behaviour. New `Stats.candidate_demotions`.
+  - Regression scenario `stuck candidate demotes to follower after consecutive
+    failed elections` (RED before the fix: an isolated pre-vote candidate never
+    demotes) + `applyElectionBackoff` unit test in `election.zig`.
+
 ## [0.1.8]
 
 ### Fixed

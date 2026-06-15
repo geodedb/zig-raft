@@ -52,6 +52,15 @@ pub const Config = struct {
     snapshot_chunk_size: usize = 64 * 1024,
     snapshot_threshold: u32 = 1000,
     pre_vote: bool = true,
+    /// RC-B it.2: after this many CONSECUTIVE failed candidate elections (no
+    /// win and no higher-term contact — e.g. a transport-degraded candidate, or
+    /// a pre-vote mutual-grant lockstep where peers grant each other's pre-votes
+    /// so no rejection quorum ever forms), the candidate steps down to follower
+    /// and backs off with extra randomized jitter, desynchronizing lockstep
+    /// peers so one can get ahead and win. This is the timer-based complement to
+    /// the quorum-rejection VoteLost demotion. Liveness-only; no safety effect.
+    /// 0 disables it (pre-it.2 behaviour: a candidate re-elects forever).
+    candidate_demote_threshold: u32 = 4,
     rng_seed: ?u64 = null,
 
     pub fn validate(self: Config) ConfigError!void {
@@ -105,6 +114,9 @@ pub const Stats = struct {
     ticks: u64 = 0,
     /// Number of messages stepped (RPC messages processed via step()).
     messages_stepped: u64 = 0,
+    /// Number of times a stuck candidate stepped down to follower via the
+    /// timer-based demotion (RC-B it.2) rather than via a higher-term message.
+    candidate_demotions: u64 = 0,
 };
 
 pub const RaftNode = struct {
@@ -140,6 +152,10 @@ pub const RaftNode = struct {
     peers_stack_buf: [MAX_STACK_PEERS]u64 = undefined,
     /// Observable performance counters (PERF-020).
     perf_stats: Stats = .{},
+    /// RC-B it.2: consecutive failed candidate elections (no win, no higher-term
+    /// contact). Reset on becomeLeader/becomeFollower; drives the timer-based
+    /// candidate demotion in tick(). See Config.candidate_demote_threshold.
+    consecutive_election_failures: u32 = 0,
 
     // -----------------------------------------------------------------------
     // Public API
@@ -496,6 +512,26 @@ pub const RaftNode = struct {
         } else {
             self.election_state.tickElection();
             if (self.election_state.electionTimeoutElapsed()) {
+                // RC-B it.2: a candidate whose election just timed out made no
+                // progress this round (no win → would still be a candidate; a
+                // win or a higher-term message resets the counter via
+                // becomeLeader/becomeFollower). After `candidate_demote_threshold`
+                // consecutive such failures, step down to follower and back off
+                // instead of re-campaigning. This covers the cases the
+                // quorum-rejection VoteLost path cannot — a transport-degraded
+                // candidate that collects no quorum at all, and a pre-vote
+                // mutual-grant lockstep where no rejection quorum ever forms.
+                // Liveness-only: no term/log change, no safety impact.
+                if (self.role == .candidate and self.config.candidate_demote_threshold > 0) {
+                    self.consecutive_election_failures +|= 1;
+                    if (self.consecutive_election_failures >= self.config.candidate_demote_threshold) {
+                        const failures = self.consecutive_election_failures;
+                        self.becomeFollower(self.current_term, null); // resets counter
+                        self.election_state.applyElectionBackoff(failures);
+                        self.perf_stats.candidate_demotions += 1;
+                        return;
+                    }
+                }
                 try self.startElection(self.config.pre_vote);
             }
         }
@@ -652,6 +688,7 @@ pub const RaftNode = struct {
         self.role = .follower;
         self.leader_id = leader_id;
         self.is_pre_vote_election = false;
+        self.consecutive_election_failures = 0;
         self.election_state.resetElectionElapsed();
         self.election_state.resetElectionTimeout();
 
@@ -693,6 +730,7 @@ pub const RaftNode = struct {
         self.role = .leader;
         self.leader_id = self.id;
         self.is_pre_vote_election = false;
+        self.consecutive_election_failures = 0;
         self.replication_state = rs;
         self.election_state.resetHeartbeatElapsed();
         self.perf_stats.became_leader += 1;

@@ -13,6 +13,15 @@
 > `candidate_demotes_on_quorum_{pre,real}vote_rejection`. Option B
 > (denial carries `leader_id`/`leader_term`) deferred — needs a wire-format
 > change and is unnecessary for the live-leader-exists case Option A covers.
+>
+> **EXTENDED 2026-06-15 (v0.1.9) — timer-based demotion.** Option A only fires on
+> a *quorum rejection*; a transport-degraded candidate or a pre-vote
+> *mutual-grant* lockstep (peers grant each other's pre-votes → no rejection
+> quorum ever forms) collects no quorum at all and stayed a candidate forever
+> (geode `v0.6.27-30` k8s residual). Added `Config.candidate_demote_threshold`
+> (default 4): after N consecutive failed candidate elections, step down to
+> follower + `ElectionState.applyElectionBackoff` (growing, capped, randomized),
+> desynchronizing lockstep peers. Liveness-only.
 
 ---
 

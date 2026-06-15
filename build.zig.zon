@@ -1,6 +1,6 @@
 .{
     .name = .raft,
-    .version = "0.1.8",
+    .version = "0.1.9",
     .fingerprint = 0xcda86f18be72a23e,
     .minimum_zig_version = "0.15.1",
     .dependencies = .{

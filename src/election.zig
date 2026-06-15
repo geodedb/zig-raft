@@ -52,6 +52,24 @@ pub const ElectionState = struct {
         self.election_timeout = self.prng.random().intRangeLessThan(u32, lower, upper);
     }
 
+    /// Cap on the election-timeout backoff multiplier (RC-B it.2). Bounds how far
+    /// a repeatedly-failing candidate's next election can be delayed.
+    pub const election_backoff_cap: u32 = 6;
+
+    /// Extend the next election timeout by a randomized multiple of the base
+    /// `[election_tick, 2*election_tick)` range, growing with the number of
+    /// consecutive failed elections (capped at `election_backoff_cap`). Used when
+    /// a stuck candidate steps down (RC-B it.2): the wider, randomized window
+    /// desynchronizes lockstep candidates so one campaigns ahead of the other and
+    /// can win. Resets the elapsed counter so the new timeout takes effect.
+    pub fn applyElectionBackoff(self: *ElectionState, consecutive_failures: u32) void {
+        const f: u32 = @min(@max(consecutive_failures, 1), election_backoff_cap);
+        const lower = std.math.mul(u32, self.election_tick, f) catch self.election_tick;
+        const upper = std.math.mul(u32, std.math.mul(u32, 2, self.election_tick) catch std.math.maxInt(u32), f) catch std.math.maxInt(u32);
+        self.election_elapsed = 0;
+        self.election_timeout = self.prng.random().intRangeLessThan(u32, lower, @max(upper, lower + 1));
+    }
+
     pub fn electionTimeoutElapsed(self: *const ElectionState) bool {
         return self.election_elapsed >= self.election_timeout;
     }
@@ -185,6 +203,29 @@ test "timeout randomization is within range" {
         try std.testing.expect(es.election_timeout >= election_tick);
         try std.testing.expect(es.election_timeout < 2 * election_tick);
     }
+}
+
+test "applyElectionBackoff widens the timeout range and grows with failures (capped)" {
+    const allocator = std.testing.allocator;
+    const election_tick: u32 = 10;
+    var es = ElectionState.init(allocator, election_tick, 3, @as(u64, 99));
+    defer es.deinit();
+
+    // 1 failure: range [tick, 2*tick).
+    es.applyElectionBackoff(1);
+    try std.testing.expect(es.election_timeout >= election_tick);
+    try std.testing.expect(es.election_timeout < 2 * election_tick);
+    try std.testing.expectEqual(@as(u32, 0), es.election_elapsed);
+
+    // 3 failures: range [3*tick, 6*tick).
+    es.applyElectionBackoff(3);
+    try std.testing.expect(es.election_timeout >= 3 * election_tick);
+    try std.testing.expect(es.election_timeout < 6 * election_tick);
+
+    // Beyond the cap: clamps at election_backoff_cap (6) -> [6*tick, 12*tick).
+    es.applyElectionBackoff(1000);
+    try std.testing.expect(es.election_timeout >= ElectionState.election_backoff_cap * election_tick);
+    try std.testing.expect(es.election_timeout < 2 * ElectionState.election_backoff_cap * election_tick);
 }
 
 test "election timeout elapsed detection" {

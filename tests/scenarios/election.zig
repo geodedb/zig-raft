@@ -323,6 +323,50 @@ test "scenario: candidate_demotes_on_quorum_prevote_rejection" {
     try std.testing.expect(!n1.is_pre_vote_election);
 }
 
+// ---------------------------------------------------------------------------
+// Scenario 7b: stuck candidate demotes on a TIMER (no quorum needed) (RC-B it.2)
+// ---------------------------------------------------------------------------
+//
+// v0.1.8's VoteLost demotion only fires when a quorum of peers REJECTS the
+// candidate. A transport-degraded / isolated candidate (or a pre-vote
+// mutual-grant lockstep where peers grant each other's pre-votes so no rejection
+// quorum ever forms) collects neither a winning nor a rejecting quorum, and
+// without a timer it stays a candidate indefinitely. After K consecutive failed
+// elections the candidate must step down to follower + back off, so a lockstep
+// peer can get ahead and win.
+
+test "scenario: stuck candidate demotes to follower after consecutive failed elections" {
+    var net = try harness.Network.init(std.testing.allocator, 3);
+    defer net.deinit();
+
+    const n1 = net.nodes.get(1).?;
+    // Isolate node 1 entirely: it never hears a grant, a rejection, or a leader.
+    // (pause 2/3 so only node 1 advances; partition so nothing is delivered.)
+    try net.pauseNode(2);
+    try net.pauseNode(3);
+    try net.partition(1, 2);
+    try net.partition(1, 3);
+
+    var saw_candidate = false;
+    var saw_demote_to_follower = false;
+    var t: u32 = 0;
+    while (t < 600) : (t += 1) {
+        try net.tickAll();
+        if (n1.role == .candidate) saw_candidate = true;
+        // After becoming a candidate, an isolated node can only return to
+        // follower via the timer-based demotion (no higher-term message exists).
+        if (saw_candidate and n1.role == .follower) {
+            saw_demote_to_follower = true;
+            break;
+        }
+    }
+
+    try std.testing.expect(saw_candidate);
+    // WITHOUT the fix: an isolated pre-vote candidate stays a candidate forever
+    // (term frozen, no demotion path) -> saw_demote_to_follower stays false.
+    try std.testing.expect(saw_demote_to_follower);
+}
+
 test "scenario: candidate_demotes_on_quorum_realvote_rejection" {
     var net = try harness.Network.init(std.testing.allocator, 3);
     defer net.deinit();
