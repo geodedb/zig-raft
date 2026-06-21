@@ -1,0 +1,19 @@
+80:101:2:ZL300.max_line_length:line exceeds 100 characters (108)
+64:67:2:ZL303.max_nesting:nesting depth exceeds 4 (7)
+127:13:1:ZL009.var_should_be_const:variable 'net' is never reassigned; consider using 'const'
+140:13:1:ZL009.var_should_be_const:variable 'i' is never reassigned; consider using 'const'
+145:17:1:ZL009.var_should_be_const:variable 'j' is never reassigned; consider using 'const'
+182:13:1:ZL009.var_should_be_const:variable 'nit' is never reassigned; consider using 'const'
+191:13:1:ZL009.var_should_be_const:variable 'sit' is never reassigned; consider using 'const'
+198:13:1:ZL009.var_should_be_const:variable 'tit' is never reassigned; consider using 'const'
+204:13:1:ZL009.var_should_be_const:variable 'cit' is never reassigned; consider using 'const'
+279:13:1:ZL009.var_should_be_const:variable 't' is never reassigned; consider using 'const'
+298:13:1:ZL009.var_should_be_const:variable 't' is never reassigned; consider using 'const'
+301:17:1:ZL009.var_should_be_const:variable 'count' is never reassigned; consider using 'const'
+157:34:1:ZL010.magic_number:magic number 10; consider using a named constant
+116:5:1:ZL011.missing_doc_comment:public declaration 'RouteKey' is missing documentation
+181:5:1:ZL011.missing_doc_comment:public declaration 'deinit' is missing documentation
+124:32:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+151:40:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+163:36:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+167:37:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer

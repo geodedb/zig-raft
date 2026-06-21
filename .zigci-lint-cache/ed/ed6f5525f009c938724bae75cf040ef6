@@ -1,0 +1,96 @@
+13:11:1:ZL203.const_snakecase:constant 'MAX_VOTERS_PER_SET' should use snake_case (or PascalCase for types)
+73:101:2:ZL300.max_line_length:line exceeds 100 characters (117)
+257:101:2:ZL300.max_line_length:line exceeds 100 characters (104)
+258:101:2:ZL300.max_line_length:line exceeds 100 characters (109)
+349:101:2:ZL300.max_line_length:line exceeds 100 characters (118)
+352:101:2:ZL300.max_line_length:line exceeds 100 characters (109)
+658:101:2:ZL300.max_line_length:line exceeds 100 characters (103)
+174:59:2:ZL303.max_nesting:nesting depth exceeds 4 (5)
+83:13:1:ZL009.var_should_be_const:variable 'new_voter_list' is never reassigned; consider using 'const'
+231:13:1:ZL009.var_should_be_const:variable 'new_outgoing' is never reassigned; consider using 'const'
+265:13:1:ZL009.var_should_be_const:variable 'offset' is never reassigned; consider using 'const'
+294:13:1:ZL009.var_should_be_const:variable 'offset' is never reassigned; consider using 'const'
+328:13:1:ZL009.var_should_be_const:variable 'offset' is never reassigned; consider using 'const'
+567:9:1:ZL009.var_should_be_const:variable 'final_parsed' is never reassigned; consider using 'const'
+580:9:1:ZL009.var_should_be_const:variable 'joint_parsed' is never reassigned; consider using 'const'
+592:9:1:ZL009.var_should_be_const:variable 'ms' is never reassigned; consider using 'const'
+270:48:1:ZL010.magic_number:magic number 4; consider using a named constant
+271:19:1:ZL010.magic_number:magic number 4; consider using a named constant
+277:48:1:ZL010.magic_number:magic number 4; consider using a named constant
+278:19:1:ZL010.magic_number:magic number 4; consider using a named constant
+299:48:1:ZL010.magic_number:magic number 4; consider using a named constant
+300:19:1:ZL010.magic_number:magic number 4; consider using a named constant
+330:33:1:ZL010.magic_number:magic number 4; consider using a named constant
+332:19:1:ZL010.magic_number:magic number 4; consider using a named constant
+341:37:1:ZL010.magic_number:magic number 4; consider using a named constant
+343:23:1:ZL010.magic_number:magic number 4; consider using a named constant
+408:35:1:ZL010.magic_number:magic number 3; consider using a named constant
+412:44:1:ZL010.magic_number:magic number 3; consider using a named constant
+415:42:1:ZL010.magic_number:magic number 3; consider using a named constant
+422:35:1:ZL010.magic_number:magic number 3; consider using a named constant
+426:35:1:ZL010.magic_number:magic number 3; consider using a named constant
+426:38:1:ZL010.magic_number:magic number 4; consider using a named constant
+438:42:1:ZL010.magic_number:magic number 5; consider using a named constant
+439:42:1:ZL010.magic_number:magic number 10; consider using a named constant
+442:44:1:ZL010.magic_number:magic number 3; consider using a named constant
+443:44:1:ZL010.magic_number:magic number 3; consider using a named constant
+448:35:1:ZL010.magic_number:magic number 3; consider using a named constant
+452:35:1:ZL010.magic_number:magic number 3; consider using a named constant
+452:38:1:ZL010.magic_number:magic number 4; consider using a named constant
+457:28:1:ZL010.magic_number:magic number 5; consider using a named constant
+457:31:1:ZL010.magic_number:magic number 6; consider using a named constant
+464:35:1:ZL010.magic_number:magic number 3; consider using a named constant
+468:35:1:ZL010.magic_number:magic number 3; consider using a named constant
+468:38:1:ZL010.magic_number:magic number 4; consider using a named constant
+484:42:1:ZL010.magic_number:magic number 11; consider using a named constant
+488:44:1:ZL010.magic_number:magic number 3; consider using a named constant
+493:35:1:ZL010.magic_number:magic number 3; consider using a named constant
+502:35:1:ZL010.magic_number:magic number 3; consider using a named constant
+506:35:1:ZL010.magic_number:magic number 3; consider using a named constant
+506:38:1:ZL010.magic_number:magic number 4; consider using a named constant
+523:35:1:ZL010.magic_number:magic number 3; consider using a named constant
+527:35:1:ZL010.magic_number:magic number 3; consider using a named constant
+527:38:1:ZL010.magic_number:magic number 4; consider using a named constant
+538:35:1:ZL010.magic_number:magic number 3; consider using a named constant
+543:44:1:ZL010.magic_number:magic number 3; consider using a named constant
+548:32:1:ZL010.magic_number:magic number 4; consider using a named constant
+548:35:1:ZL010.magic_number:magic number 5; consider using a named constant
+555:44:1:ZL010.magic_number:magic number 3; consider using a named constant
+563:28:1:ZL010.magic_number:magic number 10; consider using a named constant
+563:32:1:ZL010.magic_number:magic number 20; consider using a named constant
+563:36:1:ZL010.magic_number:magic number 30; consider using a named constant
+570:44:1:ZL010.magic_number:magic number 3; consider using a named constant
+571:42:1:ZL010.magic_number:magic number 10; consider using a named constant
+572:42:1:ZL010.magic_number:magic number 20; consider using a named constant
+573:42:1:ZL010.magic_number:magic number 30; consider using a named constant
+583:44:1:ZL010.magic_number:magic number 3; consider using a named constant
+591:35:1:ZL010.magic_number:magic number 3; consider using a named constant
+597:28:1:ZL010.magic_number:magic number 4; consider using a named constant
+597:31:1:ZL010.magic_number:magic number 5; consider using a named constant
+597:34:1:ZL010.magic_number:magic number 6; consider using a named constant
+601:44:1:ZL010.magic_number:magic number 3; consider using a named constant
+602:42:1:ZL010.magic_number:magic number 4; consider using a named constant
+607:28:1:ZL010.magic_number:magic number 7; consider using a named constant
+608:37:1:ZL010.magic_number:magic number 4; consider using a named constant
+608:40:1:ZL010.magic_number:magic number 5; consider using a named constant
+638:42:1:ZL010.magic_number:magic number 7; consider using a named constant
+642:34:1:ZL010.magic_number:magic number 3; consider using a named constant
+649:34:1:ZL010.magic_number:magic number 3; consider using a named constant
+650:37:1:ZL010.magic_number:magic number 4; consider using a named constant
+650:40:1:ZL010.magic_number:magic number 5; consider using a named constant
+656:34:1:ZL010.magic_number:magic number 3; consider using a named constant
+657:30:1:ZL010.magic_number:magic number 4; consider using a named constant
+657:33:1:ZL010.magic_number:magic number 5; consider using a named constant
+661:41:1:ZL010.magic_number:magic number 4; consider using a named constant
+662:42:1:ZL010.magic_number:magic number 6; consider using a named constant
+7:1:1:ZL011.missing_doc_comment:public declaration 'MembershipError' is missing documentation
+38:5:1:ZL011.missing_doc_comment:public declaration 'init' is missing documentation
+51:5:1:ZL011.missing_doc_comment:public declaration 'deinit' is missing documentation
+315:9:1:ZL011.missing_doc_comment:public declaration 'deinit' is missing documentation
+365:5:1:ZL011.missing_doc_comment:public declaration 'serializeVoters' is missing documentation
+358:37:1:ZL602.unnecessary_alloc:allocation inside loop; consider preallocating or using arena allocator
+358:28:1:ZL602.unnecessary_alloc:allocation inside loop; consider preallocating or using arena allocator
+264:34:1:ZL603.missing_defer_cleanup:resource '.alloc(' may not be properly cleaned up; consider using defer
+293:34:1:ZL603.missing_defer_cleanup:resource '.alloc(' may not be properly cleaned up; consider using defer
+358:37:1:ZL603.missing_defer_cleanup:resource '.alloc(' may not be properly cleaned up; consider using defer
+27:27:1:ZL605.large_struct_copy:struct 'MembershipState' has 56 fields; consider passing by pointer to avoid copies

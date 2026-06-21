@@ -1,0 +1,33 @@
+112:101:2:ZL300.max_line_length:line exceeds 100 characters (137)
+115:101:2:ZL300.max_line_length:line exceeds 100 characters (108)
+118:101:2:ZL300.max_line_length:line exceeds 100 characters (153)
+121:101:2:ZL300.max_line_length:line exceeds 100 characters (145)
+124:101:2:ZL300.max_line_length:line exceeds 100 characters (271)
+137:101:2:ZL300.max_line_length:line exceeds 100 characters (101)
+124:219:2:ZL303.max_nesting:nesting depth exceeds 4 (5)
+107:36:1:ZL010.magic_number:magic number 3; consider using a named constant
+112:52:1:ZL010.magic_number:magic number 5; consider using a named constant
+112:92:1:ZL010.magic_number:magic number 10; consider using a named constant
+112:113:1:ZL010.magic_number:magic number 4; consider using a named constant
+113:42:1:ZL010.magic_number:magic number 5; consider using a named constant
+115:62:1:ZL010.magic_number:magic number 5; consider using a named constant
+118:54:1:ZL010.magic_number:magic number 3; consider using a named constant
+121:64:1:ZL010.magic_number:magic number 3; consider using a named constant
+121:99:1:ZL010.magic_number:magic number 5; consider using a named constant
+124:98:1:ZL010.magic_number:magic number 10; consider using a named constant
+132:34:1:ZL010.magic_number:magic number 3; consider using a named constant
+136:30:1:ZL010.magic_number:magic number 4; consider using a named constant
+136:33:1:ZL010.magic_number:magic number 5; consider using a named constant
+6:1:1:ZL011.missing_doc_comment:public declaration 'EntryKind' is missing documentation
+12:1:1:ZL011.missing_doc_comment:public declaration 'Entry' is missing documentation
+18:5:1:ZL011.missing_doc_comment:public declaration 'isNoop' is missing documentation
+23:1:1:ZL011.missing_doc_comment:public declaration 'ClusterConfig' is missing documentation
+29:1:1:ZL011.missing_doc_comment:public declaration 'SnapshotMetadata' is missing documentation
+35:1:1:ZL011.missing_doc_comment:public declaration 'Snapshot' is missing documentation
+40:1:1:ZL011.missing_doc_comment:public declaration 'RequestVote' is missing documentation
+48:1:1:ZL011.missing_doc_comment:public declaration 'RequestVoteResponse' is missing documentation
+54:1:1:ZL011.missing_doc_comment:public declaration 'AppendEntries' is missing documentation
+63:1:1:ZL011.missing_doc_comment:public declaration 'AppendEntriesResponse' is missing documentation
+71:1:1:ZL011.missing_doc_comment:public declaration 'InstallSnapshot' is missing documentation
+86:1:1:ZL011.missing_doc_comment:public declaration 'InstallSnapshotResponse' is missing documentation
+91:1:1:ZL011.missing_doc_comment:public declaration 'Message' is missing documentation

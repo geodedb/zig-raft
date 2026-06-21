@@ -1,0 +1,54 @@
+69:101:2:ZL300.max_line_length:line exceeds 100 characters (107)
+89:101:2:ZL300.max_line_length:line exceeds 100 characters (116)
+215:101:2:ZL300.max_line_length:line exceeds 100 characters (102)
+226:101:2:ZL300.max_line_length:line exceeds 100 characters (118)
+128:45:2:ZL303.max_nesting:nesting depth exceeds 4 (6)
+500:9:1:ZL009.var_should_be_const:variable 'store' is never reassigned; consider using 'const'
+360:21:1:ZL010.magic_number:magic number 3; consider using a named constant
+367:44:1:ZL010.magic_number:magic number 3; consider using a named constant
+370:42:1:ZL010.magic_number:magic number 3; consider using a named constant
+382:21:1:ZL010.magic_number:magic number 3; consider using a named constant
+388:65:1:ZL010.magic_number:magic number 3; consider using a named constant
+417:21:1:ZL010.magic_number:magic number 3; consider using a named constant
+418:21:1:ZL010.magic_number:magic number 4; consider using a named constant
+431:42:1:ZL010.magic_number:magic number 3; consider using a named constant
+432:42:1:ZL010.magic_number:magic number 4; consider using a named constant
+439:49:1:ZL010.magic_number:magic number 5; consider using a named constant
+439:65:1:ZL010.magic_number:magic number 3; consider using a named constant
+452:22:1:ZL010.magic_number:magic number 10; consider using a named constant
+453:21:1:ZL010.magic_number:magic number 3; consider using a named constant
+455:42:1:ZL010.magic_number:magic number 3; consider using a named constant
+465:42:1:ZL010.magic_number:magic number 10; consider using a named constant
+466:42:1:ZL010.magic_number:magic number 3; consider using a named constant
+471:42:1:ZL010.magic_number:magic number 10; consider using a named constant
+472:42:1:ZL010.magic_number:magic number 3; consider using a named constant
+483:21:1:ZL010.magic_number:magic number 3; consider using a named constant
+489:78:1:ZL010.magic_number:magic number 3; consider using a named constant
+490:78:1:ZL010.magic_number:magic number 3; consider using a named constant
+496:42:1:ZL010.magic_number:magic number 3; consider using a named constant
+8:1:1:ZL011.missing_doc_comment:public declaration 'StorageError' is missing documentation
+10:1:1:ZL011.missing_doc_comment:public declaration 'Storage' is missing documentation
+14:5:1:ZL011.missing_doc_comment:public declaration 'VTable' is missing documentation
+26:5:1:ZL011.missing_doc_comment:public declaration 'saveHardState' is missing documentation
+30:5:1:ZL011.missing_doc_comment:public declaration 'loadHardState' is missing documentation
+34:5:1:ZL011.missing_doc_comment:public declaration 'appendEntries' is missing documentation
+38:5:1:ZL011.missing_doc_comment:public declaration 'entries' is missing documentation
+42:5:1:ZL011.missing_doc_comment:public declaration 'term' is missing documentation
+46:5:1:ZL011.missing_doc_comment:public declaration 'lastIndex' is missing documentation
+50:5:1:ZL011.missing_doc_comment:public declaration 'saveSnapshot' is missing documentation
+54:5:1:ZL011.missing_doc_comment:public declaration 'loadSnapshot' is missing documentation
+58:5:1:ZL011.missing_doc_comment:public declaration 'compact' is missing documentation
+72:1:1:ZL011.missing_doc_comment:public declaration 'InMemoryStorage' is missing documentation
+80:5:1:ZL011.missing_doc_comment:public declaration 'init' is missing documentation
+84:5:1:ZL011.missing_doc_comment:public declaration 'deinit' is missing documentation
+100:5:1:ZL011.missing_doc_comment:public declaration 'storage' is missing documentation
+117:5:1:ZL011.missing_doc_comment:public declaration 'appendEntriesImpl' is missing documentation
+163:5:1:ZL011.missing_doc_comment:public declaration 'entriesImpl' is missing documentation
+180:5:1:ZL011.missing_doc_comment:public declaration 'termImpl' is missing documentation
+190:5:1:ZL011.missing_doc_comment:public declaration 'lastIndexImpl' is missing documentation
+195:5:1:ZL011.missing_doc_comment:public declaration 'compactImpl' is missing documentation
+221:5:1:ZL011.missing_doc_comment:public declaration 'saveSnapshotImpl' is missing documentation
+291:5:1:ZL011.missing_doc_comment:public declaration 'saveHardStateImpl' is missing documentation
+295:5:1:ZL011.missing_doc_comment:public declaration 'loadHardState' is missing documentation
+299:5:1:ZL011.missing_doc_comment:public declaration 'loadHardStateImpl' is missing documentation
+175:42:1:ZL603.missing_defer_cleanup:resource '.alloc(' may not be properly cleaned up; consider using defer

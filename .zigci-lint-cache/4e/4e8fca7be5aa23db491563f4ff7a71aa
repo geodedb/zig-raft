@@ -1,0 +1,75 @@
+109:22:2:ZL001.no_undefined:use of 'undefined' may hide uninitialized memory bugs
+110:25:2:ZL001.no_undefined:use of 'undefined' may hide uninitialized memory bugs
+111:27:2:ZL001.no_undefined:use of 'undefined' may hide uninitialized memory bugs
+123:95:2:ZL002.no_unreachable:use of 'unreachable' may hide bugs
+373:92:2:ZL002.no_unreachable:use of 'unreachable' may hide bugs
+84:99:3:ZL003.no_empty_catch:empty catch block suppresses errors
+103:55:3:ZL003.no_empty_catch:empty catch block suppresses errors
+387:46:3:ZL003.no_empty_catch:empty catch block suppresses errors
+473:46:3:ZL003.no_empty_catch:empty catch block suppresses errors
+546:46:3:ZL003.no_empty_catch:empty catch block suppresses errors
+123:89:2:ZL004.no_catch_unreachable:catch unreachable suppresses error handling
+373:86:2:ZL004.no_catch_unreachable:catch unreachable suppresses error handling
+84:101:2:ZL300.max_line_length:line exceeds 100 characters (107)
+123:101:2:ZL300.max_line_length:line exceeds 100 characters (106)
+373:101:2:ZL300.max_line_length:line exceeds 100 characters (103)
+72:67:2:ZL303.max_nesting:nesting depth exceeds 4 (7)
+122:17:1:ZL009.var_should_be_const:variable 'path_buf' is never reassigned; consider using 'const'
+132:17:1:ZL009.var_should_be_const:variable 'pi' is never reassigned; consider using 'const'
+227:13:1:ZL009.var_should_be_const:variable 't' is never reassigned; consider using 'const'
+273:9:1:ZL009.var_should_be_const:variable 't' is never reassigned; consider using 'const'
+315:9:1:ZL009.var_should_be_const:variable 't' is never reassigned; consider using 'const'
+321:9:1:ZL009.var_should_be_const:variable 'nodes_with_entry' is never reassigned; consider using 'const'
+357:13:1:ZL009.var_should_be_const:variable 't' is never reassigned; consider using 'const'
+372:13:1:ZL009.var_should_be_const:variable 'path_buf' is never reassigned; consider using 'const'
+400:9:1:ZL009.var_should_be_const:variable 't' is never reassigned; consider using 'const'
+421:9:1:ZL009.var_should_be_const:variable 'cluster' is never reassigned; consider using 'const'
+433:9:1:ZL009.var_should_be_const:variable 't' is never reassigned; consider using 'const'
+450:9:1:ZL009.var_should_be_const:variable 'found' is never reassigned; consider using 'const'
+497:13:1:ZL009.var_should_be_const:variable 'dir' is never reassigned; consider using 'const'
+500:13:1:ZL009.var_should_be_const:variable 'wal_file' is never reassigned; consider using 'const'
+512:13:1:ZL009.var_should_be_const:variable 'store' is never reassigned; consider using 'const'
+118:17:1:ZL010.magic_number:magic number 3; consider using a named constant
+133:21:1:ZL010.magic_number:magic number 4; consider using a named constant
+144:34:1:ZL010.magic_number:magic number 10; consider using a named constant
+164:17:1:ZL010.magic_number:magic number 3; consider using a named constant
+251:60:1:ZL010.magic_number:magic number 3; consider using a named constant
+274:16:1:ZL010.magic_number:magic number 50; consider using a named constant
+316:16:1:ZL010.magic_number:magic number 50; consider using a named constant
+358:20:1:ZL010.magic_number:magic number 20; consider using a named constant
+371:13:1:ZL010.magic_number:magic number 4; consider using a named constant
+401:16:1:ZL010.magic_number:magic number 50; consider using a named constant
+434:16:1:ZL010.magic_number:magic number 50; consider using a named constant
+485:25:1:ZL010.magic_number:magic number 3; consider using a named constant
+491:46:1:ZL010.magic_number:magic number 3; consider using a named constant
+505:32:1:ZL010.magic_number:magic number 0xDE; consider using a named constant
+505:38:1:ZL010.magic_number:magic number 0xAD; consider using a named constant
+505:44:1:ZL010.magic_number:magic number 0xBE; consider using a named constant
+505:50:1:ZL010.magic_number:magic number 0xEF; consider using a named constant
+505:74:1:ZL010.magic_number:magic number 0x03; consider using a named constant
+505:80:1:ZL010.magic_number:magic number 0xFF; consider using a named constant
+505:86:1:ZL010.magic_number:magic number 0xFF; consider using a named constant
+517:46:1:ZL010.magic_number:magic number 3; consider using a named constant
+528:48:1:ZL010.magic_number:magic number 3; consider using a named constant
+537:25:1:ZL010.magic_number:magic number 4; consider using a named constant
+542:46:1:ZL010.magic_number:magic number 4; consider using a named constant
+246:18:2:ZL500.os_specific_code:Unix-specific path code '"/tmp/' may cause portability issues; consider adding OS detection guards
+262:18:2:ZL500.os_specific_code:Unix-specific path code '"/tmp/' may cause portability issues; consider adding OS detection guards
+305:18:2:ZL500.os_specific_code:Unix-specific path code '"/tmp/' may cause portability issues; consider adding OS detection guards
+349:18:2:ZL500.os_specific_code:Unix-specific path code '"/tmp/' may cause portability issues; consider adding OS detection guards
+391:18:2:ZL500.os_specific_code:Unix-specific path code '"/tmp/' may cause portability issues; consider adding OS detection guards
+420:18:2:ZL500.os_specific_code:Unix-specific path code '"/tmp/' may cause portability issues; consider adding OS detection guards
+470:18:2:ZL500.os_specific_code:Unix-specific path code '"/tmp/' may cause portability issues; consider adding OS detection guards
+246:18:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+262:18:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+305:18:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+349:18:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+391:18:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+420:18:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+470:18:1:ZL501.hardcoded_path_separator:hardcoded path may not work across operating systems; consider using std.fs.path
+500:31:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+497:39:1:ZL603.missing_defer_cleanup:resource '.openDir(' may not be properly cleaned up; consider using defer
+105:36:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+126:40:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+149:39:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer
+154:37:1:ZL603.missing_defer_cleanup:resource '.create(' may not be properly cleaned up; consider using defer

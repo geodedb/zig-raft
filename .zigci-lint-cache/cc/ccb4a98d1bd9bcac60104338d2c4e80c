@@ -1,0 +1,7 @@
+52:58:1:ZL010.magic_number:magic number 3; consider using a named constant
+54:43:1:ZL010.magic_number:magic number 3; consider using a named constant
+6:1:1:ZL011.missing_doc_comment:public declaration 'Role' is missing documentation
+12:1:1:ZL011.missing_doc_comment:public declaration 'HardState' is missing documentation
+16:5:1:ZL011.missing_doc_comment:public declaration 'initial' is missing documentation
+18:5:1:ZL011.missing_doc_comment:public declaration 'eql' is missing documentation
+23:1:1:ZL011.missing_doc_comment:public declaration 'SoftState' is missing documentation

@@ -1,0 +1,16 @@
+97:66:2:ZL303.max_nesting:nesting depth exceeds 4 (7)
+50:13:1:ZL009.var_should_be_const:variable 'it' is never reassigned; consider using 'const'
+207:9:1:ZL009.var_should_be_const:variable 'ipt' is never reassigned; consider using 'const'
+153:12:1:ZL010.magic_number:magic number 99; consider using a named constant
+163:13:1:ZL010.magic_number:magic number 5; consider using a named constant
+173:44:1:ZL010.magic_number:magic number 5; consider using a named constant
+178:44:1:ZL010.magic_number:magic number 5; consider using a named constant
+179:13:1:ZL010.magic_number:magic number 5; consider using a named constant
+211:65:1:ZL010.magic_number:magic number 42; consider using a named constant
+228:25:1:ZL010.magic_number:magic number 3; consider using a named constant
+23:5:1:ZL011.missing_doc_comment:public declaration 'VTable' is missing documentation
+33:1:1:ZL011.missing_doc_comment:public declaration 'InProcessTransport' is missing documentation
+42:5:1:ZL011.missing_doc_comment:public declaration 'init' is missing documentation
+49:5:1:ZL011.missing_doc_comment:public declaration 'deinit' is missing documentation
+73:74:1:ZL603.missing_defer_cleanup:resource '.alloc(' may not be properly cleaned up; consider using defer
+75:37:1:ZL603.missing_defer_cleanup:resource '.alloc(' may not be properly cleaned up; consider using defer

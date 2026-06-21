@@ -1,0 +1,23 @@
+94:13:1:ZL009.var_should_be_const:variable 'normal_count' is never reassigned; consider using 'const'
+127:13:1:ZL009.var_should_be_const:variable 'buf' is never reassigned; consider using 'const'
+230:9:1:ZL009.var_should_be_const:variable 'ticks' is never reassigned; consider using 'const'
+259:9:1:ZL009.var_should_be_const:variable 'net' is never reassigned; consider using 'const'
+271:9:1:ZL009.var_should_be_const:variable 'majority_peers' is never reassigned; consider using 'const'
+272:9:1:ZL009.var_should_be_const:variable 'mp' is never reassigned; consider using 'const'
+37:63:1:ZL010.magic_number:magic number 3; consider using a named constant
+50:43:1:ZL010.magic_number:magic number 50; consider using a named constant
+71:63:1:ZL010.magic_number:magic number 3; consider using a named constant
+74:31:1:ZL010.magic_number:magic number 50; consider using a named constant
+114:63:1:ZL010.magic_number:magic number 3; consider using a named constant
+123:33:1:ZL010.magic_number:magic number 50; consider using a named constant
+184:63:1:ZL010.magic_number:magic number 3; consider using a named constant
+191:16:1:ZL010.magic_number:magic number 3; consider using a named constant
+195:53:1:ZL010.magic_number:magic number 50; consider using a named constant
+216:16:1:ZL010.magic_number:magic number 3; consider using a named constant
+220:39:1:ZL010.magic_number:magic number 50; consider using a named constant
+259:63:1:ZL010.magic_number:magic number 5; consider using a named constant
+292:16:1:ZL010.magic_number:magic number 20; consider using a named constant
+310:16:1:ZL010.magic_number:magic number 150; consider using a named constant
+335:16:1:ZL010.magic_number:magic number 150; consider using a named constant
+18:36:1:ZL602.unnecessary_alloc:allocation inside loop; consider preallocating or using arena allocator
+18:27:1:ZL602.unnecessary_alloc:allocation inside loop; consider preallocating or using arena allocator

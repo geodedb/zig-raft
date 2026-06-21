@@ -1,0 +1,9 @@
+55:101:2:ZL300.max_line_length:line exceeds 100 characters (135)
+92:101:2:ZL300.max_line_length:line exceeds 100 characters (145)
+100:101:2:ZL300.max_line_length:line exceeds 100 characters (131)
+133:101:2:ZL300.max_line_length:line exceeds 100 characters (138)
+40:53:2:ZL303.max_nesting:nesting depth exceeds 4 (7)
+37:21:1:ZL009.var_should_be_const:variable 'idx' is never reassigned; consider using 'const'
+73:21:1:ZL009.var_should_be_const:variable 'idx' is never reassigned; consider using 'const'
+116:21:1:ZL009.var_should_be_const:variable 'idx' is never reassigned; consider using 'const'
+11:1:1:ZL011.missing_doc_comment:public declaration 'Checker' is missing documentation

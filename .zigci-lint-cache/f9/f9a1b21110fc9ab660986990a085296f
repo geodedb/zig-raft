@@ -1,0 +1,37 @@
+63:11:1:ZL203.const_snakecase:constant 'freeSnapshot' should use snake_case (or PascalCase for types)
+67:11:1:ZL203.const_snakecase:constant 'isNoop' should use snake_case (or PascalCase for types)
+11:1:1:ZL011.missing_doc_comment:public declaration 'thread_pool' is missing documentation
+14:1:1:ZL011.missing_doc_comment:public declaration 'state' is missing documentation
+15:1:1:ZL011.missing_doc_comment:public declaration 'rpc' is missing documentation
+16:1:1:ZL011.missing_doc_comment:public declaration 'quorum' is missing documentation
+17:1:1:ZL011.missing_doc_comment:public declaration 'storage' is missing documentation
+18:1:1:ZL011.missing_doc_comment:public declaration 'file_storage' is missing documentation
+19:1:1:ZL011.missing_doc_comment:public declaration 'transport' is missing documentation
+20:1:1:ZL011.missing_doc_comment:public declaration 'log' is missing documentation
+21:1:1:ZL011.missing_doc_comment:public declaration 'election' is missing documentation
+22:1:1:ZL011.missing_doc_comment:public declaration 'replication' is missing documentation
+23:1:1:ZL011.missing_doc_comment:public declaration 'membership' is missing documentation
+24:1:1:ZL011.missing_doc_comment:public declaration 'snapshot_mod' is missing documentation
+25:1:1:ZL011.missing_doc_comment:public declaration 'ready' is missing documentation
+26:1:1:ZL011.missing_doc_comment:public declaration 'node' is missing documentation
+34:1:1:ZL011.missing_doc_comment:public declaration 'observability' is missing documentation
+48:1:1:ZL011.missing_doc_comment:public declaration 'RaftNode' is missing documentation
+49:1:1:ZL011.missing_doc_comment:public declaration 'Config' is missing documentation
+50:1:1:ZL011.missing_doc_comment:public declaration 'Stats' is missing documentation
+51:1:1:ZL011.missing_doc_comment:public declaration 'Ready' is missing documentation
+52:1:1:ZL011.missing_doc_comment:public declaration 'Role' is missing documentation
+53:1:1:ZL011.missing_doc_comment:public declaration 'HardState' is missing documentation
+54:1:1:ZL011.missing_doc_comment:public declaration 'SoftState' is missing documentation
+55:1:1:ZL011.missing_doc_comment:public declaration 'Entry' is missing documentation
+56:1:1:ZL011.missing_doc_comment:public declaration 'EntryKind' is missing documentation
+57:1:1:ZL011.missing_doc_comment:public declaration 'Message' is missing documentation
+58:1:1:ZL011.missing_doc_comment:public declaration 'Snapshot' is missing documentation
+59:1:1:ZL011.missing_doc_comment:public declaration 'SnapshotMetadata' is missing documentation
+60:1:1:ZL011.missing_doc_comment:public declaration 'ClusterConfig' is missing documentation
+61:1:1:ZL011.missing_doc_comment:public declaration 'Storage' is missing documentation
+62:1:1:ZL011.missing_doc_comment:public declaration 'InMemoryStorage' is missing documentation
+63:1:1:ZL011.missing_doc_comment:public declaration 'freeSnapshot' is missing documentation
+64:1:1:ZL011.missing_doc_comment:public declaration 'FileStorage' is missing documentation
+65:1:1:ZL011.missing_doc_comment:public declaration 'Transport' is missing documentation
+66:1:1:ZL011.missing_doc_comment:public declaration 'InProcessTransport' is missing documentation
+67:1:1:ZL011.missing_doc_comment:public declaration 'isNoop' is missing documentation

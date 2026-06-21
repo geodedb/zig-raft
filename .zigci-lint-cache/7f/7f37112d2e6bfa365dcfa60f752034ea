@@ -1,0 +1,116 @@
+794:101:2:ZL002.no_unreachable:use of 'unreachable' may hide bugs
+110:87:3:ZL003.no_empty_catch:empty catch block suppresses errors
+132:90:3:ZL003.no_empty_catch:empty catch block suppresses errors
+133:90:3:ZL003.no_empty_catch:empty catch block suppresses errors
+185:96:3:ZL003.no_empty_catch:empty catch block suppresses errors
+340:103:3:ZL003.no_empty_catch:empty catch block suppresses errors
+354:103:3:ZL003.no_empty_catch:empty catch block suppresses errors
+395:32:3:ZL003.no_empty_catch:empty catch block suppresses errors
+480:93:3:ZL003.no_empty_catch:empty catch block suppresses errors
+481:28:3:ZL003.no_empty_catch:empty catch block suppresses errors
+503:99:3:ZL003.no_empty_catch:empty catch block suppresses errors
+794:95:2:ZL004.no_catch_unreachable:catch unreachable suppresses error handling
+42:7:1:ZL203.const_snakecase:constant 'VOTED_FOR_NONE' should use snake_case (or PascalCase for types)
+45:7:1:ZL203.const_snakecase:constant 'PAYLOAD_HEADER_SIZE' should use snake_case (or PascalCase for types)
+16:101:2:ZL300.max_line_length:line exceeds 100 characters (116)
+79:101:2:ZL300.max_line_length:line exceeds 100 characters (117)
+82:101:2:ZL300.max_line_length:line exceeds 100 characters (101)
+182:101:2:ZL300.max_line_length:line exceeds 100 characters (110)
+185:101:2:ZL300.max_line_length:line exceeds 100 characters (104)
+191:101:2:ZL300.max_line_length:line exceeds 100 characters (115)
+216:101:2:ZL300.max_line_length:line exceeds 100 characters (101)
+337:101:2:ZL300.max_line_length:line exceeds 100 characters (117)
+340:101:2:ZL300.max_line_length:line exceeds 100 characters (111)
+348:101:2:ZL300.max_line_length:line exceeds 100 characters (147)
+351:101:2:ZL300.max_line_length:line exceeds 100 characters (117)
+354:101:2:ZL300.max_line_length:line exceeds 100 characters (111)
+361:101:2:ZL300.max_line_length:line exceeds 100 characters (121)
+362:101:2:ZL300.max_line_length:line exceeds 100 characters (121)
+389:101:2:ZL300.max_line_length:line exceeds 100 characters (124)
+391:101:2:ZL300.max_line_length:line exceeds 100 characters (132)
+396:101:2:ZL300.max_line_length:line exceeds 100 characters (126)
+409:101:2:ZL300.max_line_length:line exceeds 100 characters (106)
+420:101:2:ZL300.max_line_length:line exceeds 100 characters (113)
+480:101:2:ZL300.max_line_length:line exceeds 100 characters (101)
+496:101:2:ZL300.max_line_length:line exceeds 100 characters (130)
+497:101:2:ZL300.max_line_length:line exceeds 100 characters (108)
+500:101:2:ZL300.max_line_length:line exceeds 100 characters (113)
+503:101:2:ZL300.max_line_length:line exceeds 100 characters (107)
+508:101:2:ZL300.max_line_length:line exceeds 100 characters (121)
+520:101:2:ZL300.max_line_length:line exceeds 100 characters (144)
+545:101:2:ZL300.max_line_length:line exceeds 100 characters (107)
+552:101:2:ZL300.max_line_length:line exceeds 100 characters (103)
+562:101:2:ZL300.max_line_length:line exceeds 100 characters (103)
+596:101:2:ZL300.max_line_length:line exceeds 100 characters (110)
+602:101:2:ZL300.max_line_length:line exceeds 100 characters (103)
+612:101:2:ZL300.max_line_length:line exceeds 100 characters (103)
+631:101:2:ZL300.max_line_length:line exceeds 100 characters (102)
+794:101:2:ZL300.max_line_length:line exceeds 100 characters (112)
+340:109:2:ZL303.max_nesting:nesting depth exceeds 4 (5)
+269:13:1:ZL009.var_should_be_const:variable 'read_count' is never reassigned; consider using 'const'
+277:13:1:ZL009.var_should_be_const:variable 'w' is never reassigned; consider using 'const'
+283:13:1:ZL009.var_should_be_const:variable 'i' is never reassigned; consider using 'const'
+369:13:1:ZL009.var_should_be_const:variable 'new_voters' is never reassigned; consider using 'const'
+373:13:1:ZL009.var_should_be_const:variable 'new_outgoing' is never reassigned; consider using 'const'
+384:13:1:ZL009.var_should_be_const:variable 'meta' is never reassigned; consider using 'const'
+410:13:1:ZL009.var_should_be_const:variable 'm' is never reassigned; consider using 'const'
+430:17:1:ZL009.var_should_be_const:variable 'hasher' is never reassigned; consider using 'const'
+432:17:1:ZL009.var_should_be_const:variable 'actual_digest' is never reassigned; consider using 'const'
+618:17:1:ZL009.var_should_be_const:variable 'digest' is never reassigned; consider using 'const'
+639:17:1:ZL009.var_should_be_const:variable 'digest' is never reassigned; consider using 'const'
+675:13:1:ZL009.var_should_be_const:variable 'iter' is never reassigned; consider using 'const'
+679:17:1:ZL009.var_should_be_const:variable 'entry_opt' is never reassigned; consider using 'const'
+681:17:1:ZL009.var_should_be_const:variable 'wal_entry' is never reassigned; consider using 'const'
+896:9:1:ZL009.var_should_be_const:variable 'tmp' is never reassigned; consider using 'const'
+902:9:1:ZL009.var_should_be_const:variable 'fs' is never reassigned; consider using 'const'
+180:39:1:ZL010.magic_number:magic number 20; consider using a named constant
+531:25:1:ZL010.magic_number:magic number 48; consider using a named constant
+532:39:1:ZL010.magic_number:magic number 52; consider using a named constant
+539:48:1:ZL010.magic_number:magic number 4; consider using a named constant
+539:57:1:ZL010.magic_number:magic number 4; consider using a named constant
+560:28:1:ZL010.magic_number:magic number 20; consider using a named constant
+563:22:1:ZL010.magic_number:magic number 20; consider using a named constant
+610:28:1:ZL010.magic_number:magic number 52; consider using a named constant
+613:22:1:ZL010.magic_number:magic number 52; consider using a named constant
+619:38:1:ZL010.magic_number:magic number 48; consider using a named constant
+626:27:1:ZL010.magic_number:magic number 52; consider using a named constant
+640:38:1:ZL010.magic_number:magic number 48; consider using a named constant
+642:17:1:ZL010.magic_number:magic number 52; consider using a named constant
+642:35:1:ZL010.magic_number:magic number 4; consider using a named constant
+824:21:1:ZL010.magic_number:magic number 3; consider using a named constant
+828:42:1:ZL010.magic_number:magic number 3; consider using a named constant
+830:62:1:ZL010.magic_number:magic number 3; consider using a named constant
+839:44:1:ZL010.magic_number:magic number 3; consider using a named constant
+856:53:1:ZL010.magic_number:magic number 5; consider using a named constant
+856:69:1:ZL010.magic_number:magic number 3; consider using a named constant
+863:46:1:ZL010.magic_number:magic number 5; consider using a named constant
+864:47:1:ZL010.magic_number:magic number 3; consider using a named constant
+908:21:1:ZL010.magic_number:magic number 3; consider using a named constant
+915:42:1:ZL010.magic_number:magic number 3; consider using a named constant
+916:62:1:ZL010.magic_number:magic number 3; consider using a named constant
+47:1:1:ZL011.missing_doc_comment:public declaration 'FileStorage' is missing documentation
+62:5:1:ZL011.missing_doc_comment:public declaration 'DirectoryAlreadyLocked' is missing documentation
+78:5:1:ZL011.missing_doc_comment:public declaration 'init' is missing documentation
+141:5:1:ZL011.missing_doc_comment:public declaration 'deinit' is missing documentation
+150:5:1:ZL011.missing_doc_comment:public declaration 'storage' is missing documentation
+173:5:1:ZL011.missing_doc_comment:public declaration 'saveHardStateImpl' is missing documentation
+196:5:1:ZL011.missing_doc_comment:public declaration 'appendEntriesImpl' is missing documentation
+259:5:1:ZL011.missing_doc_comment:public declaration 'entriesImpl' is missing documentation
+315:5:1:ZL011.missing_doc_comment:public declaration 'termImpl' is missing documentation
+323:5:1:ZL011.missing_doc_comment:public declaration 'lastIndexImpl' is missing documentation
+328:5:1:ZL011.missing_doc_comment:public declaration 'saveSnapshotImpl' is missing documentation
+383:5:1:ZL011.missing_doc_comment:public declaration 'loadSnapshotImpl' is missing documentation
+455:5:1:ZL011.missing_doc_comment:public declaration 'compactImpl' is missing documentation
+512:5:1:ZL011.missing_doc_comment:public declaration 'loadHardState' is missing documentation
+733:5:1:ZL011.missing_doc_comment:public declaration 'loadHardStateImpl' is missing documentation
+74:19:1:ZL502.platform_syscalls:low-level system call 'std.c.' may not be portable; prefer std library abstractions
+75:13:1:ZL502.platform_syscalls:low-level system call 'std.c.' may not be portable; prefer std library abstractions
+234:43:1:ZL602.unnecessary_alloc:allocation inside loop; consider preallocating or using arena allocator
+234:34:1:ZL602.unnecessary_alloc:allocation inside loop; consider preallocating or using arena allocator
+389:35:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+396:43:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+545:34:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+596:34:1:ZL603.missing_defer_cleanup:resource '.openFile(' may not be properly cleaned up; consider using defer
+234:43:1:ZL603.missing_defer_cleanup:resource '.alloc(' may not be properly cleaned up; consider using defer
+268:42:1:ZL603.missing_defer_cleanup:resource '.alloc(' may not be properly cleaned up; consider using defer
+47:23:1:ZL605.large_struct_copy:struct 'FileStorage' has 71 fields; consider passing by pointer to avoid copies

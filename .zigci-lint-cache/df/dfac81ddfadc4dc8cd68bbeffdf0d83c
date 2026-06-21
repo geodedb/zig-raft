@@ -1,0 +1,38 @@
+257:101:2:ZL300.max_line_length:line exceeds 100 characters (102)
+225:62:2:ZL303.max_nesting:nesting depth exceeds 4 (6)
+34:9:1:ZL009.var_should_be_const:variable 'count' is never reassigned; consider using 'const'
+87:9:1:ZL009.var_should_be_const:variable 't' is never reassigned; consider using 'const'
+253:9:1:ZL009.var_should_be_const:variable 'idx' is never reassigned; consider using 'const'
+287:9:1:ZL009.var_should_be_const:variable 't' is never reassigned; consider using 'const'
+352:9:1:ZL009.var_should_be_const:variable 't' is never reassigned; consider using 'const'
+371:9:1:ZL009.var_should_be_const:variable 'net' is never reassigned; consider using 'const'
+56:63:1:ZL010.magic_number:magic number 5; consider using a named constant
+61:60:1:ZL010.magic_number:magic number 5; consider using a named constant
+82:63:1:ZL010.magic_number:magic number 5; consider using a named constant
+88:16:1:ZL010.magic_number:magic number 300; consider using a named constant
+105:63:1:ZL010.magic_number:magic number 5; consider using a named constant
+132:16:1:ZL010.magic_number:magic number 60; consider using a named constant
+145:16:1:ZL010.magic_number:magic number 30; consider using a named constant
+166:63:1:ZL010.magic_number:magic number 3; consider using a named constant
+174:21:1:ZL010.magic_number:magic number 99; consider using a named constant
+175:31:1:ZL010.magic_number:magic number 10; consider using a named constant
+176:25:1:ZL010.magic_number:magic number 99; consider using a named constant
+185:47:1:ZL010.magic_number:magic number 10; consider using a named constant
+193:63:1:ZL010.magic_number:magic number 3; consider using a named constant
+207:23:1:ZL010.magic_number:magic number 99; consider using a named constant
+209:25:1:ZL010.magic_number:magic number 99; consider using a named constant
+216:52:1:ZL010.magic_number:magic number 99; consider using a named constant
+222:49:1:ZL010.magic_number:magic number 99; consider using a named constant
+241:63:1:ZL010.magic_number:magic number 3; consider using a named constant
+288:16:1:ZL010.magic_number:magic number 200; consider using a named constant
+294:63:1:ZL010.magic_number:magic number 3; consider using a named constant
+312:17:1:ZL010.magic_number:magic number 3; consider using a named constant
+339:63:1:ZL010.magic_number:magic number 3; consider using a named constant
+346:23:1:ZL010.magic_number:magic number 3; consider using a named constant
+348:26:1:ZL010.magic_number:magic number 3; consider using a named constant
+353:16:1:ZL010.magic_number:magic number 600; consider using a named constant
+371:63:1:ZL010.magic_number:magic number 3; consider using a named constant
+397:17:1:ZL010.magic_number:magic number 3; consider using a named constant
+25:31:1:ZL602.unnecessary_alloc:allocation inside loop; consider preallocating or using arena allocator
+25:22:1:ZL602.unnecessary_alloc:allocation inside loop; consider preallocating or using arena allocator
+25:31:1:ZL603.missing_defer_cleanup:resource '.alloc(' may not be properly cleaned up; consider using defer

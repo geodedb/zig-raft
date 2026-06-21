@@ -1,0 +1,58 @@
+27:101:2:ZL300.max_line_length:line exceeds 100 characters (108)
+190:101:2:ZL300.max_line_length:line exceeds 100 characters (106)
+299:45:2:ZL303.max_nesting:nesting depth exceeds 4 (6)
+611:9:1:ZL009.var_should_be_const:variable 'mem_store' is never reassigned; consider using 'const'
+614:9:1:ZL009.var_should_be_const:variable 'log' is never reassigned; consider using 'const'
+397:21:1:ZL010.magic_number:magic number 3; consider using a named constant
+401:42:1:ZL010.magic_number:magic number 3; consider using a named constant
+420:21:1:ZL010.magic_number:magic number 3; consider using a named constant
+421:21:1:ZL010.magic_number:magic number 4; consider using a named constant
+426:42:1:ZL010.magic_number:magic number 4; consider using a named constant
+427:42:1:ZL010.magic_number:magic number 4; consider using a named constant
+428:42:1:ZL010.magic_number:magic number 4; consider using a named constant
+445:21:1:ZL010.magic_number:magic number 3; consider using a named constant
+468:21:1:ZL010.magic_number:magic number 3; consider using a named constant
+469:21:1:ZL010.magic_number:magic number 4; consider using a named constant
+475:21:1:ZL010.magic_number:magic number 3; consider using a named constant
+476:21:1:ZL010.magic_number:magic number 4; consider using a named constant
+480:42:1:ZL010.magic_number:magic number 4; consider using a named constant
+483:59:1:ZL010.magic_number:magic number 3; consider using a named constant
+484:59:1:ZL010.magic_number:magic number 4; consider using a named constant
+497:21:1:ZL010.magic_number:magic number 3; consider using a named constant
+509:18:1:ZL010.magic_number:magic number 3; consider using a named constant
+510:42:1:ZL010.magic_number:magic number 3; consider using a named constant
+514:42:1:ZL010.magic_number:magic number 3; consider using a named constant
+532:46:1:ZL010.magic_number:magic number 3; consider using a named constant
+536:43:1:ZL010.magic_number:magic number 3; consider using a named constant
+569:42:1:ZL010.magic_number:magic number 5; consider using a named constant
+593:21:1:ZL010.magic_number:magic number 3; consider using a named constant
+594:21:1:ZL010.magic_number:magic number 4; consider using a named constant
+594:32:1:ZL010.magic_number:magic number 3; consider using a named constant
+603:59:1:ZL010.magic_number:magic number 3; consider using a named constant
+604:42:1:ZL010.magic_number:magic number 3; consider using a named constant
+604:59:1:ZL010.magic_number:magic number 4; consider using a named constant
+620:21:1:ZL010.magic_number:magic number 3; consider using a named constant
+623:44:1:ZL010.magic_number:magic number 3; consider using a named constant
+628:42:1:ZL010.magic_number:magic number 3; consider using a named constant
+631:22:1:ZL010.magic_number:magic number 3; consider using a named constant
+631:25:1:ZL010.magic_number:magic number 99; consider using a named constant
+635:22:1:ZL010.magic_number:magic number 3; consider using a named constant
+8:1:1:ZL011.missing_doc_comment:public declaration 'RaftLog' is missing documentation
+42:5:1:ZL011.missing_doc_comment:public declaration 'deinit' is missing documentation
+67:5:1:ZL011.missing_doc_comment:public declaration 'append' is missing documentation
+95:5:1:ZL011.missing_doc_comment:public declaration 'lastIndex' is missing documentation
+104:5:1:ZL011.missing_doc_comment:public declaration 'lastTerm' is missing documentation
+108:5:1:ZL011.missing_doc_comment:public declaration 'term' is missing documentation
+141:5:1:ZL011.missing_doc_comment:public declaration 'slice' is missing documentation
+181:5:1:ZL011.missing_doc_comment:public declaration 'maybeAppend' is missing documentation
+224:5:1:ZL011.missing_doc_comment:public declaration 'findConflict' is missing documentation
+232:5:1:ZL011.missing_doc_comment:public declaration 'commitTo' is missing documentation
+239:5:1:ZL011.missing_doc_comment:public declaration 'appliedTo' is missing documentation
+244:5:1:ZL011.missing_doc_comment:public declaration 'stableTo' is missing documentation
+276:5:1:ZL011.missing_doc_comment:public declaration 'compact' is missing documentation
+310:5:1:ZL011.missing_doc_comment:public declaration 'restore' is missing documentation
+328:5:1:ZL011.missing_doc_comment:public declaration 'matchTerm' is missing documentation
+333:5:1:ZL011.missing_doc_comment:public declaration 'isUpToDate' is missing documentation
+340:5:1:ZL011.missing_doc_comment:public declaration 'unstableSlice' is missing documentation
+175:42:1:ZL603.missing_defer_cleanup:resource '.alloc(' may not be properly cleaned up; consider using defer
+8:19:1:ZL605.large_struct_copy:struct 'RaftLog' has 56 fields; consider passing by pointer to avoid copies

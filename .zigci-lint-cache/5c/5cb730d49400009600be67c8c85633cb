@@ -1,0 +1,11 @@
+21:27:2:ZL204.no_dupe_import:duplicate import of 'build_options' (first at line 11)
+27:9:1:ZL009.var_should_be_const:variable 'span' is never reassigned; consider using 'const'
+38:9:1:ZL009.var_should_be_const:variable 'sspan' is never reassigned; consider using 'const'
+51:9:1:ZL009.var_should_be_const:variable 'client_span' is never reassigned; consider using 'const'
+56:9:1:ZL009.var_should_be_const:variable 'server_span' is never reassigned; consider using 'const'
+61:9:1:ZL009.var_should_be_const:variable 'snap_span' is never reassigned; consider using 'const'
+32:44:1:ZL010.magic_number:magic number 200; consider using a named constant
+43:45:1:ZL010.magic_number:magic number 200; consider using a named constant
+51:78:1:ZL010.magic_number:magic number 42; consider using a named constant
+56:76:1:ZL010.magic_number:magic number 7; consider using a named constant
+61:78:1:ZL010.magic_number:magic number 99; consider using a named constant

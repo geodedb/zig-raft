@@ -24,6 +24,8 @@ const Checker = @import("checker").Checker;
 
 /// Compute BLAKE3 hash of data (test helper).
 fn blake3Hash(data: []const u8) [32]u8 {
+    // fips-exempt: non-security — test helper hashing snapshot bytes for
+    // state-equality checks across nodes; not a security operation.
     var h = std.crypto.hash.Blake3.init(.{});
     h.update(data);
     var digest: [32]u8 = undefined;

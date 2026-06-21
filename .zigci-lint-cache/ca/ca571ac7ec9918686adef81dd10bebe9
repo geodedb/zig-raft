@@ -1,0 +1,99 @@
+25:101:2:ZL300.max_line_length:line exceeds 100 characters (110)
+71:101:2:ZL300.max_line_length:line exceeds 100 characters (139)
+73:101:2:ZL300.max_line_length:line exceeds 100 characters (104)
+129:101:2:ZL300.max_line_length:line exceeds 100 characters (111)
+149:101:2:ZL300.max_line_length:line exceeds 100 characters (117)
+230:101:2:ZL300.max_line_length:line exceeds 100 characters (102)
+231:101:2:ZL300.max_line_length:line exceeds 100 characters (105)
+163:5:2:ZL302.max_params:function has too many parameters (8 > 6)
+113:35:2:ZL303.max_nesting:nesting depth exceeds 4 (5)
+27:17:1:ZL009.var_should_be_const:variable 'buf' is never reassigned; consider using 'const'
+203:9:1:ZL009.var_should_be_const:variable 'i' is never reassigned; consider using 'const'
+244:9:1:ZL009.var_should_be_const:variable 'i' is never reassigned; consider using 'const'
+425:9:1:ZL009.var_should_be_const:variable 'es' is never reassigned; consider using 'const'
+200:59:1:ZL010.magic_number:magic number 3; consider using a named constant
+200:71:1:ZL010.magic_number:magic number 42; consider using a named constant
+204:16:1:ZL010.magic_number:magic number 50; consider using a named constant
+214:59:1:ZL010.magic_number:magic number 3; consider using a named constant
+214:71:1:ZL010.magic_number:magic number 99; consider using a named constant
+224:29:1:ZL010.magic_number:magic number 3; consider using a named constant
+225:51:1:ZL010.magic_number:magic number 3; consider using a named constant
+226:50:1:ZL010.magic_number:magic number 6; consider using a named constant
+237:44:1:ZL010.magic_number:magic number 5; consider using a named constant
+237:59:1:ZL010.magic_number:magic number 7; consider using a named constant
+245:16:1:ZL010.magic_number:magic number 5; consider using a named constant
+258:44:1:ZL010.magic_number:magic number 10; consider using a named constant
+258:48:1:ZL010.magic_number:magic number 3; consider using a named constant
+275:44:1:ZL010.magic_number:magic number 10; consider using a named constant
+275:48:1:ZL010.magic_number:magic number 3; consider using a named constant
+280:23:1:ZL010.magic_number:magic number 3; consider using a named constant
+282:34:1:ZL010.magic_number:magic number 3; consider using a named constant
+297:44:1:ZL010.magic_number:magic number 10; consider using a named constant
+297:48:1:ZL010.magic_number:magic number 3; consider using a named constant
+300:34:1:ZL010.magic_number:magic number 3; consider using a named constant
+300:37:1:ZL010.magic_number:magic number 4; consider using a named constant
+300:40:1:ZL010.magic_number:magic number 5; consider using a named constant
+308:23:1:ZL010.magic_number:magic number 3; consider using a named constant
+315:44:1:ZL010.magic_number:magic number 10; consider using a named constant
+315:48:1:ZL010.magic_number:magic number 3; consider using a named constant
+318:38:1:ZL010.magic_number:magic number 3; consider using a named constant
+319:32:1:ZL010.magic_number:magic number 4; consider using a named constant
+319:35:1:ZL010.magic_number:magic number 5; consider using a named constant
+319:38:1:ZL010.magic_number:magic number 6; consider using a named constant
+327:23:1:ZL010.magic_number:magic number 4; consider using a named constant
+328:23:1:ZL010.magic_number:magic number 5; consider using a named constant
+342:44:1:ZL010.magic_number:magic number 10; consider using a named constant
+342:48:1:ZL010.magic_number:magic number 3; consider using a named constant
+345:34:1:ZL010.magic_number:magic number 3; consider using a named constant
+356:23:1:ZL010.magic_number:magic number 3; consider using a named constant
+365:44:1:ZL010.magic_number:magic number 10; consider using a named constant
+365:48:1:ZL010.magic_number:magic number 3; consider using a named constant
+368:38:1:ZL010.magic_number:magic number 3; consider using a named constant
+369:32:1:ZL010.magic_number:magic number 4; consider using a named constant
+369:35:1:ZL010.magic_number:magic number 5; consider using a named constant
+369:38:1:ZL010.magic_number:magic number 6; consider using a named constant
+386:23:1:ZL010.magic_number:magic number 4; consider using a named constant
+392:53:1:ZL010.magic_number:magic number 5; consider using a named constant
+392:56:1:ZL010.magic_number:magic number 3; consider using a named constant
+392:59:1:ZL010.magic_number:magic number 5; consider using a named constant
+395:53:1:ZL010.magic_number:magic number 5; consider using a named constant
+395:59:1:ZL010.magic_number:magic number 5; consider using a named constant
+398:53:1:ZL010.magic_number:magic number 6; consider using a named constant
+398:59:1:ZL010.magic_number:magic number 5; consider using a named constant
+401:50:1:ZL010.magic_number:magic number 5; consider using a named constant
+401:53:1:ZL010.magic_number:magic number 3; consider using a named constant
+401:56:1:ZL010.magic_number:magic number 5; consider using a named constant
+405:45:1:ZL010.magic_number:magic number 3; consider using a named constant
+405:51:1:ZL010.magic_number:magic number 10; consider using a named constant
+405:55:1:ZL010.magic_number:magic number 10; consider using a named constant
+405:59:1:ZL010.magic_number:magic number 5; consider using a named constant
+410:54:1:ZL010.magic_number:magic number 10; consider using a named constant
+410:61:1:ZL010.magic_number:magic number 5; consider using a named constant
+413:54:1:ZL010.magic_number:magic number 4; consider using a named constant
+413:60:1:ZL010.magic_number:magic number 5; consider using a named constant
+418:44:1:ZL010.magic_number:magic number 3; consider using a named constant
+418:50:1:ZL010.magic_number:magic number 5; consider using a named constant
+418:53:1:ZL010.magic_number:magic number 3; consider using a named constant
+418:56:1:ZL010.magic_number:magic number 5; consider using a named constant
+421:45:1:ZL010.magic_number:magic number 3; consider using a named constant
+421:51:1:ZL010.magic_number:magic number 4; consider using a named constant
+421:57:1:ZL010.magic_number:magic number 5; consider using a named constant
+425:56:1:ZL010.magic_number:magic number 10; consider using a named constant
+425:63:1:ZL010.magic_number:magic number 42; consider using a named constant
+8:1:1:ZL011.missing_doc_comment:public declaration 'VoteTally' is missing documentation
+13:1:1:ZL011.missing_doc_comment:public declaration 'ElectionState' is missing documentation
+25:5:1:ZL011.missing_doc_comment:public declaration 'init' is missing documentation
+47:5:1:ZL011.missing_doc_comment:public declaration 'deinit' is missing documentation
+51:5:1:ZL011.missing_doc_comment:public declaration 'resetElectionTimeout' is missing documentation
+76:5:1:ZL011.missing_doc_comment:public declaration 'electionTimeoutElapsed' is missing documentation
+80:5:1:ZL011.missing_doc_comment:public declaration 'heartbeatTimeoutElapsed' is missing documentation
+84:5:1:ZL011.missing_doc_comment:public declaration 'tickElection' is missing documentation
+90:5:1:ZL011.missing_doc_comment:public declaration 'tickHeartbeat' is missing documentation
+95:5:1:ZL011.missing_doc_comment:public declaration 'resetElectionElapsed' is missing documentation
+99:5:1:ZL011.missing_doc_comment:public declaration 'resetHeartbeatElapsed' is missing documentation
+103:5:1:ZL011.missing_doc_comment:public declaration 'recordVote' is missing documentation
+107:5:1:ZL011.missing_doc_comment:public declaration 'tallyVotes' is missing documentation
+124:5:1:ZL011.missing_doc_comment:public declaration 'hasQuorum' is missing documentation
+129:5:1:ZL011.missing_doc_comment:public declaration 'hasJointQuorum' is missing documentation
+157:5:1:ZL011.missing_doc_comment:public declaration 'resetVotes' is missing documentation
+163:1:1:ZL011.missing_doc_comment:public declaration 'shouldGrantVote' is missing documentation
