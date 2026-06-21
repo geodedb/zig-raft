@@ -17,6 +17,8 @@ pub const ElectionState = struct {
     heartbeat_elapsed: u32,
     election_elapsed: u32,
     votes_received: std.AutoHashMap(u64, bool),
+    // fips-exempt: non-security — randomized election timeout to break Raft
+    // leader-election ties (liveness); not a secret or key.
     prng: std.Random.DefaultPrng,
     allocator: Allocator,
 
@@ -27,6 +29,7 @@ pub const ElectionState = struct {
             io.random(&buf);
             break :blk std.mem.readInt(u64, &buf, .little);
         };
+        // fips-exempt: non-security — election-timeout jitter PRNG (see field above).
         const prng = std.Random.DefaultPrng.init(seed);
 
         return .{

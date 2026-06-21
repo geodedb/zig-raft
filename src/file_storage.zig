@@ -174,6 +174,8 @@ pub const FileStorage = struct {
         var buf: [20]u8 = undefined;
         std.mem.writeInt(u64, buf[0..8], hs.current_term, .little);
         std.mem.writeInt(u64, buf[8..16], hs.voted_for orelse VOTED_FOR_NONE, .little);
+        // fips-exempt: non-security — CRC32 record-integrity check for the on-disk
+        // hard-state file; detects corruption, not tampering.
         const crc = std.hash.Crc32.hash(buf[0..16]);
         std.mem.writeInt(u32, buf[16..20], crc, .little);
 
@@ -324,6 +326,7 @@ pub const FileStorage = struct {
     }
 
     pub fn saveSnapshotImpl(self: *FileStorage, snap: rpc.Snapshot) !void {
+        // fips-exempt: non-security — snapshot-data integrity digest on disk.
         const Blake3 = std.crypto.hash.Blake3;
         var hasher = Blake3.init(.{});
         hasher.update(snap.data);
@@ -422,6 +425,7 @@ pub const FileStorage = struct {
         }
 
         if (m.data_digest) |expected_digest| {
+            // fips-exempt: non-security — snapshot-data integrity verification on load.
             const Blake3 = std.crypto.hash.Blake3;
             var hasher = Blake3.init(.{});
             hasher.update(data);
@@ -530,6 +534,7 @@ pub const FileStorage = struct {
             @memcpy(buf[52..][0..config_data.len], config_data);
         }
         const payload = buf[0 .. total_size - 4];
+        // fips-exempt: non-security — CRC32 record-integrity check for snapshot meta.
         const crc = std.hash.Crc32.hash(payload);
         std.mem.writeInt(u32, buf[total_size - 4 ..][0..4], crc, .little);
 
@@ -557,6 +562,7 @@ pub const FileStorage = struct {
             const n = try file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), &buf, 0);
             if (n != 20) return error.InvalidHardState;
             const stored_crc = std.mem.readInt(u32, buf[16..20], .little);
+            // fips-exempt: non-security — CRC32 corruption check on read.
             const computed_crc = std.hash.Crc32.hash(buf[0..16]);
             if (stored_crc != computed_crc) return error.InvalidHardState;
             const term = std.mem.readInt(u64, buf[0..8], .little);
@@ -606,6 +612,7 @@ pub const FileStorage = struct {
             const n = try file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), &buf, 0);
             if (n != 52) return error.InvalidSnapshotMeta;
             const stored_crc = std.mem.readInt(u32, buf[48..52], .little);
+            // fips-exempt: non-security — CRC32 corruption check on read.
             const computed_crc = std.hash.Crc32.hash(buf[0..48]);
             if (stored_crc != computed_crc) return error.InvalidSnapshotMeta;
             var digest: [32]u8 = undefined;
@@ -625,6 +632,7 @@ pub const FileStorage = struct {
             if (n != size) return error.InvalidSnapshotMeta;
 
             const stored_crc = std.mem.readInt(u32, buf[size - 4 ..][0..4], .little);
+            // fips-exempt: non-security — CRC32 corruption check on read.
             const computed_crc = std.hash.Crc32.hash(buf[0 .. size - 4]);
             if (stored_crc != computed_crc) return error.InvalidSnapshotMeta;
 

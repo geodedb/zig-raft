@@ -101,6 +101,9 @@ pub const SnapshotState = struct {
     /// computation and chunk construction on large snapshots. Currently
     /// sequential: Zig's Blake3 API does not expose parallel tree hashing,
     /// and per-chunk work is trivially cheap.
+    // fips-exempt: non-security — snapshot-data integrity digest only (detects
+    // corruption/truncation of snapshot bytes in transit and on disk); not
+    // authentication and not protecting a secret.
     const Blake3 = std.crypto.hash.Blake3;
 
     pub fn buildInstallSnapshotMessages(
@@ -114,6 +117,7 @@ pub const SnapshotState = struct {
         const data = snapshot.data;
 
         // Compute BLAKE3 digest of the full snapshot data.
+        // fips-exempt: non-security — snapshot-data integrity digest (see alias above).
         var hasher = Blake3.init(.{});
         hasher.update(data);
         var digest: [32]u8 = undefined;
@@ -226,6 +230,7 @@ pub const SnapshotState = struct {
 
         if (msg.done) {
             const assembled = pending.data.items;
+            // fips-exempt: non-security — snapshot-data integrity verification (see alias above).
             var hasher = Blake3.init(.{});
             hasher.update(assembled);
             var digest: [32]u8 = undefined;
@@ -329,6 +334,7 @@ const test_config = rpc.ClusterConfig{
 
 /// Test helper: compute BLAKE3 hash of data.
 fn blake3Hash(data: []const u8) [32]u8 {
+    // fips-exempt: non-security — test helper computing the snapshot-data integrity digest.
     var hasher = std.crypto.hash.Blake3.init(.{});
     hasher.update(data);
     var digest: [32]u8 = undefined;
@@ -892,4 +898,9 @@ test "receiveChunk rejects last_included_term > term (SEC-0141)" {
     defer ss.allocator.free(snap.?.data);
     defer if (snap.?.metadata.config.voters.len > 0) ss.allocator.free(snap.?.metadata.config.voters);
     defer if (snap.?.metadata.config.voters_outgoing.len > 0) ss.allocator.free(snap.?.metadata.config.voters_outgoing);
+}
+
+test "fips-exempt annotation present on BLAKE3 snapshot integrity sites" {
+    const src = @embedFile("snapshot.zig");
+    try std.testing.expect(std.mem.indexOf(u8, src, "fips-exempt: non-security — snapshot-data integrity") != null);
 }
