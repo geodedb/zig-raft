@@ -44,6 +44,7 @@ pub fn build(b: *std.Build) void {
     // imports the SAME module instance via `addImport` to avoid Zig's
     // "file exists in modules X and X0" error when two independent
     // `addOptions` modules end up sharing a transitive file path.
+    build_options.addOption([]const u8, "package_name", "raft");
     const build_options_mod = build_options.createModule();
 
     // Observability seam (otel). Declared as a SHARED NAMED MODULE so
