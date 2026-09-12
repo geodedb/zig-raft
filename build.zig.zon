@@ -1,24 +1,24 @@
 .{
     .name = .raft,
-    .version = "0.1.13",
+    .version = "0.1.14",
     .fingerprint = 0xcda86f18be72a23e,
     .minimum_zig_version = "0.15.1",
     .dependencies = .{
         .thread_pool = .{
-            .url = "git+https://gitlab.com/devnw/zig/thread-pool.git?ref=v0.2.6#aa4493781d962f42ba1dd37261e0e107be5f6ffe",
-            .hash = "thread_pool-0.2.5-11B1BiNceQDdiX2mLCg-blCuvBT0ZHh0_A_gH9j7t2Gl",
+            .url = "git+https://gitlab.com/devnw/zig/thread-pool.git?ref=v0.2.7#54a2ddda1a356c32ba2e4df70691459570fb6339",
+            .hash = "thread_pool-0.2.7-11B1BvRneQBnMkDnRbKd76THvZn4ZhDhmlWQw-aziWQm",
         },
         .wal = .{
-            .url = "git+https://gitlab.com/devnw/zig/wal.git#v0.1.12",
-            .hash = "wal-0.1.12-EqPqpmVXBQBXfTTDLspnODMxihbhEg744Xlwd2JhR9Lx",
+            .url = "git+https://gitlab.com/devnw/zig/wal.git?ref=v0.1.13#9423deef65b17ebab51f1a89670b2e446b33c5f1",
+            .hash = "wal-0.1.13-EqPqpr9XBQAqyfIYRGxnz46NycS0QMmFMu8SVsWGodVu",
         },
         // Gated otel dependency — only fetched when `-Dwith_otel=true`
         // because `b.lazyDependency("otel", ...)` is called only inside
         // the `if (with_otel)` block in build.zig. When the flag is off,
         // the package manager never resolves this entry.
         .otel = .{
-            .url = "git+https://gitlab.com/devnw/zig/otel.git#v0.1.17",
-            .hash = "otel-0.1.17-B0v3lvT2NQAYURxdLxS-8cMcAqL8Qfniddlwq1ai86G7",
+            .url = "git+https://gitlab.com/devnw/zig/otel.git?ref=v0.1.18#d431d1bb72203f51b6922f3a88093cec854dc050",
+            .hash = "otel-0.1.18-B0v3liP3NQB05N3TveX5FJIiWYYRm0UGCeMZ0P9bi_ha",
             .lazy = true,
         },
     },
