@@ -4,53 +4,67 @@
 
 default:
   interruptible: true
+  cache:
+    - key: "zig-toolchain-${ZIG_VERSION}-linux-amd64"
+      paths: ["zig-${ZIG_VERSION}/"]
+      policy: pull
+    - key:
+        prefix: "zig-compile-${ZIG_VERSION}-linux-amd64-${CI_JOB_NAME}"
+        files: [build.zig.zon]
+      paths: [.zig-cache/, .zig-global-cache/]
+  after_script:
+    - |
+      size=$(du -sm .zig-cache .zig-global-cache 2>/dev/null | awk '{sum += $1} END {print sum+0}')
+      if [ "$size" -gt 2048 ]; then rm -rf .zig-cache .zig-global-cache; fi
   tags:
     - company
     - linux
-    # Inherited GitLab SAST images are AMD64-only; avoid ARM fleet runners.
+    # Keep these jobs on Linux AMD64 runners.
     - amd64
 
 include:
+  # Exercise the portable UUID/WAL entropy path on macOS before Geode consumes it.
+  - component: gitlab.com/devnw/ci-catalog/zig-test-macos@55d86c5ce70793e9e01c2b2d369d1d449b6d5fbc
+    inputs:
+      zig_version: "0.16.0"
+      job_suffix: "-portable-deps"
+      test_step: test
+      test_options: "test-integration -j2 --summary all"
+      allow_failure: false
+
   # Security scanning
-  - component: gitlab.com/devnw/ci-catalog/security-sast@v1.57.0
-    inputs:
-      tags: ["company", "linux", "x86"]
-  - component: gitlab.com/devnw/ci-catalog/security-dependency-scanning@v1.57.0
-    inputs:
-      tags: ["company", "linux", "x86"]
-  - component: gitlab.com/devnw/ci-catalog/security-secrets@v1.57.0
-    inputs:
-      tags: ["company", "linux", "x86"]
-  - component: gitlab.com/devnw/ci-catalog/security-gitleaks@v1.57.0
+  - component: gitlab.com/devnw/ci-catalog/security-gitleaks@aad997d40e358eeef7ec943f761498341c37c724
     inputs:
       tags: ["company", "linux", "x86"]
 
   # Code quality
-  - component: gitlab.com/devnw/ci-catalog/zig-format@v1.57.0
+  - component: gitlab.com/devnw/ci-catalog/zig-format@aad997d40e358eeef7ec943f761498341c37c724
     inputs:
       tags: ["company", "linux", "x86"]
 
   # SBOM
-  - component: gitlab.com/devnw/ci-catalog/sbom-generate@v1.57.0
+  - component: gitlab.com/devnw/ci-catalog/sbom-generate@aad997d40e358eeef7ec943f761498341c37c724
     inputs:
       tags: ["company", "linux", "x86"]
-  - component: gitlab.com/devnw/ci-catalog/sbom-scan@v1.57.0
+  - component: gitlab.com/devnw/ci-catalog/sbom-scan@aad997d40e358eeef7ec943f761498341c37c724
     inputs:
       tags: ["company", "linux", "x86"]
 
   # Release
-  - component: gitlab.com/devnw/ci-catalog/release-semantic@3122045afd7832332b342ca72065e4db7dde5ed4
+  - component: gitlab.com/devnw/ci-catalog/release-semantic@aad997d40e358eeef7ec943f761498341c37c724
     inputs:
       tags: ["company", "linux", "x86"]
       release_auth: job_token
-  - component: gitlab.com/devnw/ci-catalog/zig-version-tag-check@v1.57.0
+  - component: gitlab.com/devnw/ci-catalog/zig-version-tag-check@aad997d40e358eeef7ec943f761498341c37c724
     inputs:
       tags: ["company", "linux", "x86"]
 
 variables:
   ZIG_VERSION: "0.16.0"
+  ZIG_GLOBAL_CACHE_DIR: "$CI_PROJECT_DIR/.zig-global-cache"
 
 stages:
+  - prepare
   - lint
   - build
   - test
@@ -106,9 +120,21 @@ zig-format:
   before_script:
     - *install-zig
 
+# One writer owns the toolchain cache; test jobs only restore it.
+prepare-zig:
+  stage: prepare
+  image: debian:bookworm-slim
+  script:
+    - *install-zig
+  cache:
+    key: "zig-toolchain-${ZIG_VERSION}-linux-amd64"
+    paths: ["zig-${ZIG_VERSION}/"]
+    policy: pull-push
+
 # Build job
 build:
   stage: build
+  needs: [prepare-zig]
   image: debian:bookworm-slim
   before_script:
     - *install-zig
@@ -292,10 +318,27 @@ workflow:
         on_new_commit: none
     # SRE-194: validation pipelines fail fast on the first blocking job failure;
     # these rules admit only what the next rule already admits.
+    # The complete job graph uses branch pipelines; avoid partial MR duplicates.
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-      auto_cancel:
-        on_job_failure: all
+      when: never
     - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
       auto_cancel:
         on_job_failure: all
     - when: always
+
+zig-test-macos-portable-deps-0.16.0:
+  image: macos-26-xcode-26
+  needs: []
+  variables:
+    ZIG_GLOBAL_CACHE_DIR: "$CI_PROJECT_DIR/.zig-global-cache"
+  cache:
+    key:
+      prefix: "zig-macos-0.16.0-aarch64"
+      files: [build.zig.zon]
+    paths: [zig-0.16.0/, .zig-global-cache/, .zig-cache/]
+  after_script:
+    - |
+      size=$(du -sm .zig-cache .zig-global-cache 2>/dev/null | awk '{sum += $1} END {print sum+0}')
+      if [ "$size" -gt 2048 ]; then rm -rf .zig-cache .zig-global-cache; fi
+  rules:
+    - if: '$CI_COMMIT_BRANCH || $CI_COMMIT_TAG'
