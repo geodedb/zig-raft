@@ -26,6 +26,7 @@ include:
   # Exercise the portable UUID/WAL entropy path on macOS before Geode consumes it.
   - component: gitlab.com/devnw/ci-catalog/zig-test-macos@55d86c5ce70793e9e01c2b2d369d1d449b6d5fbc
     inputs:
+      tags: [dedicated, macos, arm]
       zig_version: "0.16.0"
       job_suffix: "-portable-deps"
       test_step: test
@@ -327,7 +328,6 @@ workflow:
     - when: always
 
 zig-test-macos-portable-deps-0.16.0:
-  image: macos-26-xcode-26
   needs: []
   variables:
     ZIG_GLOBAL_CACHE_DIR: "$CI_PROJECT_DIR/.zig-global-cache"
