@@ -156,6 +156,11 @@ pub const RaftNode = struct {
     /// contact). Reset on becomeLeader/becomeFollower; drives the timer-based
     /// candidate demotion in tick(). See Config.candidate_demote_threshold.
     consecutive_election_failures: u32 = 0,
+    /// Index of the final config entry (C_new) that removes this leader, or
+    /// 0. The leader keeps leading (without counting itself, as C_new
+    /// excludes it) until that entry commits, then steps down (Raft §4.2.2,
+    /// SONNY-6611).
+    stepdown_index: u64 = 0,
 
     // -----------------------------------------------------------------------
     // Public API
@@ -498,11 +503,19 @@ pub const RaftNode = struct {
                     // preventing Raft §6 safety violation on OOM (SEC-0139).
                     self.membership_state.commitFinalizeChange();
                     self.pending_config_index = 0;
+                    if (!mem.isVoter(self.membership_state.config(), self.id)) {
+                        self.stepdown_index = entry.index;
+                    }
                 }
             }
 
-            // Check if leader should step down.
-            if (self.membership_state.shouldLeaderStepDown(self.id)) {
+            // A leader outside C_new steps down once C_new is committed, not
+            // when it is appended: until then the remaining voters may not
+            // have it, and nobody else can drive it to commit (Raft §4.2.2).
+            // The heartbeat above already carried the new commit index.
+            if (self.membership_state.shouldLeaderStepDown(self.id) and
+                self.log.committed >= self.stepdown_index)
+            {
                 self.becomeFollower(self.current_term, null);
                 return;
             }
@@ -546,6 +559,11 @@ pub const RaftNode = struct {
     }
 
     pub fn ready(self: *RaftNode) !rd.Ready {
+        // Refuse before collecting anything: a second call before advance()
+        // would add the committed entries again (and could move the slice the
+        // previous Ready handed out) (SONNY-6611).
+        if (self.ready_state.has_pending_ready) return error.ReadyNotAdvanced;
+
         // Collect committed entries.
         if (self.log.committed > self.log.applied) {
             // Checked overflow: applied + 1, committed + 1 (SEC-0071).
@@ -600,8 +618,8 @@ pub const RaftNode = struct {
         // this is the follower-side analogue. saveSnapshot advances the store's
         // snapshot_index so the subsequent appendEntries truncates the stale
         // tail correctly.
-        if (self.ready_state.pending_snapshot) |pending_snap| {
-            try self.storage.saveSnapshot(pending_snap);
+        if (self.ready_state.ready_snapshot) |ready_snap| {
+            try self.storage.saveSnapshot(ready_snap);
         }
 
         // Persist hard state if changed.
@@ -663,6 +681,9 @@ pub const RaftNode = struct {
         if (unstable.len > 0) {
             const last = unstable[unstable.len - 1];
             try self.log.stableTo(last.index, last.term);
+            // The leader's own entries now count toward commit; without
+            // this a single-node cluster would wait for another tick.
+            if (self.role == .leader) self.maybeCommit();
         }
     }
 
@@ -695,6 +716,7 @@ pub const RaftNode = struct {
         self.leader_id = leader_id;
         self.is_pre_vote_election = false;
         self.consecutive_election_failures = 0;
+        self.stepdown_index = 0;
         self.election_state.resetElectionElapsed();
         self.election_state.resetElectionTimeout();
 
@@ -1104,13 +1126,18 @@ pub const RaftNode = struct {
             } });
         } else {
             const conflict = self.log.findConflict(msg.prev_log_index);
-            self.sendAfterPersist(msg.leader_id, rpc.Message{ .append_entries_response = .{
-                .term = self.current_term,
-                .success = false,
-                .match_index = 0,
-                .conflict_index = conflict.index,
-                .conflict_term = conflict.term_val,
-            } });
+            self.sendAfterPersist(msg.leader_id, rpc.Message{
+                .append_entries_response = .{
+                    .term = self.current_term,
+                    .success = false,
+                    // On a rejection, match_index carries the rejected
+                    // prev_log_index so the leader can drop stale rejections
+                    // (SONNY-6611).
+                    .match_index = msg.prev_log_index,
+                    .conflict_index = conflict.index,
+                    .conflict_term = conflict.term_val,
+                },
+            });
         }
     }
 
@@ -1134,7 +1161,10 @@ pub const RaftNode = struct {
             _ = progress.maybeUpdate(msg.match_index);
             self.maybeCommit();
         } else {
-            if (progress.maybeDecrTo(msg.match_index, msg.conflict_index, msg.conflict_term)) {
+            // A rejection carries the rejected prev_log_index in match_index
+            // and the follower's conflict hint (SONNY-6611).
+            const hint = repl.backtrackHint(&self.log, msg.match_index, msg.conflict_index, msg.conflict_term);
+            if (progress.maybeDecrTo(msg.match_index, hint, msg.conflict_term)) {
                 // Send retry AppendEntries with updated next_index.
                 const ae_msg = rs.buildAppendEntries(
                     from,
@@ -1226,8 +1256,10 @@ pub const RaftNode = struct {
                 // Snapshot supersedes any in-flight config change (SEC-0112).
                 self.pending_config_index = 0;
             }
-            // Transfer ownership to ready_state — errdefer will not fire
-            // on normal return since setSnapshot is infallible.
+            // Transfer ownership to ready_state, which frees it at the
+            // advance() after the Ready that delivers it (SONNY-6611); the
+            // errdefer will not fire on normal return since setSnapshot is
+            // infallible.
             self.ready_state.setSnapshot(snapshot_val);
             self.perf_stats.snapshots_installed += 1;
             self.sendAfterPersist(msg.leader_id, rpc.Message{ .install_snapshot_response = .{
@@ -1860,10 +1892,11 @@ test "stats returns correct counters after tick and propose (QA-010)" {
     s = node.stats();
     try std.testing.expectEqual(@as(u64, 2), s.proposals);
 
-    // Tick to run maybeCommit() so the commit index advances.
+    // The entries commit once advance() has persisted them (SONNY-6611),
+    // and are applied by the Ready after that.
     try node.tick(null);
-
-    // After ready+advance, entries_applied should increment.
+    _ = try node.ready();
+    try node.advance();
     _ = try node.ready();
     try node.advance();
     s = node.stats();

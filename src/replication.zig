@@ -31,23 +31,36 @@ pub const PeerProgress = struct {
         return self.next_index <= snapshot_index;
     }
 
-    /// After rejection with conflict hints, update next_index for fast backtracking.
-    /// Returns true if next_index changed.
-    /// Only allows backward movement of next_index to prevent a malicious
-    /// conflict_index from jumping next_index forward (SEC-0076).
-    /// Never moves next_index to or below match_index: the peer acked those
-    /// entries, so a rejection that points there is stale (a reply to an
-    /// older AppendEntries delivered late). Acting on it sent a peer that had
-    /// just installed a snapshot back below the snapshot, re-sending it
-    /// forever.
+    /// After a rejection of the AppendEntries whose prev_log_index was
+    /// `rejected_index`, move next_index back to `conflict_index` (fast
+    /// backtracking: use `backtrackHint` to fold the follower's
+    /// `conflict_term` into it). Returns true if next_index changed.
+    ///
+    /// - A stale rejection (sent before next_index last moved:
+    ///   `rejected_index + 1 != next_index`) and a hint past the rejected
+    ///   index (the follower already holds that much, e.g. in its snapshot)
+    ///   are ignored (SONNY-6611).
+    /// - A rejection without a position (`rejected_index` 0: a stale-term
+    ///   or malformed AppendEntries, a follower on raft <= 0.2.1, or a
+    ///   transport that does not carry the field) backs off to
+    ///   `conflict_index` as before, so mixed-version clusters still
+    ///   converge.
+    /// - Only allows backward movement of next_index to prevent a malicious
+    ///   conflict_index from jumping next_index forward (SEC-0076).
+    /// - Never moves next_index to or below match_index: the peer acked
+    ///   those entries. Acting on such a rejection sent a peer that had just
+    ///   installed a snapshot back below the snapshot, re-sending it forever.
     pub fn maybeDecrTo(
         self: *PeerProgress,
         rejected_index: u64,
         conflict_index: u64,
         conflict_term: u64,
     ) bool {
-        _ = rejected_index;
         _ = conflict_term;
+        if (rejected_index != 0) {
+            if (rejected_index +| 1 != self.next_index) return false;
+            if (conflict_index > rejected_index) return false;
+        }
         const floor = std.math.add(u64, self.match_index, 1) catch self.match_index;
         const new_next = @max(conflict_index, floor, 1);
         // Only allow backward movement (SEC-0076).
@@ -72,6 +85,29 @@ pub const PeerProgress = struct {
         return changed;
     }
 };
+
+/// Where to resume after a follower rejected the AppendEntries whose
+/// prev_log_index was `rejected_index`, reporting its `conflict_term` and
+/// the first index of that term (`conflict_index`). If the leader holds
+/// `conflict_term` at or below `rejected_index`, resume just past its last
+/// entry of that term; otherwise skip the follower's whole term
+/// (`conflict_index`). A term of 0 means "log too short": resume at
+/// `conflict_index` (SONNY-6611).
+pub fn backtrackHint(
+    raft_log_ptr: *raft_log.RaftLog,
+    rejected_index: u64,
+    conflict_index: u64,
+    conflict_term: u64,
+) u64 {
+    if (conflict_term == 0) return conflict_index;
+    var i = @min(rejected_index, raft_log_ptr.lastIndex());
+    while (i > raft_log_ptr.snapshot_index) : (i -= 1) {
+        const t = raft_log_ptr.term(i) catch break;
+        if (t == conflict_term) return i + 1;
+        if (t < conflict_term) break;
+    }
+    return conflict_index;
+}
 
 pub const ReplicationState = struct {
     peers: std.AutoHashMap(u64, PeerProgress),
@@ -229,9 +265,11 @@ pub const ReplicationState = struct {
         defer if (count > 16) self.allocator.free(match_indices);
         var n: usize = 0;
 
-        // Leader's own match index is its last log index.
+        // The leader counts itself only for entries it has persisted: an
+        // unsaved entry could be lost with the leader yet already count
+        // toward commit (SONNY-6611).
         node_ids[n] = leader_id;
-        match_indices[n] = raft_log_ptr.lastIndex();
+        match_indices[n] = raft_log_ptr.stableLastIndex();
         n += 1;
 
         var it = self.peers.iterator();
@@ -415,6 +453,9 @@ test "maybeCommit advances commit when majority has replicated" {
         .{ .index = 3, .term = 3, .kind = .normal, .data = &.{} },
     };
     try log.append(&entries);
+    // The leader has persisted them (advancePersist + stableTo).
+    try mem_store.appendEntriesImpl(&entries);
+    try log.stableTo(3, 3);
 
     const peer_ids = [_]u64{ 2, 3 };
     var rs = try ReplicationState.init(std.testing.allocator, &peer_ids, 3);
@@ -427,6 +468,38 @@ test "maybeCommit advances commit when majority has replicated" {
     const voters = [_]u64{ 1, 2, 3 };
     const committed = try rs.maybeCommit(&log, &voters, &.{}, 3, 1);
     try std.testing.expect(committed);
+    try std.testing.expectEqual(@as(u64, 3), log.committed);
+}
+
+test "maybeCommit does not count the leader's unpersisted entries (SONNY-6611)" {
+    var mem_store = stg.InMemoryStorage.init(std.testing.allocator);
+    defer mem_store.deinit();
+
+    var log = try raft_log.RaftLog.init(std.testing.allocator, mem_store.storage(), 0, 0);
+    defer log.deinit();
+
+    const entries = [_]rpc.Entry{
+        .{ .index = 1, .term = 3, .kind = .normal, .data = &.{} },
+        .{ .index = 2, .term = 3, .kind = .normal, .data = &.{} },
+        .{ .index = 3, .term = 3, .kind = .normal, .data = &.{} },
+    };
+    try log.append(&entries); // in the leader's log, not yet persisted
+
+    const peer_ids = [_]u64{ 2, 3 };
+    var rs = try ReplicationState.init(std.testing.allocator, &peer_ids, 3);
+    defer rs.deinit();
+    _ = rs.peers.getPtr(2).?.maybeUpdate(3);
+    _ = rs.peers.getPtr(3).?.maybeUpdate(1);
+
+    // Only peer 2 holds 2..3 durably: one of three, not a majority.
+    const voters = [_]u64{ 1, 2, 3 };
+    _ = try rs.maybeCommit(&log, &voters, &.{}, 3, 1);
+    try std.testing.expectEqual(@as(u64, 1), log.committed);
+
+    // Once the leader has persisted them, 3 is held by a majority.
+    try mem_store.appendEntriesImpl(&entries);
+    try log.stableTo(3, 3);
+    try std.testing.expect(try rs.maybeCommit(&log, &voters, &.{}, 3, 1));
     try std.testing.expectEqual(@as(u64, 3), log.committed);
 }
 
@@ -463,14 +536,56 @@ test "maybeDecrTo ignores a stale rejection below the acked match_index" {
     // The peer acked through 10 (e.g. a snapshot install); a rejection of an
     // older AppendEntries that arrives late must not send it back below that.
     var pp = PeerProgress{ .next_index = 11, .match_index = 10 };
-    try std.testing.expect(!pp.maybeDecrTo(0, 3, 1));
+    try std.testing.expect(!pp.maybeDecrTo(5, 3, 1));
     try std.testing.expectEqual(@as(u64, 11), pp.next_index);
     try std.testing.expect(!pp.needsSnapshot(10));
 
     // A real rejection above match_index still backs off, down to match + 1.
     var probe = PeerProgress{ .next_index = 20, .match_index = 10 };
-    try std.testing.expect(probe.maybeDecrTo(0, 15, 2));
+    try std.testing.expect(probe.maybeDecrTo(19, 15, 2));
     try std.testing.expectEqual(@as(u64, 15), probe.next_index);
-    try std.testing.expect(probe.maybeDecrTo(0, 4, 1));
+    try std.testing.expect(probe.maybeDecrTo(14, 4, 1));
     try std.testing.expectEqual(@as(u64, 11), probe.next_index);
+}
+
+test "maybeDecrTo ignores duplicate rejections and hints past the rejected index (SONNY-6611)" {
+    var pp = PeerProgress{ .next_index = 20, .match_index = 0 };
+    try std.testing.expect(pp.maybeDecrTo(19, 12, 0));
+    try std.testing.expectEqual(@as(u64, 12), pp.next_index);
+    // The same rejection again (a second heartbeat sent from 20): stale.
+    try std.testing.expect(!pp.maybeDecrTo(19, 12, 0));
+    // A hint past the rejected index: the follower holds that much.
+    try std.testing.expect(!pp.maybeDecrTo(11, 30, 0));
+    try std.testing.expectEqual(@as(u64, 12), pp.next_index);
+}
+
+test "backtrackHint skips to the leader's last entry of the conflicting term (SONNY-6611)" {
+    var mem_store = stg.InMemoryStorage.init(std.testing.allocator);
+    defer mem_store.deinit();
+    var log = try raft_log.RaftLog.init(std.testing.allocator, mem_store.storage(), 0, 0);
+    defer log.deinit();
+    var ents: [10]rpc.Entry = undefined;
+    // Leader: 1..4 term 1, 5..7 term 2, 8..10 term 4.
+    for (&ents, 0..) |*e, i| e.* = .{ .index = i + 1, .term = if (i < 4) 1 else if (i < 7) 2 else 4, .kind = .normal, .data = &.{} };
+    try log.append(&ents);
+
+    // Follower has term 2 at 9 (first at 5): leader's last term-2 entry is 7.
+    try std.testing.expectEqual(@as(u64, 8), backtrackHint(&log, 9, 5, 2));
+    // Follower has term 3 (first at 6), which the leader never had.
+    try std.testing.expectEqual(@as(u64, 6), backtrackHint(&log, 9, 6, 3));
+    // Log too short.
+    try std.testing.expectEqual(@as(u64, 4), backtrackHint(&log, 9, 4, 0));
+}
+
+test "maybeDecrTo still backs off on a rejection without a position (mixed versions)" {
+    // A follower on raft <= 0.2.1 (or a transport that drops the hints)
+    // reports a rejection with match_index 0 and no conflict hint. The
+    // leader must keep backing off, as before, or that follower stalls.
+    var pp = PeerProgress{ .next_index = 20, .match_index = 6 };
+    try std.testing.expect(pp.maybeDecrTo(0, 0, 0));
+    try std.testing.expectEqual(@as(u64, 7), pp.next_index);
+    // An old follower's hint (its rejected prev_log_index) is still used.
+    var hinted = PeerProgress{ .next_index = 20, .match_index = 0 };
+    try std.testing.expect(hinted.maybeDecrTo(0, 15, 2));
+    try std.testing.expectEqual(@as(u64, 15), hinted.next_index);
 }

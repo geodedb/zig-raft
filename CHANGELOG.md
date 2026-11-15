@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-11-15
+
+### Fixed
+
+- The leader counted entries it had not yet persisted toward commit, so an
+  entry could commit while durable on less than a majority, and a
+  single-node cluster committed an entry before it was on disk. The leader
+  now counts only `RaftLog.stableLastIndex()` (new), and `advanceApply()`
+  re-evaluates the commit index after stabilizing (SONNY-6611).
+- A second `ready()` before `advance()` added the committed entries again;
+  they were applied and counted twice. It now returns `ReadyNotAdvanced`
+  before touching any state.
+- A snapshot installed between `ready()` and `advance()` was persisted but
+  never delivered in a Ready, and installed snapshots were leaked.
+  `ReadyState` now owns the snapshot (freed at the `advance()` after the
+  Ready that delivers it) and keeps one installed mid-cycle for the next
+  Ready.
+- A leader removed by a membership change stepped down as soon as it
+  appended the new configuration; it now leads until that configuration
+  commits (Raft §4.2.2).
+- Fast backtracking: a rejection carries the rejected `prev_log_index` (in
+  `match_index`), the follower hints `lastIndex + 1` (log too short) or its
+  conflicting term and that term's first index, and the leader skips to
+  its last entry of that term (`replication.backtrackHint`, new). Stale and
+  duplicate rejections are ignored; rejections without a position (older
+  followers, transports without the field) back off as before.
+- Saving a snapshot dropped none of the log it covers, and the following
+  `compact()` returned early: `FileStorage` never compacted its WAL or
+  index and a follower kept a conflicting tail, and `InMemoryStorage` read
+  misaligned entries after a snapshot. Both now apply Raft §7: keep the
+  entries after the snapshot if the log holds its last entry with the same
+  term, otherwise drop the whole log.
+- `FileStorage.compact` left the snapshot point advanced when the WAL
+  compaction failed; it is now rolled back (except on `WalPoisoned`).
+- `FileStorage` conflict truncation over a damaged record silently cut the
+  log at the damage; it now refuses with `StorageError.LogCorrupted`, maps
+  wal's errors, and shrinks its index only after the WAL is truncated.
+- `examples/basic.zig` did not build; it is now a runnable example of the
+  consumer loop, and `zig build check` compiles the examples.
+
 ## [0.2.1] - 2026-11-15
 
 ### Changed

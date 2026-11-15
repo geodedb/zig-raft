@@ -289,3 +289,48 @@ test "membership: no_double_commit_during_reconfig" {
     // Run all four Raft invariant checks.
     try runChecker(&net);
 }
+
+// ---------------------------------------------------------------------------
+// SONNY-6611: a removed leader steps down when C_new commits (Raft §4.2.2)
+// ---------------------------------------------------------------------------
+test "membership: a removed leader steps down only once the new config commits" {
+    var net = try Network.init(std.testing.allocator, 3);
+    defer net.deinit();
+
+    const leader_id = try net.waitForLeader(50);
+    const leader = net.nodes.get(leader_id).?;
+
+    var new_voters: [2]u64 = undefined;
+    var idx: usize = 0;
+    for (net.node_ids.items) |nid| {
+        if (nid != leader_id) {
+            new_voters[idx] = nid;
+            idx += 1;
+        }
+    }
+    try leader.proposeConfigChange(&new_voters);
+
+    // Index of C_new in the leader's log, once appended.
+    var final_idx: u64 = 0;
+    var ticks: u32 = 0;
+    while (ticks < 200) : (ticks += 1) {
+        try net.tickAll();
+        if (final_idx == 0 and !leader.membership_state.is_joint and
+            !containsId(leader.membership_state.voters.items, leader_id))
+        {
+            final_idx = leader.log.lastIndex();
+        }
+        if (leader.role != .leader) break;
+    }
+    try std.testing.expect(final_idx != 0);
+    try std.testing.expectEqual(raft.Role.follower, leader.role);
+    // It led until C_new was committed, not just appended.
+    try std.testing.expect(leader.log.committed >= final_idx);
+
+    // The remaining voters elect a leader under C_new.
+    const new_leader_id = try net.waitForLeader(100);
+    try std.testing.expect(containsId(&new_voters, new_leader_id));
+    const new_leader = net.nodes.get(new_leader_id).?;
+    try std.testing.expect(new_leader.log.committed >= final_idx);
+    try runChecker(&net);
+}

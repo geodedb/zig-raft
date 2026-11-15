@@ -4,6 +4,7 @@
 const std = @import("std");
 const state = @import("state.zig");
 const rpc = @import("rpc.zig");
+const stg = @import("storage.zig");
 
 /// A message for peer `to` that the consumer sends only after
 /// `RaftNode.advancePersist()` has made this Ready's hard state and entries
@@ -41,7 +42,13 @@ pub const ReadyState = struct {
     /// `RaftLog.slice` results whose data `pending_committed_entries`
     /// borrows; freed (data and slice) at `advance` / `deinit` (SONNY-6592).
     owned_committed: std.ArrayList([]rpc.Entry) = .empty,
+    /// Snapshot for the next Ready. Owned: freed with storage.freeSnapshot.
     pending_snapshot: ?rpc.Snapshot,
+    /// Snapshot handed out by the current Ready (persisted by
+    /// advancePersist), freed at `advance`. Kept apart from
+    /// `pending_snapshot` so one installed between `ready()` and `advance()`
+    /// goes in the next Ready instead of being dropped (SONNY-6611).
+    ready_snapshot: ?rpc.Snapshot = null,
     pending_should_snapshot: bool,
     allocator: std.mem.Allocator,
 
@@ -63,6 +70,8 @@ pub const ReadyState = struct {
         self.pending_committed_entries.deinit(self.allocator);
         self.freeOwnedCommitted();
         self.owned_committed.deinit(self.allocator);
+        if (self.pending_snapshot) |snap| stg.freeSnapshot(self.allocator, snap);
+        if (self.ready_snapshot) |snap| stg.freeSnapshot(self.allocator, snap);
     }
 
     fn freeOwnedCommitted(self: *ReadyState) void {
@@ -100,8 +109,12 @@ pub const ReadyState = struct {
         self.owned_committed.appendAssumeCapacity(entries);
     }
 
-    /// Set snapshot to deliver.
+    /// Set the snapshot to deliver in the next Ready. The ReadyState takes
+    /// ownership (data and config slices, freed with storage.freeSnapshot)
+    /// and frees it at the `advance` after that Ready; a snapshot still
+    /// pending is replaced (and freed) by a newer one.
     pub fn setSnapshot(self: *ReadyState, snapshot: rpc.Snapshot) void {
+        if (self.pending_snapshot) |old| stg.freeSnapshot(self.allocator, old);
         self.pending_snapshot = snapshot;
     }
 
@@ -122,18 +135,21 @@ pub const ReadyState = struct {
         // Hand the accumulated messages to this Ready; later ones accumulate
         // afresh for the next (ready_messages is empty: advance cleared it).
         std.mem.swap(std.ArrayList(Outbound), &self.pending_messages, &self.ready_messages);
+        // Likewise the snapshot (ready_snapshot is null: advance freed it).
+        self.ready_snapshot = self.pending_snapshot;
+        self.pending_snapshot = null;
 
         return .{
             .hard_state = hs,
-            .snapshot = self.pending_snapshot,
+            .snapshot = self.ready_snapshot,
             .committed_entries = self.pending_committed_entries.items,
             .messages = self.ready_messages.items,
             .should_snapshot = self.pending_should_snapshot,
         };
     }
 
-    /// Release Ready memory, reset pending state. Messages queued after
-    /// `ready()` stay pending for the next Ready.
+    /// Release Ready memory, reset pending state. Messages and a snapshot
+    /// queued after `ready()` stay pending for the next Ready.
     pub fn advance(self: *ReadyState, current_hs: state.HardState) void {
         self.prev_hard_state = current_hs;
         self.has_pending_ready = false;
@@ -141,7 +157,8 @@ pub const ReadyState = struct {
         self.ready_messages.clearRetainingCapacity();
         self.pending_committed_entries.clearRetainingCapacity();
         self.freeOwnedCommitted();
-        self.pending_snapshot = null;
+        if (self.ready_snapshot) |snap| stg.freeSnapshot(self.allocator, snap);
+        self.ready_snapshot = null;
         self.pending_should_snapshot = false;
     }
 
@@ -174,6 +191,7 @@ fn testEntry(index: u64) rpc.Entry {
     return .{ .index = index, .term = 1, .kind = .normal, .data = "x" };
 }
 
+/// A heap-owned snapshot: setSnapshot takes ownership.
 fn testSnapshot() rpc.Snapshot {
     return .{
         .metadata = .{ .index = 5, .term = 2, .config = .{
@@ -181,7 +199,7 @@ fn testSnapshot() rpc.Snapshot {
             .voters_outgoing = &.{},
             .is_joint = false,
         } },
-        .data = "snap",
+        .data = std.testing.allocator.dupe(u8, "snap") catch @panic("OOM"),
     };
 }
 
@@ -273,6 +291,7 @@ test "advance clears all pending state" {
     try std.testing.expectEqual(@as(usize, 0), rs.ready_messages.items.len);
     try std.testing.expectEqual(@as(usize, 0), rs.pending_committed_entries.items.len);
     try std.testing.expect(rs.pending_snapshot == null);
+    try std.testing.expect(rs.ready_snapshot == null);
     try std.testing.expect(!rs.pending_should_snapshot);
     try std.testing.expect(!rs.has_pending_ready);
 }
@@ -351,4 +370,24 @@ test "owned committed entries are freed at advance and at deinit" {
 
     // Still pending at deinit: freed there.
     try rs.addOwnedCommittedEntries(try rpc.dupeEntries(alloc, &src));
+}
+
+test "a snapshot set between ready() and advance() goes in the next Ready" {
+    const hs = state.HardState.initial;
+    var rs = ReadyState.init(std.testing.allocator, hs);
+    defer rs.deinit();
+
+    const r1 = try rs.ready(hs);
+    try std.testing.expect(r1.snapshot == null);
+    rs.setSnapshot(testSnapshot());
+    rs.advance(hs);
+
+    try std.testing.expect(rs.hasReady(hs));
+    const r2 = try rs.ready(hs);
+    try std.testing.expectEqualStrings("snap", r2.snapshot.?.data);
+    // Replaced before the next ready(): the older one is freed.
+    rs.setSnapshot(testSnapshot());
+    rs.setSnapshot(testSnapshot());
+    rs.advance(hs);
+    // The last one is still pending at deinit and freed there.
 }

@@ -101,6 +101,12 @@ pub const RaftLog = struct {
         return self.cached_storage_last_index;
     }
 
+    /// Highest index known to be in storage: entries above it are still
+    /// unstable (not yet persisted by advancePersist/stableTo).
+    pub fn stableLastIndex(self: *RaftLog) u64 {
+        return self.firstUnstableIndex() - 1;
+    }
+
     pub fn lastTerm(self: *RaftLog) u64 {
         return self.term(self.lastIndex()) catch 0;
     }
@@ -225,12 +231,26 @@ pub const RaftLog = struct {
         return last_new_index;
     }
 
+    /// Backtracking hint for a rejected AppendEntries whose prev_log_index
+    /// is `index` (SONNY-6611):
+    /// - at or below the snapshot: `snapshot_index + 1`, term 0 (this log
+    ///   holds everything up to there; nothing to back off to);
+    /// - past the end of the log: `lastIndex() + 1`, term 0 (log too short);
+    /// - otherwise the term found at `index` and the first index of that
+    ///   term, so the leader can skip the whole conflicting term at once.
     pub fn findConflict(self: *RaftLog, index: u64) struct { index: u64, term_val: u64 } {
         if (index <= self.snapshot_index) {
-            return .{ .index = self.snapshot_index, .term_val = self.snapshot_term };
+            return .{ .index = self.snapshot_index +| 1, .term_val = 0 };
         }
-        const t = self.term(index) catch 0;
-        return .{ .index = index, .term_val = t };
+        const last = self.lastIndex();
+        if (index > last) return .{ .index = last +| 1, .term_val = 0 };
+        const t = self.term(index) catch return .{ .index = index, .term_val = 0 };
+        var first = index;
+        while (first > self.snapshot_index + 1) : (first -= 1) {
+            const prev = self.term(first - 1) catch break;
+            if (prev != t) break;
+        }
+        return .{ .index = first, .term_val = t };
     }
 
     pub fn commitTo(self: *RaftLog, committed: u64) void {
@@ -559,7 +579,7 @@ test "findConflict returns correct conflict info" {
     var log = try RaftLog.init(std.testing.allocator, mem_store.storage(), 0, 0);
     defer log.deinit();
 
-    // Index in log returns its term.
+    // Index in log returns its term and the first index of that term.
     const c1 = log.findConflict(1);
     try std.testing.expectEqual(@as(u64, 1), c1.index);
     try std.testing.expectEqual(@as(u64, 1), c1.term_val);
@@ -568,14 +588,14 @@ test "findConflict returns correct conflict info" {
     try std.testing.expectEqual(@as(u64, 2), c2.index);
     try std.testing.expectEqual(@as(u64, 2), c2.term_val);
 
-    // Index beyond log returns 0 term.
+    // Index beyond the log: the log is too short, resume after its end.
     const c3 = log.findConflict(5);
-    try std.testing.expectEqual(@as(u64, 5), c3.index);
+    try std.testing.expectEqual(@as(u64, 3), c3.index);
     try std.testing.expectEqual(@as(u64, 0), c3.term_val);
 
-    // Index at or below snapshot returns snapshot info.
+    // Index at or below the snapshot: nothing to back off to.
     const c0 = log.findConflict(0);
-    try std.testing.expectEqual(@as(u64, 0), c0.index);
+    try std.testing.expectEqual(@as(u64, 1), c0.index);
     try std.testing.expectEqual(@as(u64, 0), c0.term_val);
 }
 
@@ -638,4 +658,19 @@ test "stableTo moves entries from unstable to stable" {
     // Correct term should remove it.
     try log.stableTo(3, 2);
     try std.testing.expectEqual(@as(usize, 0), log.unstableSlice().len);
+}
+
+test "findConflict points at the first index of the conflicting term (SONNY-6611)" {
+    var mem_store = stg.InMemoryStorage.init(std.testing.allocator);
+    defer mem_store.deinit();
+    var log = try RaftLog.init(std.testing.allocator, mem_store.storage(), 0, 0);
+    defer log.deinit();
+
+    var ents: [8]rpc.Entry = undefined;
+    for (&ents, 0..) |*e, i| e.* = .{ .index = i + 1, .term = if (i < 2) 1 else 3, .kind = .normal, .data = &.{} };
+    try log.append(&ents); // 1..2 at term 1, 3..8 at term 3
+
+    const c = log.findConflict(7);
+    try std.testing.expectEqual(@as(u64, 3), c.term_val);
+    try std.testing.expectEqual(@as(u64, 3), c.index);
 }

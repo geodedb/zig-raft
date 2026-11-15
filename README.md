@@ -21,7 +21,7 @@ Add to your `build.zig.zon`:
 ```zig
 .dependencies = .{
     .raft = .{
-        .url = "https://gitlab.com/devnw/zig/raft/-/archive/v0.2.1/raft-v0.2.1.tar.gz",
+        .url = "https://gitlab.com/devnw/zig/raft/-/archive/v0.2.2/raft-v0.2.2.tar.gz",
         .hash = "...",
     },
 },
@@ -71,8 +71,11 @@ pub fn main() !void {
 }
 ```
 
-`Ready.messages` and `Ready.committed_entries` stay valid until
-`advanceApply()`. Leader replication (AppendEntries, InstallSnapshot) goes out
+`Ready.messages`, `Ready.committed_entries` and `Ready.snapshot` stay valid
+until `advanceApply()`; copy anything you keep longer. Call `ready()` again
+only after `advanceApply()` (it returns `error.ReadyNotAdvanced` otherwise).
+Entries are committed only once the leader has persisted them, so a
+committed entry appears in the Ready after the one that persisted it. Leader replication (AppendEntries, InstallSnapshot) goes out
 at once through the `Transport` set with `node.setTransport`; the node frees
 those payloads when `send` returns, so a transport that queues a message must
 copy its entries with `raft.dupeEntries` (data included) and free them with

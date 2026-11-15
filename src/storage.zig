@@ -253,6 +253,9 @@ pub const InMemoryStorage = struct {
             try self.allocator.dupe(u64, snap.metadata.config.voters_outgoing)
         else
             snap.metadata.config.voters_outgoing;
+        if (snap.metadata.index > self.snapshot_index) {
+            self.discardCoveredBy(snap.metadata.index, snap.metadata.term);
+        }
         self.snapshot_data = .{
             .metadata = .{
                 .index = snap.metadata.index,
@@ -267,6 +270,23 @@ pub const InMemoryStorage = struct {
         };
         self.snapshot_index = snap.metadata.index;
         self.snapshot_term = snap.metadata.term;
+    }
+
+    /// Drop the entries a snapshot at `snap_index` / `snap_term` covers
+    /// (Raft §7, SONNY-6611): up to it when the log holds that entry with
+    /// that term, otherwise all of them. `log` is positional from
+    /// `snapshot_index + 1`, so without this a snapshot saved past the
+    /// stored entries misaligned every later `entries()` / `term()`.
+    fn discardCoveredBy(self: *InMemoryStorage, snap_index: u64, snap_term: u64) void {
+        const pos = snap_index - self.snapshot_index - 1;
+        const keep_tail = pos < self.log.items.len and self.log.items[pos].term == snap_term;
+        const drop = if (keep_tail) pos + 1 else self.log.items.len;
+        for (self.log.items[0..drop]) |entry| {
+            if (entry.data.len > 0) self.allocator.free(entry.data);
+        }
+        const remaining = self.log.items.len - drop;
+        std.mem.copyForwards(rpc.Entry, self.log.items[0..remaining], self.log.items[drop..]);
+        self.log.shrinkRetainingCapacity(remaining);
     }
 
     /// Returns a heap-allocated copy of the snapshot (data + config voter
@@ -527,4 +547,30 @@ test "vtable dispatch works" {
     defer rpc.freeEntries(std.testing.allocator, result);
     try std.testing.expectEqual(@as(usize, 1), result.len);
     try std.testing.expectEqualStrings("x", result[0].data);
+}
+
+test "InMemoryStorage: a snapshot matching the log trims it; a conflicting one drops it (SONNY-6611)" {
+    var store = InMemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+    var ents: [10]rpc.Entry = undefined;
+    for (&ents, 0..) |*e, i| e.* = .{ .index = i + 1, .term = 1, .kind = .normal, .data = "d" };
+    try store.appendEntriesImpl(&ents);
+
+    const snap = rpc.Snapshot{
+        .metadata = .{ .index = 6, .term = 1, .config = .{ .voters = &.{1}, .voters_outgoing = &.{}, .is_joint = false } },
+        .data = "s",
+    };
+    try store.saveSnapshotImpl(snap);
+    try std.testing.expectEqual(@as(u64, 10), try store.lastIndexImpl());
+    const got = try store.entriesImpl(7, 9);
+    defer rpc.freeEntries(std.testing.allocator, got);
+    try std.testing.expectEqual(@as(u64, 7), got[0].index);
+    try std.testing.expectEqual(@as(u64, 8), got[1].index);
+
+    var conflicting = snap;
+    conflicting.metadata.index = 8;
+    conflicting.metadata.term = 2;
+    try store.saveSnapshotImpl(conflicting);
+    try std.testing.expectEqual(@as(u64, 8), try store.lastIndexImpl());
+    try std.testing.expectError(StorageError.Unavailable, store.termImpl(9));
 }
