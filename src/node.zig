@@ -512,6 +512,14 @@ pub const RaftNode = struct {
         } else {
             self.election_state.tickElection();
             if (self.election_state.electionTimeoutElapsed()) {
+                // A node outside its own voter set (removed by a membership
+                // change) must not campaign (etcd `promotable`): peers still
+                // in the joint config would elect it, and its first act as
+                // leader is to step down again, starving the real voters.
+                if (!mem.isVoter(self.membership_state.config(), self.id)) {
+                    self.election_state.resetElectionElapsed();
+                    return;
+                }
                 // RC-B it.2: a candidate whose election just timed out made no
                 // progress this round (no win → would still be a candidate; a
                 // win or a higher-term message resets the counter via
@@ -2120,4 +2128,33 @@ test "handleInstallSnapshotResponse clears pending on success and failure (SEC-0
     try node.handleInstallSnapshotResponse(2, .{ .term = node.current_term, .success = false });
     try std.testing.expectEqual(@as(u64, 0), progress.pending_snapshot_index);
     try std.testing.expectEqual(@as(u32, 0), progress.pending_snapshot_ticks);
+}
+
+test "a node outside its own voter set does not start elections" {
+    var mem_store = stg.InMemoryStorage.init(std.testing.allocator);
+    defer mem_store.deinit();
+    // Restored from a snapshot whose config no longer includes node 1
+    // (it was removed by a membership change).
+    try mem_store.storage().saveSnapshot(.{
+        .metadata = .{ .index = 5, .term = 2, .config = .{
+            .voters = &.{ 2, 3 },
+            .voters_outgoing = &.{},
+            .is_joint = false,
+        } },
+        .data = "s",
+    });
+
+    var node = try RaftNode.init(std.testing.allocator, .{
+        .id = 1,
+        .peers = &.{ 2, 3 },
+        .pre_vote = false,
+        .rng_seed = 3,
+    }, mem_store.storage());
+    defer node.deinit();
+
+    var i: u32 = 0;
+    while (i < 100) : (i += 1) try node.tick(null);
+    try std.testing.expectEqual(st.Role.follower, node.role);
+    try std.testing.expectEqual(@as(u64, 0), node.stats().elections_started);
+    try std.testing.expectEqual(@as(u64, 0), node.current_term);
 }
