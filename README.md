@@ -21,7 +21,7 @@ Add to your `build.zig.zon`:
 ```zig
 .dependencies = .{
     .raft = .{
-        .url = "https://gitlab.com/devnw/zig/raft/-/archive/v0.1.0/raft-v0.1.0.tar.gz",
+        .url = "https://gitlab.com/devnw/zig/raft/-/archive/v0.2.0/raft-v0.2.0.tar.gz",
         .hash = "...",
     },
 },
