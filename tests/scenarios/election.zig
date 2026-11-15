@@ -253,7 +253,7 @@ test "scenario: noop_entry_enables_prior_term_commit" {
     var idx: u64 = last_idx;
     while (idx >= 1) : (idx -= 1) {
         const entries = try leader.log.slice(idx, idx + 1);
-        defer net.allocator.free(entries);
+        defer raft.freeEntries(net.allocator, entries);
         if (entries.len > 0 and entries[0].kind == .noop and entries[0].term == leader.current_term) {
             found_noop = true;
             break;

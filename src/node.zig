@@ -560,15 +560,11 @@ pub const RaftNode = struct {
                     slice_lo,
                     slice_hi,
                 );
-                // Free slice on error so addCommittedEntries failure doesn't leak (SEC-0117).
-                errdefer if (entries.len > 0) self.allocator.free(entries);
-
-                try self.ready_state.addCommittedEntries(entries);
-
-                // Free the slice allocated by log.slice() — entries have been copied into ready_state.
-                if (entries.len > 0) {
-                    self.allocator.free(entries);
-                }
+                // The Ready owns the slice and its data until advance(); it is
+                // freed here only if handing it over failed (SEC-0117,
+                // SONNY-6592).
+                errdefer rpc.freeEntries(self.allocator, entries);
+                try self.ready_state.addOwnedCommittedEntries(entries);
             }
         }
 
@@ -1547,16 +1543,14 @@ pub const RaftNode = struct {
         }
     }
 
-    /// Free the heap-allocated entries slice inside an AppendEntries message
-    /// that was built by `buildAppendEntries` (via `log.slice()`).
-    /// Must be called after `sendMsg` since transport copies by value (SEC-0140).
+    /// Free the entries (slice and data) inside an AppendEntries message
+    /// built by `buildAppendEntries` (via `log.slice()`).
+    /// Must be called after `sendMsg`: a transport that keeps the message
+    /// past `send` must deep-copy the entries, data included (SEC-0140,
+    /// SONNY-6592).
     fn freeAppendEntriesPayload(self: *RaftNode, msg: rpc.Message) void {
         switch (msg) {
-            .append_entries => |ae| {
-                if (ae.entries.len > 0) {
-                    self.allocator.free(ae.entries);
-                }
-            },
+            .append_entries => |ae| rpc.freeEntries(self.allocator, ae.entries),
             else => {},
         }
     }
@@ -1669,7 +1663,7 @@ test "leader appends noop on election" {
 
     // Verify it is a noop.
     const entries = try node.log.slice(last_idx, last_idx + 1);
-    defer std.testing.allocator.free(entries);
+    defer rpc.freeEntries(std.testing.allocator, entries);
     try std.testing.expectEqual(rpc.EntryKind.noop, entries[0].kind);
 }
 
@@ -1702,7 +1696,7 @@ test "propose on leader succeeds" {
 
     // Verify the entry has the right data.
     const entries = try node.log.slice(after, after + 1);
-    defer std.testing.allocator.free(entries);
+    defer rpc.freeEntries(std.testing.allocator, entries);
     try std.testing.expectEqual(rpc.EntryKind.normal, entries[0].kind);
 }
 

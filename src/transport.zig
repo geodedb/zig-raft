@@ -49,6 +49,7 @@ pub const InProcessTransport = struct {
     pub fn deinit(self: *InProcessTransport) void {
         var it = self.inboxes.valueIterator();
         while (it.next()) |inbox| {
+            for (inbox.items) |msg| freeMessage(self.allocator, msg);
             inbox.deinit(self.allocator);
         }
         self.inboxes.deinit();
@@ -68,7 +69,8 @@ pub const InProcessTransport = struct {
         };
     }
 
-    /// Drain all pending messages for a node. Returns owned slice, caller must free.
+    /// Drain all pending messages for a node. Returns owned slice, caller must
+    /// free it, and each message's payload with `freeMessage`.
     pub fn drain(self: *InProcessTransport, id: u64, allocator: std.mem.Allocator) ![]rpc.Message {
         const inbox = self.inboxes.getPtr(id) orelse return try allocator.alloc(rpc.Message, 0);
         const items = inbox.items;
@@ -87,13 +89,13 @@ pub const InProcessTransport = struct {
     fn sendImpl(ptr: *anyopaque, to: u64, msg: rpc.Message) void {
         const self: *InProcessTransport = @ptrCast(@alignCast(ptr));
         const inbox = self.inboxes.getPtr(to) orelse return;
-        // Deep-copy AppendEntries entries so the sender can free its
-        // copy after send without leaving dangling pointers (SEC-0140).
+        // Deep-copy AppendEntries entries, data included: the sender frees
+        // both once send returns (SEC-0140, SONNY-6592).
         var copied_msg = msg;
         switch (msg) {
             .append_entries => |ae| {
                 if (ae.entries.len > 0) {
-                    const dup = self.allocator.dupe(rpc.Entry, ae.entries) catch return;
+                    const dup = rpc.dupeEntries(self.allocator, ae.entries) catch return;
                     copied_msg = rpc.Message{ .append_entries = .{
                         .term = ae.term,
                         .leader_id = ae.leader_id,
@@ -106,7 +108,15 @@ pub const InProcessTransport = struct {
             },
             else => {},
         }
-        inbox.append(self.allocator, copied_msg) catch return;
+        inbox.append(self.allocator, copied_msg) catch freeMessage(self.allocator, copied_msg);
+    }
+
+    /// Free the payload `sendImpl` copied into a queued message.
+    pub fn freeMessage(allocator: std.mem.Allocator, msg: rpc.Message) void {
+        switch (msg) {
+            .append_entries => |ae| rpc.freeEntries(allocator, ae.entries),
+            else => {},
+        }
     }
 };
 

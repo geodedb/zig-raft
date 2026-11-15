@@ -138,6 +138,10 @@ pub const RaftLog = struct {
         return active[start..end];
     }
 
+    /// Entries [lo, hi). The caller owns the slice AND each entry's `data`
+    /// (stable entries come from `Storage.entries`, which hands out owned
+    /// data; unstable ones are copied): free with `rpc.freeEntries`.
+    /// Freeing only the slice leaked every stable entry's data (SONNY-6592).
     pub fn slice(self: *RaftLog, lo: u64, hi: u64) ![]rpc.Entry {
         if (lo >= hi) return &[_]rpc.Entry{};
 
@@ -156,25 +160,25 @@ pub const RaftLog = struct {
             if (end > active.len or start > active.len) {
                 return error.OutOfRange;
             }
-            const unstable_slice = active[start..end];
-            const result = try self.allocator.alloc(rpc.Entry, unstable_slice.len);
-            @memcpy(result, unstable_slice);
-            return result;
+            return rpc.dupeEntries(self.allocator, active[start..end]);
         }
 
         // Spans both regions.
-        const stable = try self.storage.entries(lo, first_unstable);
-        defer self.allocator.free(stable);
-
         const unstable_end = hi - first_unstable;
         if (unstable_end > active.len) {
             return error.OutOfRange;
         }
-        const unstable_slice = active[0..unstable_end];
+        const stable = try self.storage.entries(lo, first_unstable);
+        errdefer rpc.freeEntries(self.allocator, stable);
+        const unstable = try rpc.dupeEntries(self.allocator, active[0..unstable_end]);
+        errdefer rpc.freeEntries(self.allocator, unstable);
 
-        const result = try self.allocator.alloc(rpc.Entry, stable.len + unstable_slice.len);
+        const result = try self.allocator.alloc(rpc.Entry, stable.len + unstable.len);
         @memcpy(result[0..stable.len], stable);
-        @memcpy(result[stable.len..], unstable_slice);
+        @memcpy(result[stable.len..], unstable);
+        // The entries' data moved into `result`; free only the two outer slices.
+        if (stable.len > 0) self.allocator.free(stable);
+        if (unstable.len > 0) self.allocator.free(unstable);
         return result;
     }
 

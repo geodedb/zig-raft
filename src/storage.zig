@@ -35,6 +35,9 @@ pub const Storage = struct {
         return self.vtable.appendEntries(self.ptr, ents);
     }
 
+    /// Entries [lo, hi). The caller owns the slice AND each entry's `data`;
+    /// free with `rpc.freeEntries`. Implementations must return copies, never
+    /// views into their own buffers.
     pub fn entries(self: Storage, lo: u64, hi: u64) anyerror![]rpc.Entry {
         return self.vtable.entries(self.ptr, lo, hi);
     }
@@ -171,10 +174,9 @@ pub const InMemoryStorage = struct {
         // Upper-bound guard: return Unavailable for out-of-range indices (SEC-0051).
         if (end > self.log.items.len) return StorageError.Unavailable;
 
-        const slice = self.log.items[start..end];
-        const result = try self.allocator.alloc(rpc.Entry, slice.len);
-        @memcpy(result, slice);
-        return result;
+        // The caller owns each entry's data, as with FileStorage (see
+        // Storage.entries); free with rpc.freeEntries.
+        return rpc.dupeEntries(self.allocator, self.log.items[start..end]);
     }
 
     pub fn termImpl(self: *InMemoryStorage, index: u64) anyerror!u64 {
@@ -362,7 +364,7 @@ test "append entries then retrieve" {
     try store.appendEntriesImpl(&entries_in);
 
     const result = try store.entriesImpl(1, 4);
-    defer std.testing.allocator.free(result);
+    defer rpc.freeEntries(std.testing.allocator, result);
 
     try std.testing.expectEqual(@as(usize, 3), result.len);
     try std.testing.expectEqual(@as(u64, 1), result[0].index);
@@ -427,7 +429,7 @@ test "compact removes old entries" {
 
     // Remaining entries are indices 3 and 4.
     const result = try store.entriesImpl(3, 5);
-    defer std.testing.allocator.free(result);
+    defer rpc.freeEntries(std.testing.allocator, result);
     try std.testing.expectEqual(@as(u64, 3), result[0].index);
     try std.testing.expectEqual(@as(u64, 4), result[1].index);
 }
@@ -491,7 +493,7 @@ test "entries returns Compacted when lo <= snapshot_index" {
 
     // Requesting entries after snapshot_index should succeed.
     const result = try store.entriesImpl(3, 4);
-    defer std.testing.allocator.free(result);
+    defer rpc.freeEntries(std.testing.allocator, result);
     try std.testing.expectEqual(@as(usize, 1), result.len);
     try std.testing.expectEqual(@as(u64, 3), result[0].index);
 }
@@ -511,7 +513,7 @@ test "vtable dispatch works" {
     try std.testing.expectEqual(@as(u64, 1), try s.term(1));
 
     const result = try s.entries(1, 2);
-    defer std.testing.allocator.free(result);
+    defer rpc.freeEntries(std.testing.allocator, result);
     try std.testing.expectEqual(@as(usize, 1), result.len);
     try std.testing.expectEqualStrings("x", result[0].data);
 }

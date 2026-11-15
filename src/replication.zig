@@ -171,11 +171,15 @@ pub const ReplicationState = struct {
         // to avoid use-after-free (trimmed points into entries).
         if (count < entries.len) {
             const result = self.allocator.alloc(rpc.Entry, trimmed.len) catch |err| {
-                // Free the original entries slice on alloc failure (SEC-0059).
-                self.allocator.free(entries);
+                // Free the original entries, data included, on alloc failure
+                // (SEC-0059, SONNY-6592).
+                rpc.freeEntries(self.allocator, entries);
                 return err;
             };
             @memcpy(result, trimmed);
+            // The kept entries' data moved into `result`; the dropped ones'
+            // data goes with the old slice (SONNY-6592).
+            for (entries[count..]) |e| if (e.data.len > 0) self.allocator.free(e.data);
             self.allocator.free(entries);
             return rpc.Message{ .append_entries = .{
                 .term = term,
@@ -360,7 +364,7 @@ test "buildAppendEntries builds correct message with entries" {
     try std.testing.expect(msg != null);
 
     const ae = msg.?.append_entries;
-    defer std.testing.allocator.free(ae.entries);
+    defer rpc.freeEntries(std.testing.allocator, ae.entries);
 
     try std.testing.expectEqual(@as(u64, 2), ae.term);
     try std.testing.expectEqual(@as(u64, 1), ae.leader_id);

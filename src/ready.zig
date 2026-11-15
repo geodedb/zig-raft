@@ -18,6 +18,9 @@ pub const ReadyState = struct {
     has_pending_ready: bool,
     pending_messages: std.ArrayList(rpc.Message),
     pending_committed_entries: std.ArrayList(rpc.Entry),
+    /// `RaftLog.slice` results whose data `pending_committed_entries`
+    /// borrows; freed (data and slice) at `advance` / `deinit` (SONNY-6592).
+    owned_committed: std.ArrayList([]rpc.Entry) = .empty,
     pending_snapshot: ?rpc.Snapshot,
     pending_should_snapshot: bool,
     allocator: std.mem.Allocator,
@@ -37,6 +40,13 @@ pub const ReadyState = struct {
     pub fn deinit(self: *ReadyState) void {
         self.pending_messages.deinit(self.allocator);
         self.pending_committed_entries.deinit(self.allocator);
+        self.freeOwnedCommitted();
+        self.owned_committed.deinit(self.allocator);
+    }
+
+    fn freeOwnedCommitted(self: *ReadyState) void {
+        for (self.owned_committed.items) |entries| rpc.freeEntries(self.allocator, entries);
+        self.owned_committed.clearRetainingCapacity();
     }
 
     /// Accumulate a message to be included in the next Ready.
@@ -57,6 +67,16 @@ pub const ReadyState = struct {
     /// Accumulate committed entries (slice).
     pub fn addCommittedEntries(self: *ReadyState, entries: []const rpc.Entry) !void {
         try self.pending_committed_entries.appendSlice(self.allocator, entries);
+    }
+
+    /// `addCommittedEntries` for a slice the caller owns (a `RaftLog.slice`
+    /// result): the ReadyState takes it, data included, and frees it at
+    /// `advance`. On error the caller still owns it.
+    pub fn addOwnedCommittedEntries(self: *ReadyState, entries: []rpc.Entry) !void {
+        if (entries.len == 0) return;
+        try self.owned_committed.ensureUnusedCapacity(self.allocator, 1);
+        try self.pending_committed_entries.appendSlice(self.allocator, entries);
+        self.owned_committed.appendAssumeCapacity(entries);
     }
 
     /// Set snapshot to deliver.
@@ -94,6 +114,7 @@ pub const ReadyState = struct {
 
         self.pending_messages.clearRetainingCapacity();
         self.pending_committed_entries.clearRetainingCapacity();
+        self.freeOwnedCommitted();
         self.pending_snapshot = null;
         self.pending_should_snapshot = false;
     }
@@ -249,4 +270,22 @@ test "setSnapshot and setShouldSnapshot" {
     try std.testing.expect(r.snapshot != null);
     try std.testing.expectEqual(@as(u64, 5), r.snapshot.?.metadata.index);
     rs.advance(hs);
+}
+
+test "owned committed entries are freed at advance and at deinit" {
+    const alloc = std.testing.allocator;
+    const hs = state.HardState.initial;
+    const src = [_]rpc.Entry{ testEntry(1), testEntry(2) };
+
+    var rs = ReadyState.init(alloc, hs);
+    defer rs.deinit();
+
+    try rs.addOwnedCommittedEntries(try rpc.dupeEntries(alloc, &src));
+    const r = try rs.ready(hs);
+    try std.testing.expectEqual(@as(usize, 2), r.committed_entries.len);
+    try std.testing.expectEqualStrings("x", r.committed_entries[1].data);
+    rs.advance(hs);
+
+    // Still pending at deinit: freed there.
+    try rs.addOwnedCommittedEntries(try rpc.dupeEntries(alloc, &src));
 }

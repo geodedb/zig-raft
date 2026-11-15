@@ -264,7 +264,7 @@ test "bench: log-slice-unstable" {
             // Fallback to allocating slice.
             const s = try log.slice(500, 600);
             std.mem.doNotOptimizeAway(&s);
-            allocator.free(s);
+            raft.freeEntries(allocator, s);
         }
     }
     const elapsed = timer.read();
