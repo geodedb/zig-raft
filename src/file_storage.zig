@@ -508,6 +508,10 @@ pub const FileStorage = struct {
             .voters_outgoing = self.snapshot_config_voters_outgoing.items,
             .is_joint = self.snapshot_config_is_joint,
         };
+        // What to restore if the WAL compaction fails (SONNY-6611).
+        const old_index = self.snapshot_index;
+        const old_term = self.snapshot_term;
+        const had_meta = if (self.dir.access(std.Io.Threaded.global_single_threaded.io(), "snapshot.meta", .{})) |_| true else |_| false;
         try self.writeSnapshotMeta(index, new_term, self.snapshot_data_digest, cached_cfg);
 
         self.snapshot_term = new_term;
@@ -532,11 +536,22 @@ pub const FileStorage = struct {
         // leaving it untouched and usable (wal v0.1.24). The snapshot is
         // already durable, so that is not fatal: the records <= index stay in
         // the file and recoverWal skips them (SONNY-6622).
+        //
+        // Any other failure leaves the file unchanged too, so the snapshot
+        // point is rolled back (on disk and in memory) and the error
+        // returned: before, the snapshot stayed advanced over entries the
+        // WAL still held while compact() reported failure (SONNY-6611).
+        // Except WalPoisoned: the rewrite may already have replaced the
+        // file, so the advanced snapshot point is the one that matches it.
         if (self.wal_log) |*w| {
             w.compact(index) catch |err| {
-                if (!isWalRefusal(err)) return err;
-                std.log.warn("raft: FileStorage: entries.wal compaction up to {d} refused: {s}; " ++
-                    "the log is unchanged and stays in use", .{ index, @errorName(err) });
+                if (isWalRefusal(err)) {
+                    std.log.warn("raft: FileStorage: entries.wal compaction up to {d} refused: {s}; " ++
+                        "the log is unchanged and stays in use", .{ index, @errorName(err) });
+                } else {
+                    if (err != error.WalPoisoned) self.rollbackSnapshotPoint(old_index, old_term, had_meta, cached_cfg);
+                    return err;
+                }
             };
         }
 
@@ -544,6 +559,22 @@ pub const FileStorage = struct {
         const new_items = self.index.items[compact_pos + 1 ..];
         std.mem.copyForwards(IndexEntry, self.index.items[0..remaining_count], new_items);
         self.index.shrinkRetainingCapacity(remaining_count);
+    }
+
+    /// Undo compactImpl's snapshot point after a failed WAL compaction.
+    /// Best effort: if the meta cannot be restored on disk, recovery still
+    /// finds every entry in the WAL, it just treats those up to the newer
+    /// point as compacted.
+    fn rollbackSnapshotPoint(self: *FileStorage, old_index: u64, old_term: u64, had_meta: bool, cfg: rpc.ClusterConfig) void {
+        self.snapshot_index = old_index;
+        self.snapshot_term = old_term;
+        const restored = if (had_meta)
+            self.writeSnapshotMeta(old_index, old_term, self.snapshot_data_digest, cfg)
+        else blk: {
+            self.dir.deleteFile(std.Io.Threaded.global_single_threaded.io(), "snapshot.meta") catch |err| break :blk err;
+            break :blk self.syncDir();
+        };
+        restored catch |err| std.log.warn("raft: FileStorage: could not roll snapshot.meta back to {d}: {s}", .{ old_index, @errorName(err) });
     }
 
     fn writeSnapshotMeta(self: *FileStorage, snap_index: u64, snap_term: u64, data_digest: [32]u8, cfg: rpc.ClusterConfig) !void {
@@ -1225,4 +1256,38 @@ test "FileStorage: a snapshot that conflicts with the log drops the log (SONNY-6
     defer fs.deinit();
     try std.testing.expectEqual(@as(u64, 6), try fs.lastIndexImpl());
     try std.testing.expectError(stg.StorageError.Unavailable, fs.termImpl(7));
+}
+
+test "FileStorage: a failed WAL compaction rolls the snapshot back (SONNY-6611)" {
+    var tmp = testDir();
+    defer tmp.cleanup();
+    const full_path = testPath(std.testing.allocator, &tmp, "fs-test-compact-rollback");
+    defer std.testing.allocator.free(full_path);
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    {
+        var fs = try FileStorage.init(std.testing.allocator, full_path);
+        defer fs.deinit();
+        const ents = payloadEntries();
+        try fs.appendEntriesImpl(&ents);
+
+        // wal writes its rewrite to entries.wal.tmp; a directory there makes
+        // the compaction fail without being a refusal.
+        const blocker = try std.fmt.allocPrint(std.testing.allocator, "{s}/entries.wal.tmp", .{full_path});
+        defer std.testing.allocator.free(blocker);
+        var d = try std.Io.Dir.cwd().createDirPathOpen(io, blocker, .{});
+        d.close(io);
+
+        if (fs.compactImpl(3)) |_| return error.TestExpectedCompactionFailure else |_| {}
+        try std.testing.expectEqual(@as(u64, 0), fs.snapshot_index);
+        try std.testing.expectEqual(@as(u64, 1), try fs.termImpl(2));
+        try std.testing.expectEqual(@as(u64, 5), try fs.lastIndexImpl());
+    }
+
+    var fs = try FileStorage.init(std.testing.allocator, full_path);
+    defer fs.deinit();
+    try std.testing.expectEqual(@as(u64, 0), fs.snapshot_index);
+    const all = try fs.entriesImpl(1, 6);
+    defer rpc.freeEntries(std.testing.allocator, all);
+    try std.testing.expectEqualStrings("entry-2-payload", all[1].data);
 }
