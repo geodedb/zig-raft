@@ -29,7 +29,14 @@
 //!
 //! - Hard state and snapshots: write to temp file, sync, rename.
 //! - WAL: handled by the wal library (CRC32, fdatasync, torn write recovery).
+//!   Only a torn tail is truncated on open; a damaged record with valid ones
+//!   after it, or a WAL in the other key mode, fails `init` with
+//!   `StorageError.LogCorrupted` / `LogAuthFailed` / `LogEncryptionMismatch`
+//!   and leaves the file untouched (SONNY-6622).
 //! - Compaction: handled by the wal library (atomic rewrite via temp + rename).
+//!   A compaction the WAL refuses is logged, not fatal: the snapshot is
+//!   durable, the WAL stays in use, and recovery skips records at or below
+//!   the snapshot index.
 
 const std = @import("std");
 const wal_mod = @import("wal");
@@ -204,12 +211,7 @@ pub const FileStorage = struct {
 
         // Ensure WAL is open.
         if (self.wal_log == null) {
-            self.wal_log = try wal_mod.WriteAheadLog.init(
-                self.allocator,
-                self.dir,
-                "entries.wal",
-                .{},
-            );
+            self.wal_log = try self.openWal();
         }
 
         // Pre-reserve index capacity.
@@ -482,9 +484,17 @@ pub const FileStorage = struct {
             return;
         }
 
-        // Compact WAL: remove all records with LSN <= index.
+        // Compact WAL: remove all records with LSN <= index. The WAL
+        // validates every record first and refuses to rewrite a damaged log,
+        // leaving it untouched and usable (wal v0.1.24). The snapshot is
+        // already durable, so that is not fatal: the records <= index stay in
+        // the file and recoverWal skips them (SONNY-6622).
         if (self.wal_log) |*w| {
-            try w.compact(index);
+            w.compact(index) catch |err| {
+                if (!isWalRefusal(err)) return err;
+                std.log.warn("raft: FileStorage: entries.wal compaction up to {d} refused: {s}; " ++
+                    "the log is unchanged and stays in use", .{ index, @errorName(err) });
+            };
         }
 
         // Trim in-memory index.
@@ -664,24 +674,21 @@ pub const FileStorage = struct {
             return; // No WAL yet.
         };
 
-        self.wal_log = try wal_mod.WriteAheadLog.init(
-            self.allocator,
-            self.dir,
-            "entries.wal",
-            .{},
-        );
+        self.wal_log = try self.openWal();
 
         // Rebuild in-memory index by iterating all records.
         var iter = try self.wal_log.?.iterator(0);
         defer iter.deinit();
 
         while (true) {
-            var entry_opt = try iter.next();
+            var entry_opt = iter.next() catch |err| return mapWalError(err);
             if (entry_opt == null) break;
             var wal_entry = &entry_opt.?;
             defer wal_entry.deinit();
 
             if (wal_entry.payload.len < PAYLOAD_HEADER_SIZE) continue;
+            // Covered by the snapshot: left behind by a refused compaction.
+            if (wal_entry.lsn <= self.snapshot_index) continue;
 
             const term = std.mem.readInt(u64, wal_entry.payload[0..8], .little);
             const data_len: u32 = @intCast(wal_entry.payload.len - PAYLOAD_HEADER_SIZE);
@@ -692,6 +699,18 @@ pub const FileStorage = struct {
                 .data_len = data_len,
             });
         }
+    }
+
+    /// Open entries.wal (plaintext). The WAL fails closed on damage it cannot
+    /// safely truncate, leaving the file untouched; that surfaces as a
+    /// StorageError (SONNY-6622). Only a torn tail is truncated.
+    fn openWal(self: *FileStorage) !wal_mod.WriteAheadLog {
+        return wal_mod.WriteAheadLog.init(self.allocator, self.dir, "entries.wal", .{}) catch |err| {
+            if (isWalRefusal(err)) {
+                std.log.warn("raft: FileStorage: refused to open entries.wal: {s}; the file was not modified", .{@errorName(err)});
+            }
+            return mapWalError(err);
+        };
     }
 
     fn findIndexPos(self: *FileStorage, raft_index: u64) ?usize {
@@ -779,6 +798,22 @@ pub const FileStorage = struct {
         return self.compactImpl(index);
     }
 };
+
+/// True for the errors wal returns when it refuses to recover or compact a
+/// log it cannot read, leaving the file untouched.
+fn isWalRefusal(err: anyerror) bool {
+    return err == error.WalCorrupted or err == error.WalAuthFailed or err == error.WalEncryptionMismatch;
+}
+
+/// Map wal's recovery errors to StorageError; other errors pass through.
+fn mapWalError(err: anyerror) anyerror {
+    return switch (err) {
+        error.WalCorrupted => stg.StorageError.LogCorrupted,
+        error.WalAuthFailed => stg.StorageError.LogAuthFailed,
+        error.WalEncryptionMismatch => stg.StorageError.LogEncryptionMismatch,
+        else => err,
+    };
+}
 
 // ============================================================================
 // Unit Tests
@@ -918,4 +953,146 @@ test "FileStorage: compaction removes entries and rewrites WAL" {
     // Index 1 and 2 should be compacted.
     const result = fs.termImpl(1);
     try std.testing.expectError(stg.StorageError.Compacted, result);
+}
+
+// ----------------------------------------------------------------------------
+// SONNY-6622: wal v0.1.24 fails closed on damage it cannot safely truncate.
+// ----------------------------------------------------------------------------
+
+fn walFile(path: []const u8) !std.Io.File {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const wal_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/entries.wal", .{path});
+    defer std.testing.allocator.free(wal_path);
+    return std.Io.Dir.cwd().openFile(io, wal_path, .{ .mode = .read_write });
+}
+
+/// Flip the first byte of `needle` (a record payload) in the WAL on disk.
+fn corruptWalPayload(path: []const u8, needle: []const u8) !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var file = try walFile(path);
+    defer file.close(io);
+    const buf = try std.testing.allocator.alloc(u8, @intCast(try file.length(io)));
+    defer std.testing.allocator.free(buf);
+    _ = try file.readPositionalAll(io, buf, 0);
+    const at = std.mem.indexOf(u8, buf, needle) orelse return error.TestNeedleNotFound;
+    try file.writePositionalAll(io, &.{buf[at] ^ 0xff}, at);
+    try file.sync(io);
+}
+
+/// Append bytes that are not a valid record to the WAL on disk (a torn tail).
+fn appendWalGarbage(path: []const u8) !void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var file = try walFile(path);
+    defer file.close(io);
+    try file.writePositionalAll(io, "\x07\x00torn-tail", try file.length(io));
+    try file.sync(io);
+}
+
+fn payloadEntries() [5]rpc.Entry {
+    return .{
+        .{ .index = 1, .term = 1, .kind = .normal, .data = "entry-1-payload" },
+        .{ .index = 2, .term = 1, .kind = .normal, .data = "entry-2-payload" },
+        .{ .index = 3, .term = 1, .kind = .normal, .data = "entry-3-payload" },
+        .{ .index = 4, .term = 2, .kind = .normal, .data = "entry-4-payload" },
+        .{ .index = 5, .term = 2, .kind = .normal, .data = "entry-5-payload" },
+    };
+}
+
+fn expectOpenRefused(path: []const u8, expected: []const u8) !void {
+    if (FileStorage.init(std.testing.allocator, path)) |opened| {
+        var fs = opened;
+        defer fs.deinit();
+        std.debug.print("damaged log opened with lastIndex {d}\n", .{try fs.lastIndexImpl()});
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try std.testing.expectEqualStrings(expected, @errorName(err));
+    }
+}
+
+test "FileStorage: mid-log corruption refuses to open instead of dropping entries (SONNY-6622)" {
+    var tmp = testDir();
+    defer tmp.cleanup();
+    const full_path = testPath(std.testing.allocator, &tmp, "fs-test-midlog");
+    defer std.testing.allocator.free(full_path);
+
+    {
+        var fs = try FileStorage.init(std.testing.allocator, full_path);
+        defer fs.deinit();
+        const ents = payloadEntries();
+        try fs.appendEntriesImpl(&ents);
+    }
+
+    // Record 3 of 5 is damaged; 4 and 5 are intact. Opening must not
+    // silently truncate the log back to index 2.
+    try corruptWalPayload(full_path, "entry-3-payload");
+    try expectOpenRefused(full_path, "LogCorrupted");
+    // The refusal left the file as it was: it still refuses.
+    try expectOpenRefused(full_path, "LogCorrupted");
+}
+
+test "FileStorage: an encrypted WAL is refused, not read as plaintext (SONNY-6622)" {
+    var tmp = testDir();
+    defer tmp.cleanup();
+    const full_path = testPath(std.testing.allocator, &tmp, "fs-test-encrypted");
+    defer std.testing.allocator.free(full_path);
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    {
+        var dir = try std.Io.Dir.cwd().createDirPathOpen(io, full_path, .{});
+        defer dir.close(io);
+        var w = try wal_mod.WriteAheadLog.init(std.testing.allocator, dir, "entries.wal", .{
+            .encryption_key = [_]u8{0x42} ** 32,
+        });
+        defer w.deinit();
+        _ = try w.append("sealed-record");
+    }
+
+    try expectOpenRefused(full_path, "LogEncryptionMismatch");
+}
+
+test "FileStorage: WAL recovery errors map to storage errors (SONNY-6622)" {
+    try std.testing.expectEqual(stg.StorageError.LogCorrupted, mapWalError(error.WalCorrupted));
+    try std.testing.expectEqual(stg.StorageError.LogAuthFailed, mapWalError(error.WalAuthFailed));
+    try std.testing.expectEqual(stg.StorageError.LogEncryptionMismatch, mapWalError(error.WalEncryptionMismatch));
+    try std.testing.expectEqual(@as(anyerror, error.AccessDenied), mapWalError(error.AccessDenied));
+}
+
+test "FileStorage: a refused WAL compaction is logged and storage keeps working (SONNY-6622)" {
+    var tmp = testDir();
+    defer tmp.cleanup();
+    const full_path = testPath(std.testing.allocator, &tmp, "fs-test-refused-compact");
+    defer std.testing.allocator.free(full_path);
+
+    {
+        var fs = try FileStorage.init(std.testing.allocator, full_path);
+        defer fs.deinit();
+        const ents = payloadEntries();
+        try fs.appendEntriesImpl(&ents);
+
+        // The log is damaged under the open WAL; compaction now validates
+        // every record and refuses to rewrite it.
+        try appendWalGarbage(full_path);
+        try fs.compactImpl(3);
+
+        try std.testing.expectEqual(@as(u64, 3), fs.snapshot_index);
+        try std.testing.expectError(stg.StorageError.Compacted, fs.termImpl(2));
+        try std.testing.expectEqual(@as(u64, 5), try fs.lastIndexImpl());
+        const rest = try fs.entriesImpl(4, 6);
+        defer rpc.freeEntries(std.testing.allocator, rest);
+        try std.testing.expectEqualStrings("entry-4-payload", rest[0].data);
+        try std.testing.expectEqualStrings("entry-5-payload", rest[1].data);
+    }
+
+    // Reopen: the torn tail is truncated, and the records the refused
+    // compaction left behind (<= 3) do not come back into the index.
+    var fs = try FileStorage.init(std.testing.allocator, full_path);
+    defer fs.deinit();
+    try std.testing.expectEqual(@as(u64, 3), fs.snapshot_index);
+    try std.testing.expectEqual(@as(u64, 4), fs.index.items[0].raft_index);
+    try std.testing.expectEqual(@as(u64, 5), try fs.lastIndexImpl());
+    try std.testing.expectError(stg.StorageError.Compacted, fs.termImpl(2));
+    try std.testing.expectEqual(@as(u64, 1), try fs.termImpl(3));
+    const rest = try fs.entriesImpl(4, 6);
+    defer rpc.freeEntries(std.testing.allocator, rest);
+    try std.testing.expectEqualStrings("entry-5-payload", rest[1].data);
 }
