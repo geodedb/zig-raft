@@ -546,6 +546,11 @@ pub const RaftNode = struct {
     }
 
     pub fn ready(self: *RaftNode) !rd.Ready {
+        // Refuse before collecting anything: a second call before advance()
+        // would add the committed entries again (and could move the slice the
+        // previous Ready handed out) (SONNY-6611).
+        if (self.ready_state.has_pending_ready) return error.ReadyNotAdvanced;
+
         // Collect committed entries.
         if (self.log.committed > self.log.applied) {
             // Checked overflow: applied + 1, committed + 1 (SEC-0071).
