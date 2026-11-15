@@ -156,6 +156,11 @@ pub const RaftNode = struct {
     /// contact). Reset on becomeLeader/becomeFollower; drives the timer-based
     /// candidate demotion in tick(). See Config.candidate_demote_threshold.
     consecutive_election_failures: u32 = 0,
+    /// Index of the final config entry (C_new) that removes this leader, or
+    /// 0. The leader keeps leading (without counting itself, as C_new
+    /// excludes it) until that entry commits, then steps down (Raft §4.2.2,
+    /// SONNY-6611).
+    stepdown_index: u64 = 0,
 
     // -----------------------------------------------------------------------
     // Public API
@@ -498,11 +503,19 @@ pub const RaftNode = struct {
                     // preventing Raft §6 safety violation on OOM (SEC-0139).
                     self.membership_state.commitFinalizeChange();
                     self.pending_config_index = 0;
+                    if (!mem.isVoter(self.membership_state.config(), self.id)) {
+                        self.stepdown_index = entry.index;
+                    }
                 }
             }
 
-            // Check if leader should step down.
-            if (self.membership_state.shouldLeaderStepDown(self.id)) {
+            // A leader outside C_new steps down once C_new is committed, not
+            // when it is appended: until then the remaining voters may not
+            // have it, and nobody else can drive it to commit (Raft §4.2.2).
+            // The heartbeat above already carried the new commit index.
+            if (self.membership_state.shouldLeaderStepDown(self.id) and
+                self.log.committed >= self.stepdown_index)
+            {
                 self.becomeFollower(self.current_term, null);
                 return;
             }
@@ -703,6 +716,7 @@ pub const RaftNode = struct {
         self.leader_id = leader_id;
         self.is_pre_vote_election = false;
         self.consecutive_election_failures = 0;
+        self.stepdown_index = 0;
         self.election_state.resetElectionElapsed();
         self.election_state.resetElectionTimeout();
 
