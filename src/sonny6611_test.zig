@@ -171,3 +171,88 @@ test "SONNY-6611: a single-node leader commits an entry only once it is durable"
     try std.testing.expectEqualStrings("must-be-durable", rd2.committed_entries[0].data);
     try node.advance();
 }
+
+// ---------------------------------------------------------------------------
+// 5. Fast backtracking.
+// ---------------------------------------------------------------------------
+
+/// Queues AppendEntries for peer 2 (deep copies), drops everything else.
+const PeerTwoTransport = struct {
+    queue: std.ArrayList(rpc.Message) = .empty,
+
+    const vtable_inst = trans.Transport.VTable{ .send = &sendImpl };
+
+    fn transport(self: *PeerTwoTransport) trans.Transport {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable_inst };
+    }
+
+    fn sendImpl(ptr: *anyopaque, to: u64, msg: rpc.Message) void {
+        const self: *PeerTwoTransport = @ptrCast(@alignCast(ptr));
+        if (to != 2) return;
+        var copy = msg;
+        switch (msg) {
+            .append_entries => |ae| copy.append_entries.entries = rpc.dupeEntries(alloc, ae.entries) catch return,
+            else => return,
+        }
+        self.queue.append(alloc, copy) catch rpc.freeEntries(alloc, copy.append_entries.entries);
+    }
+
+    fn deinit(self: *PeerTwoTransport) void {
+        for (self.queue.items) |m| rpc.freeEntries(alloc, m.append_entries.entries);
+        self.queue.deinit(alloc);
+    }
+};
+
+test "SONNY-6611: a diverged follower is caught up in a few rounds, not one entry per round" {
+    // Follower 2: 1..40 at term 1 (from leader 3, term 1; never replicated).
+    var store2 = stg.InMemoryStorage.init(alloc);
+    defer store2.deinit();
+    var n2 = try RaftNode.init(alloc, .{ .id = 2, .peers = &.{ 1, 3 } }, store2.storage());
+    defer n2.deinit();
+    var buf: [64]rpc.Entry = undefined;
+    try n2.step(3, appendEntries(1, 3, 0, 0, entriesRange(buf[0..40], 1, 1), 0));
+    try drain(&n2);
+
+    // Node 1: 1..10 at term 1, then 11..60 at term 2 (leader 3, term 2).
+    var store1 = stg.InMemoryStorage.init(alloc);
+    defer store1.deinit();
+    var n1 = try RaftNode.init(alloc, .{ .id = 1, .peers = &.{ 2, 3 }, .pre_vote = false, .rng_seed = 9 }, store1.storage());
+    defer n1.deinit();
+    try n1.step(3, appendEntries(1, 3, 0, 0, entriesRange(buf[0..10], 1, 1), 0));
+    try n1.step(3, appendEntries(2, 3, 10, 1, entriesRange(buf[0..50], 11, 2), 10));
+    try drain(&n1);
+
+    // Node 1 wins term 3; its next_index for node 2 starts at 61.
+    var t: u32 = 0;
+    while (t < 40 and n1.role != .candidate) : (t += 1) try n1.tick(null);
+    try n1.step(3, .{ .request_vote_response = .{ .term = n1.current_term, .vote_granted = true, .pre_vote = false } });
+    try std.testing.expectEqual(st.Role.leader, n1.role);
+    try drain(&n1);
+
+    var net: PeerTwoTransport = .{};
+    defer net.deinit();
+    n1.setTransport(net.transport());
+
+    var rounds: u32 = 0;
+    while (rounds < 100) : (rounds += 1) {
+        if (n2.log.lastIndex() == n1.log.lastIndex() and (n2.log.term(n2.log.lastIndex()) catch 0) == n1.current_term) break;
+        try n1.tick(null);
+        const batch = try net.queue.toOwnedSlice(alloc);
+        defer {
+            for (batch) |m| rpc.freeEntries(alloc, m.append_entries.entries);
+            alloc.free(batch);
+        }
+        for (batch) |m| {
+            try n2.step(1, m);
+            const rd = try n2.ready();
+            try n2.advancePersist();
+            for (rd.messages) |out| if (out.to == 1) try n1.step(2, out.msg);
+            try n2.advanceApply();
+        }
+        try drain(&n1);
+    }
+    // Log too short (61 -> 41), then term 1 at 40 -> leader's last term-1
+    // entry is 10 (-> 11), then a match: a handful of rounds.
+    try std.testing.expect(rounds <= 5);
+    try std.testing.expectEqual(n1.log.lastIndex(), n2.log.lastIndex());
+}

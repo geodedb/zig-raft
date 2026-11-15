@@ -88,8 +88,15 @@ pub const AppendEntries = struct {
 pub const AppendEntriesResponse = struct {
     term: u64,
     success: bool,
+    /// On success: the last index the follower now matches. On a rejection:
+    /// the prev_log_index of the rejected AppendEntries (0 when the
+    /// rejection carries no log position: stale term, malformed message).
     match_index: u64,
+    /// On a rejection: where the leader may resume (see
+    /// `RaftLog.findConflict`) ...
     conflict_index: u64,
+    /// ... and the follower's term at prev_log_index (0: log too short or
+    /// already covered by its snapshot).
     conflict_term: u64,
 };
 

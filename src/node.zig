@@ -1126,13 +1126,18 @@ pub const RaftNode = struct {
             } });
         } else {
             const conflict = self.log.findConflict(msg.prev_log_index);
-            self.sendAfterPersist(msg.leader_id, rpc.Message{ .append_entries_response = .{
-                .term = self.current_term,
-                .success = false,
-                .match_index = 0,
-                .conflict_index = conflict.index,
-                .conflict_term = conflict.term_val,
-            } });
+            self.sendAfterPersist(msg.leader_id, rpc.Message{
+                .append_entries_response = .{
+                    .term = self.current_term,
+                    .success = false,
+                    // On a rejection, match_index carries the rejected
+                    // prev_log_index so the leader can drop stale rejections
+                    // (SONNY-6611).
+                    .match_index = msg.prev_log_index,
+                    .conflict_index = conflict.index,
+                    .conflict_term = conflict.term_val,
+                },
+            });
         }
     }
 
@@ -1156,7 +1161,10 @@ pub const RaftNode = struct {
             _ = progress.maybeUpdate(msg.match_index);
             self.maybeCommit();
         } else {
-            if (progress.maybeDecrTo(msg.match_index, msg.conflict_index, msg.conflict_term)) {
+            // A rejection carries the rejected prev_log_index in match_index
+            // and the follower's conflict hint (SONNY-6611).
+            const hint = repl.backtrackHint(&self.log, msg.match_index, msg.conflict_index, msg.conflict_term);
+            if (progress.maybeDecrTo(msg.match_index, hint, msg.conflict_term)) {
                 // Send retry AppendEntries with updated next_index.
                 const ae_msg = rs.buildAppendEntries(
                     from,
