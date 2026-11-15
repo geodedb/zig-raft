@@ -577,15 +577,17 @@ pub const RaftNode = struct {
     }
 
     /// Convenience method that calls advancePersist() then advanceApply().
-    /// Use the split methods directly for pipelined persist+send (PERF-006).
+    /// It releases `Ready.messages` unsent: a consumer with peers calls
+    /// advancePersist(), sends `Ready.messages`, then advanceApply().
     pub fn advance(self: *RaftNode) !void {
         try self.advancePersist();
         try self.advanceApply();
     }
 
     /// Phase 1: persist hard state and unstable entries to storage.
-    /// After this returns, the consumer may send Ready.messages over the
-    /// network in parallel with disk I/O completion (PERF-006).
+    /// Only after this returns may the consumer send `Ready.messages`; they
+    /// announce the vote, term and entries just persisted (SONNY-6592). If
+    /// it fails, do not send them.
     pub fn advancePersist(self: *RaftNode) !void {
         const hs = self.currentHardState();
 
@@ -834,7 +836,7 @@ pub const RaftNode = struct {
         } };
 
         for (peers) |peer| {
-            self.sendMsg(peer, msg);
+            self.sendAfterPersist(peer, msg);
         }
         observability.endRpcClientSpan(__obs_span, true, 0);
     }
@@ -864,7 +866,7 @@ pub const RaftNode = struct {
         const cfg = self.membership_state.config();
         if (!mem.isVoter(cfg, msg.candidate_id)) {
             std.log.warn("raft: RequestVote from non-member {d}, rejecting", .{msg.candidate_id});
-            self.sendMsg(msg.candidate_id, rpc.Message{ .request_vote_response = .{
+            self.sendAfterPersist(msg.candidate_id, rpc.Message{ .request_vote_response = .{
                 .term = self.current_term,
                 .vote_granted = false,
                 .pre_vote = msg.pre_vote,
@@ -878,7 +880,7 @@ pub const RaftNode = struct {
         // for same-term requests to prevent disruption (SEC-0133).
         if (msg.pre_vote) {
             if (self.role == .leader) {
-                self.sendMsg(msg.candidate_id, rpc.Message{ .request_vote_response = .{
+                self.sendAfterPersist(msg.candidate_id, rpc.Message{ .request_vote_response = .{
                     .term = self.current_term,
                     .vote_granted = false,
                     .pre_vote = true,
@@ -886,7 +888,7 @@ pub const RaftNode = struct {
                 return;
             }
             if (self.leader_id != null and msg.term <= self.current_term) {
-                self.sendMsg(msg.candidate_id, rpc.Message{ .request_vote_response = .{
+                self.sendAfterPersist(msg.candidate_id, rpc.Message{ .request_vote_response = .{
                     .term = self.current_term,
                     .vote_granted = false,
                     .pre_vote = true,
@@ -919,7 +921,7 @@ pub const RaftNode = struct {
             .vote_granted = should_grant,
             .pre_vote = msg.pre_vote,
         } };
-        self.sendMsg(msg.candidate_id, response);
+        self.sendAfterPersist(msg.candidate_id, response);
         observability.endRpcServerSpan(__obs_span, true, 0);
     }
 
@@ -1018,7 +1020,7 @@ pub const RaftNode = struct {
     /// Send a rejection AppendEntries response to the given leader (QA-002).
     /// Used for stale-term, malformed, or invalid AppendEntries messages.
     fn rejectAppendEntries(self: *RaftNode, leader_id: u64) void {
-        self.sendMsg(leader_id, rpc.Message{ .append_entries_response = .{
+        self.sendAfterPersist(leader_id, rpc.Message{ .append_entries_response = .{
             .term = self.current_term,
             .success = false,
             .match_index = 0,
@@ -1093,7 +1095,7 @@ pub const RaftNode = struct {
         );
 
         if (result) |match_index| {
-            self.sendMsg(msg.leader_id, rpc.Message{ .append_entries_response = .{
+            self.sendAfterPersist(msg.leader_id, rpc.Message{ .append_entries_response = .{
                 .term = self.current_term,
                 .success = true,
                 .match_index = match_index,
@@ -1102,7 +1104,7 @@ pub const RaftNode = struct {
             } });
         } else {
             const conflict = self.log.findConflict(msg.prev_log_index);
-            self.sendMsg(msg.leader_id, rpc.Message{ .append_entries_response = .{
+            self.sendAfterPersist(msg.leader_id, rpc.Message{ .append_entries_response = .{
                 .term = self.current_term,
                 .success = false,
                 .match_index = 0,
@@ -1181,7 +1183,7 @@ pub const RaftNode = struct {
         }
 
         if (msg.term < self.current_term) {
-            self.sendMsg(msg.leader_id, rpc.Message{ .install_snapshot_response = .{
+            self.sendAfterPersist(msg.leader_id, rpc.Message{ .install_snapshot_response = .{
                 .term = self.current_term,
                 .success = false,
             } });
@@ -1195,7 +1197,7 @@ pub const RaftNode = struct {
             std.log.warn("InstallSnapshot from leader {d} failed: {s}", .{
                 msg.leader_id, @errorName(err),
             });
-            self.sendMsg(msg.leader_id, rpc.Message{ .install_snapshot_response = .{
+            self.sendAfterPersist(msg.leader_id, rpc.Message{ .install_snapshot_response = .{
                 .term = self.current_term,
                 .success = false,
             } });
@@ -1228,7 +1230,7 @@ pub const RaftNode = struct {
             // on normal return since setSnapshot is infallible.
             self.ready_state.setSnapshot(snapshot_val);
             self.perf_stats.snapshots_installed += 1;
-            self.sendMsg(msg.leader_id, rpc.Message{ .install_snapshot_response = .{
+            self.sendAfterPersist(msg.leader_id, rpc.Message{ .install_snapshot_response = .{
                 .term = self.current_term,
                 .success = true,
             } });
@@ -1541,6 +1543,17 @@ pub const RaftNode = struct {
         if (self.transport) |t| {
             t.send(to, msg);
         }
+    }
+
+    /// Queue a message that announces state not yet durable (a granted vote,
+    /// a new term, appended entries, an installed snapshot) in the Ready, for
+    /// the consumer to send after `advancePersist()`. Sending it from inside
+    /// step() / tick() let a crash before the save lose the vote or the
+    /// entries the message acknowledged (Raft §5.2, §5.3; SONNY-6592). Only
+    /// messages without borrowed slices are queued. A message that cannot be
+    /// queued (OOM) is dropped: the peer retries.
+    fn sendAfterPersist(self: *RaftNode, to: u64, msg: rpc.Message) void {
+        self.ready_state.addMessage(to, msg) catch {};
     }
 
     /// Free the entries (slice and data) inside an AppendEntries message

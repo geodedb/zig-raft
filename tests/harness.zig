@@ -259,18 +259,19 @@ pub const Network = struct {
             }
         }
 
-        // Phase 3: ready / advance -- collect committed entries.
+        // Phase 3: ready / persist / send / apply -- collect committed entries.
         for (self.node_ids.items) |id| {
             if (self.paused_nodes.contains(id)) continue;
             try self.drainReady(id);
         }
 
-        // Discard any remaining queued messages from the ready/advance phase;
-        // they will be delivered on the next tickAll round.
+        // Messages released by Phase 3 are delivered on the next tickAll round.
     }
 
-    /// Run one Ready cycle on node `id`. Committed entries are recorded with
-    /// a private copy of their data, which the node frees at advance.
+    /// Run one Ready cycle on node `id` the way a consumer must: persist,
+    /// then queue `Ready.messages` for delivery, then apply. Committed
+    /// entries are recorded (with a private copy of their data, which the
+    /// node frees at advance).
     pub fn drainReady(self: *Network, id: u64) !void {
         const n = self.nodes.get(id).?;
         const r = try n.ready();
@@ -280,7 +281,11 @@ pub const Network = struct {
             if (entry.data.len > 0) copy.data = try self.allocator.dupe(u8, entry.data);
             try list.append(self.allocator, copy);
         }
-        try n.advance();
+        try n.advancePersist();
+        for (r.messages) |out| {
+            self.queue.append(.{ .from = id, .to = out.to, .msg = out.msg });
+        }
+        try n.advanceApply();
     }
 
     /// Tick repeatedly until exactly one leader exists, returning its ID.

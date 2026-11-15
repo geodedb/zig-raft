@@ -215,8 +215,10 @@ test "scenario: no_double_vote_same_term" {
     // The follower must NOT have changed its vote.
     try std.testing.expect(follower.voted_for.? != 99);
 
-    // Verify a rejection was enqueued in the message queue.
-    // The harness collects outbound messages in net.queue.list.
+    // The reply leaves through the Ready, after persist (SONNY-6592): run
+    // the follower's Ready cycle, then look for the rejection in the queue
+    // the harness collects outbound messages in.
+    try net.drainReady(follower_id);
     var found_rejection = false;
     for (net.queue.list.items) |pm| {
         if (pm.from == follower_id and pm.to == 99) {

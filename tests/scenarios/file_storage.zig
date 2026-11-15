@@ -203,10 +203,15 @@ const TestCluster = struct {
             try node.step(pm.from, pm.msg);
         }
 
-        // Phase 3: ready / advance.
+        // Phase 3: ready / persist / send / apply. Ready.messages leave only
+        // once advancePersist() has made what they announce durable.
         for (self.nodes) |n| {
-            _ = try n.ready();
-            try n.advance();
+            const rd = try n.ready();
+            try n.advancePersist();
+            for (rd.messages) |out| {
+                try self.queue.append(self.allocator, .{ .from = n.id, .to = out.to, .msg = out.msg });
+            }
+            try n.advanceApply();
         }
     }
 

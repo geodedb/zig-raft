@@ -49,6 +49,7 @@ pub const RaftNode = node.RaftNode;
 pub const Config = node.Config;
 pub const Stats = node.Stats;
 pub const Ready = ready.Ready;
+pub const Outbound = ready.Outbound;
 pub const Role = state.Role;
 pub const HardState = state.HardState;
 pub const SoftState = state.SoftState;

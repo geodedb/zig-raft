@@ -710,10 +710,13 @@ test "scenario: auto snapshot re-send does not regress laggard and forward progr
     const target = leader.log.lastIndex();
     try std.testing.expect(target > caught_up_index);
 
+    // Wait for the laggard to apply `target` itself: "laggard caught up with
+    // the leader" also holds before the leader has committed `target` (an
+    // ack reaches the leader only after the follower's Ready, SONNY-6592).
     rounds = 0;
     while (rounds < 100) : (rounds += 1) {
         try net.tickAll();
-        if (laggard.log.applied >= leader.log.applied) break;
+        if (laggard.log.applied >= target and laggard.log.applied >= leader.log.applied) break;
         try checkInvariants(allocator, &net);
     }
 
