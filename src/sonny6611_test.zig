@@ -91,3 +91,44 @@ test "SONNY-6611: a second ready() before advance() does not duplicate committed
     try std.testing.expectEqual(@as(usize, 0), rd2.committed_entries.len);
     try node.advance();
 }
+
+// ---------------------------------------------------------------------------
+// 3. A snapshot installed between ready() and advance().
+// ---------------------------------------------------------------------------
+
+test "SONNY-6611: a snapshot installed between ready() and advance() reaches the next Ready" {
+    var store: TestStore = undefined;
+    try store.init();
+    defer store.deinit();
+
+    var node = try RaftNode.init(alloc, .{ .id = 2, .peers = &.{ 1, 3 } }, store.fs.storage());
+    defer node.deinit();
+
+    const data = "snapshot-state";
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(data, &digest, .{});
+
+    _ = try node.ready();
+    try node.step(1, .{ .install_snapshot = .{
+        .term = 1,
+        .leader_id = 1,
+        .last_included_index = 5,
+        .last_included_term = 1,
+        .offset = 0,
+        .data = data,
+        .done = true,
+        .checksum = digest,
+        .config = .{ .voters = &.{ 1, 2, 3 }, .voters_outgoing = &.{}, .is_joint = false },
+    } });
+    try node.advance();
+
+    const rd = try node.ready();
+    try std.testing.expect(rd.snapshot != null);
+    try std.testing.expectEqual(@as(u64, 5), rd.snapshot.?.metadata.index);
+    try std.testing.expectEqualStrings(data, rd.snapshot.?.data);
+    try node.advancePersist();
+    const saved = (try store.fs.storage().loadSnapshot()).?;
+    defer stg.freeSnapshot(alloc, saved);
+    try std.testing.expectEqual(@as(u64, 5), saved.metadata.index);
+    try node.advanceApply();
+}

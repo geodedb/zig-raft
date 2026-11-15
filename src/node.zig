@@ -605,8 +605,8 @@ pub const RaftNode = struct {
         // this is the follower-side analogue. saveSnapshot advances the store's
         // snapshot_index so the subsequent appendEntries truncates the stale
         // tail correctly.
-        if (self.ready_state.pending_snapshot) |pending_snap| {
-            try self.storage.saveSnapshot(pending_snap);
+        if (self.ready_state.ready_snapshot) |ready_snap| {
+            try self.storage.saveSnapshot(ready_snap);
         }
 
         // Persist hard state if changed.
@@ -1231,8 +1231,10 @@ pub const RaftNode = struct {
                 // Snapshot supersedes any in-flight config change (SEC-0112).
                 self.pending_config_index = 0;
             }
-            // Transfer ownership to ready_state — errdefer will not fire
-            // on normal return since setSnapshot is infallible.
+            // Transfer ownership to ready_state, which frees it at the
+            // advance() after the Ready that delivers it (SONNY-6611); the
+            // errdefer will not fire on normal return since setSnapshot is
+            // infallible.
             self.ready_state.setSnapshot(snapshot_val);
             self.perf_stats.snapshots_installed += 1;
             self.sendAfterPersist(msg.leader_id, rpc.Message{ .install_snapshot_response = .{
