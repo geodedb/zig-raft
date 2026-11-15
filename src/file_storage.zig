@@ -328,6 +328,7 @@ pub const FileStorage = struct {
     }
 
     pub fn saveSnapshotImpl(self: *FileStorage, snap: rpc.Snapshot) !void {
+        const prev_snapshot_index = self.snapshot_index;
         // fips-exempt: non-security — snapshot-data integrity digest on disk.
         const Blake3 = std.crypto.hash.Blake3;
         var hasher = Blake3.init(.{});
@@ -380,6 +381,48 @@ pub const FileStorage = struct {
         self.snapshot_config_voters_outgoing.deinit(self.allocator);
         self.snapshot_config_voters_outgoing = new_outgoing;
         self.snapshot_config_is_joint = snap.metadata.config.is_joint;
+
+        if (snap.metadata.index > prev_snapshot_index) {
+            try self.discardCoveredBy(snap.metadata.index, snap.metadata.term);
+        }
+    }
+
+    /// Drop the log entries a snapshot at `snap_index` / `snap_term` (already
+    /// durable) covers (Raft §7, SONNY-6611). If the log holds that entry
+    /// with that term, the entries up to it go and the rest is kept (a
+    /// leader's own snapshot); otherwise the log conflicts with or lags the
+    /// snapshot and all of it goes (a follower's install). Before this the
+    /// WAL and index kept every entry, and a follower kept a conflicting
+    /// tail. A compaction the WAL refuses is logged: recovery skips records
+    /// at or below the snapshot.
+    fn discardCoveredBy(self: *FileStorage, snap_index: u64, snap_term: u64) !void {
+        if (self.findIndexPos(snap_index)) |pos| {
+            const items = self.index.items;
+            if (items[pos].term == snap_term and pos + 1 < items.len) {
+                const remaining = items.len - (pos + 1);
+                std.mem.copyForwards(IndexEntry, items[0..remaining], items[pos + 1 ..]);
+                self.index.shrinkRetainingCapacity(remaining);
+                if (self.wal_log) |*w| {
+                    w.compact(snap_index) catch |err| {
+                        if (!isWalRefusal(err)) return err;
+                        std.log.warn("raft: FileStorage: entries.wal compaction up to snapshot {d} refused: {s}; " ++
+                            "the log is unchanged and stays in use", .{ snap_index, @errorName(err) });
+                    };
+                }
+                return;
+            }
+        }
+
+        self.index.shrinkRetainingCapacity(0);
+        if (self.wal_log) |*w| {
+            w.deinit();
+            self.wal_log = null;
+        }
+        self.dir.deleteFile(std.Io.Threaded.global_single_threaded.io(), "entries.wal") catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+        try self.syncDir();
     }
 
     pub fn loadSnapshotImpl(self: *FileStorage) !?rpc.Snapshot {
@@ -1095,4 +1138,91 @@ test "FileStorage: a refused WAL compaction is logged and storage keeps working 
     const rest = try fs.entriesImpl(4, 6);
     defer rpc.freeEntries(std.testing.allocator, rest);
     try std.testing.expectEqualStrings("entry-5-payload", rest[1].data);
+}
+
+// ----------------------------------------------------------------------------
+// SONNY-6611: snapshot trimming, compaction rollback, truncation over damage.
+// ----------------------------------------------------------------------------
+
+fn tenEntries(buf: *[10]rpc.Entry, names: *[10][16]u8) []const rpc.Entry {
+    for (buf, 0..) |*e, i| {
+        const name = std.fmt.bufPrint(&names[i], "entry-{d:0>2}-data", .{i + 1}) catch unreachable;
+        e.* = .{ .index = i + 1, .term = 1, .kind = .normal, .data = name };
+    }
+    return buf;
+}
+
+fn testSnapshotAt(index: u64, term: u64) rpc.Snapshot {
+    return .{
+        .metadata = .{ .index = index, .term = term, .config = .{ .voters = &.{ 1, 2, 3 }, .voters_outgoing = &.{}, .is_joint = false } },
+        .data = "snapshot-bytes",
+    };
+}
+
+fn walContains(path: []const u8, needle: []const u8) !bool {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var file = walFile(path) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    defer file.close(io);
+    const buf = try std.testing.allocator.alloc(u8, @intCast(try file.length(io)));
+    defer std.testing.allocator.free(buf);
+    _ = try file.readPositionalAll(io, buf, 0);
+    return std.mem.indexOf(u8, buf, needle) != null;
+}
+
+test "FileStorage: a snapshot matching the log compacts the WAL and trims the index (SONNY-6611)" {
+    var tmp = testDir();
+    defer tmp.cleanup();
+    const full_path = testPath(std.testing.allocator, &tmp, "fs-test-snap-trim");
+    defer std.testing.allocator.free(full_path);
+
+    {
+        var fs = try FileStorage.init(std.testing.allocator, full_path);
+        defer fs.deinit();
+        var buf: [10]rpc.Entry = undefined;
+        var names: [10][16]u8 = undefined;
+        try fs.appendEntriesImpl(tenEntries(&buf, &names));
+
+        try fs.saveSnapshotImpl(testSnapshotAt(6, 1));
+        try std.testing.expectEqual(@as(u64, 7), fs.index.items[0].raft_index);
+        try std.testing.expectEqual(@as(u64, 10), try fs.lastIndexImpl());
+        try std.testing.expect(!try walContains(full_path, "entry-03-data"));
+        const rest = try fs.entriesImpl(7, 11);
+        defer rpc.freeEntries(std.testing.allocator, rest);
+        try std.testing.expectEqualStrings("entry-07-data", rest[0].data);
+    }
+
+    var fs = try FileStorage.init(std.testing.allocator, full_path);
+    defer fs.deinit();
+    try std.testing.expectEqual(@as(u64, 6), fs.snapshot_index);
+    try std.testing.expectEqual(@as(u64, 7), fs.index.items[0].raft_index);
+    try std.testing.expectEqual(@as(u64, 10), try fs.lastIndexImpl());
+}
+
+test "FileStorage: a snapshot that conflicts with the log drops the log (SONNY-6611)" {
+    var tmp = testDir();
+    defer tmp.cleanup();
+    const full_path = testPath(std.testing.allocator, &tmp, "fs-test-snap-drop");
+    defer std.testing.allocator.free(full_path);
+
+    {
+        var fs = try FileStorage.init(std.testing.allocator, full_path);
+        defer fs.deinit();
+        var buf: [10]rpc.Entry = undefined;
+        var names: [10][16]u8 = undefined;
+        try fs.appendEntriesImpl(tenEntries(&buf, &names));
+
+        // The leader's snapshot has term 2 at index 6: this log diverged.
+        try fs.saveSnapshotImpl(testSnapshotAt(6, 2));
+        try std.testing.expectEqual(@as(usize, 0), fs.index.items.len);
+        try std.testing.expectEqual(@as(u64, 6), try fs.lastIndexImpl());
+        try std.testing.expectEqual(@as(u64, 2), try fs.termImpl(6));
+    }
+
+    var fs = try FileStorage.init(std.testing.allocator, full_path);
+    defer fs.deinit();
+    try std.testing.expectEqual(@as(u64, 6), try fs.lastIndexImpl());
+    try std.testing.expectError(stg.StorageError.Unavailable, fs.termImpl(7));
 }

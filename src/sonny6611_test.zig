@@ -256,3 +256,47 @@ test "SONNY-6611: a diverged follower is caught up in a few rounds, not one entr
     try std.testing.expect(rounds <= 5);
     try std.testing.expectEqual(n1.log.lastIndex(), n2.log.lastIndex());
 }
+
+// ---------------------------------------------------------------------------
+// 7. A snapshot shrinks the stored log.
+// ---------------------------------------------------------------------------
+
+test "SONNY-6611: reportSnapshot drops the snapshotted entries from FileStorage, across a restart" {
+    var store: TestStore = undefined;
+    try store.init();
+    defer store.deinit();
+
+    var applied: u64 = 0;
+    {
+        var node = try RaftNode.init(alloc, .{ .id = 1, .peers = &.{}, .rng_seed = 5 }, store.fs.storage());
+        defer node.deinit();
+        var i: u32 = 0;
+        while (i < 40 and node.role != .leader) : (i += 1) try node.tick(null);
+        for (0..5) |_| try node.propose("before-snapshot");
+        try drain(&node);
+        try drain(&node);
+        applied = node.log.applied;
+        try std.testing.expect(applied >= 6);
+
+        try node.reportSnapshot("state-machine-image");
+        // Every stored entry was covered: the stored log is empty.
+        try std.testing.expectEqual(@as(usize, 0), store.fs.index.items.len);
+        try std.testing.expectEqual(applied, try store.fs.storage().lastIndex());
+
+        try node.propose("after-snapshot");
+        try drain(&node);
+        try drain(&node);
+        try std.testing.expectEqual(applied + 1, try store.fs.storage().lastIndex());
+    }
+
+    // Restart from disk.
+    store.fs.deinit();
+    store.fs = try FileStorage.init(alloc, store.path);
+    var node = try RaftNode.init(alloc, .{ .id = 1, .peers = &.{}, .rng_seed = 5 }, store.fs.storage());
+    defer node.deinit();
+    try std.testing.expectEqual(applied, node.log.snapshot_index);
+    try std.testing.expectEqual(applied + 1, node.log.lastIndex());
+    const tail = try node.log.slice(applied + 1, applied + 2);
+    defer rpc.freeEntries(alloc, tail);
+    try std.testing.expectEqualStrings("after-snapshot", tail[0].data);
+}
