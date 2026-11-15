@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-15
+
+### Changed
+
+- Re-pin wal to v0.1.24 (SONNY-6622), which also moves thread-pool to
+  v0.2.11. wal recovery and compaction now fail closed on data they cannot
+  read and never truncate or rewrite valid records; only a torn tail is
+  truncated on open.
+- `StorageError` gains `LogCorrupted`, `LogAuthFailed` and
+  `LogEncryptionMismatch`.
+
+### Fixed
+
+- `FileStorage` opened an entry log with a damaged record in the middle by
+  truncating it there, silently losing every entry after it. It now refuses
+  to open with `StorageError.LogCorrupted` and leaves the file untouched; an
+  encrypted log, or one that does not authenticate, is refused with
+  `LogEncryptionMismatch` / `LogAuthFailed` (SONNY-6622).
+- A WAL compaction refused after a snapshot is logged rather than failing
+  `compact`: the snapshot is durable and the WAL stays in use. Records the
+  refused compaction leaves behind are skipped on recovery.
+
 ## [0.2.0] - 2026-11-15
 
 ### Changed (breaking)

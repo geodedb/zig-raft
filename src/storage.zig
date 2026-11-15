@@ -5,7 +5,18 @@ const std = @import("std");
 const state = @import("state.zig");
 const rpc = @import("rpc.zig");
 
-pub const StorageError = error{ Compacted, Unavailable };
+pub const StorageError = error{
+    Compacted,
+    Unavailable,
+    /// The entry log holds a damaged record with valid records after it;
+    /// it was not opened, and the file was left untouched (SONNY-6622).
+    LogCorrupted,
+    /// No record of the encrypted entry log authenticates under the key.
+    LogAuthFailed,
+    /// The entry log was written in the other key mode (encrypted vs
+    /// plaintext).
+    LogEncryptionMismatch,
+};
 
 pub const Storage = struct {
     ptr: *anyopaque,
