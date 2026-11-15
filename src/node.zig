@@ -668,6 +668,9 @@ pub const RaftNode = struct {
         if (unstable.len > 0) {
             const last = unstable[unstable.len - 1];
             try self.log.stableTo(last.index, last.term);
+            // The leader's own entries now count toward commit; without
+            // this a single-node cluster would wait for another tick.
+            if (self.role == .leader) self.maybeCommit();
         }
     }
 
@@ -1867,10 +1870,11 @@ test "stats returns correct counters after tick and propose (QA-010)" {
     s = node.stats();
     try std.testing.expectEqual(@as(u64, 2), s.proposals);
 
-    // Tick to run maybeCommit() so the commit index advances.
+    // The entries commit once advance() has persisted them (SONNY-6611),
+    // and are applied by the Ready after that.
     try node.tick(null);
-
-    // After ready+advance, entries_applied should increment.
+    _ = try node.ready();
+    try node.advance();
     _ = try node.ready();
     try node.advance();
     s = node.stats();

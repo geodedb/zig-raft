@@ -101,6 +101,12 @@ pub const RaftLog = struct {
         return self.cached_storage_last_index;
     }
 
+    /// Highest index known to be in storage: entries above it are still
+    /// unstable (not yet persisted by advancePersist/stableTo).
+    pub fn stableLastIndex(self: *RaftLog) u64 {
+        return self.firstUnstableIndex() - 1;
+    }
+
     pub fn lastTerm(self: *RaftLog) u64 {
         return self.term(self.lastIndex()) catch 0;
     }

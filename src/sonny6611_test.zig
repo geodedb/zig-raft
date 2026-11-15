@@ -132,3 +132,42 @@ test "SONNY-6611: a snapshot installed between ready() and advance() reaches the
     try std.testing.expectEqual(@as(u64, 5), saved.metadata.index);
     try node.advanceApply();
 }
+
+// ---------------------------------------------------------------------------
+// 1. Commit only what is durable.
+// ---------------------------------------------------------------------------
+
+test "SONNY-6611: a single-node leader commits an entry only once it is durable" {
+    var store: TestStore = undefined;
+    try store.init();
+    defer store.deinit();
+
+    var node = try RaftNode.init(alloc, .{ .id = 1, .peers = &.{}, .rng_seed = 5 }, store.fs.storage());
+    defer node.deinit();
+
+    var i: u32 = 0;
+    while (i < 40 and node.role != .leader) : (i += 1) try node.tick(null);
+    try std.testing.expectEqual(st.Role.leader, node.role);
+    try drain(&node);
+    try drain(&node);
+
+    try node.propose("must-be-durable");
+    const idx = node.log.lastIndex();
+    try node.tick(null);
+    // Not on disk yet, so not committed.
+    try std.testing.expect(try store.fs.storage().lastIndex() < idx);
+    try std.testing.expect(node.log.committed < idx);
+
+    const rd = try node.ready();
+    try std.testing.expectEqual(@as(usize, 0), rd.committed_entries.len);
+    try node.advancePersist();
+    try std.testing.expectEqual(idx, try store.fs.storage().lastIndex());
+    try node.advanceApply();
+    // Durable now: committed without waiting for another tick.
+    try std.testing.expectEqual(idx, node.log.committed);
+
+    const rd2 = try node.ready();
+    try std.testing.expectEqual(@as(usize, 1), rd2.committed_entries.len);
+    try std.testing.expectEqualStrings("must-be-durable", rd2.committed_entries[0].data);
+    try node.advance();
+}

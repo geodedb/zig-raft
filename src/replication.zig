@@ -229,9 +229,11 @@ pub const ReplicationState = struct {
         defer if (count > 16) self.allocator.free(match_indices);
         var n: usize = 0;
 
-        // Leader's own match index is its last log index.
+        // The leader counts itself only for entries it has persisted: an
+        // unsaved entry could be lost with the leader yet already count
+        // toward commit (SONNY-6611).
         node_ids[n] = leader_id;
-        match_indices[n] = raft_log_ptr.lastIndex();
+        match_indices[n] = raft_log_ptr.stableLastIndex();
         n += 1;
 
         var it = self.peers.iterator();
@@ -415,6 +417,9 @@ test "maybeCommit advances commit when majority has replicated" {
         .{ .index = 3, .term = 3, .kind = .normal, .data = &.{} },
     };
     try log.append(&entries);
+    // The leader has persisted them (advancePersist + stableTo).
+    try mem_store.appendEntriesImpl(&entries);
+    try log.stableTo(3, 3);
 
     const peer_ids = [_]u64{ 2, 3 };
     var rs = try ReplicationState.init(std.testing.allocator, &peer_ids, 3);
@@ -427,6 +432,38 @@ test "maybeCommit advances commit when majority has replicated" {
     const voters = [_]u64{ 1, 2, 3 };
     const committed = try rs.maybeCommit(&log, &voters, &.{}, 3, 1);
     try std.testing.expect(committed);
+    try std.testing.expectEqual(@as(u64, 3), log.committed);
+}
+
+test "maybeCommit does not count the leader's unpersisted entries (SONNY-6611)" {
+    var mem_store = stg.InMemoryStorage.init(std.testing.allocator);
+    defer mem_store.deinit();
+
+    var log = try raft_log.RaftLog.init(std.testing.allocator, mem_store.storage(), 0, 0);
+    defer log.deinit();
+
+    const entries = [_]rpc.Entry{
+        .{ .index = 1, .term = 3, .kind = .normal, .data = &.{} },
+        .{ .index = 2, .term = 3, .kind = .normal, .data = &.{} },
+        .{ .index = 3, .term = 3, .kind = .normal, .data = &.{} },
+    };
+    try log.append(&entries); // in the leader's log, not yet persisted
+
+    const peer_ids = [_]u64{ 2, 3 };
+    var rs = try ReplicationState.init(std.testing.allocator, &peer_ids, 3);
+    defer rs.deinit();
+    _ = rs.peers.getPtr(2).?.maybeUpdate(3);
+    _ = rs.peers.getPtr(3).?.maybeUpdate(1);
+
+    // Only peer 2 holds 2..3 durably: one of three, not a majority.
+    const voters = [_]u64{ 1, 2, 3 };
+    _ = try rs.maybeCommit(&log, &voters, &.{}, 3, 1);
+    try std.testing.expectEqual(@as(u64, 1), log.committed);
+
+    // Once the leader has persisted them, 3 is held by a majority.
+    try mem_store.appendEntriesImpl(&entries);
+    try log.stableTo(3, 3);
+    try std.testing.expect(try rs.maybeCommit(&log, &voters, &.{}, 3, 1));
     try std.testing.expectEqual(@as(u64, 3), log.committed);
 }
 
