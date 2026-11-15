@@ -36,11 +36,15 @@ pub const PeerProgress = struct {
     /// backtracking: use `backtrackHint` to fold the follower's
     /// `conflict_term` into it). Returns true if next_index changed.
     ///
-    /// - A rejection without a position (`rejected_index` 0: stale term or
-    ///   malformed message) and a stale one (sent before next_index last
-    ///   moved: `rejected_index + 1 != next_index`) are ignored (SONNY-6611).
-    /// - A hint past the rejected index (the follower already holds that
-    ///   much, e.g. in its snapshot) is ignored.
+    /// - A stale rejection (sent before next_index last moved:
+    ///   `rejected_index + 1 != next_index`) and a hint past the rejected
+    ///   index (the follower already holds that much, e.g. in its snapshot)
+    ///   are ignored (SONNY-6611).
+    /// - A rejection without a position (`rejected_index` 0: a stale-term
+    ///   or malformed AppendEntries, a follower on raft <= 0.2.1, or a
+    ///   transport that does not carry the field) backs off to
+    ///   `conflict_index` as before, so mixed-version clusters still
+    ///   converge.
     /// - Only allows backward movement of next_index to prevent a malicious
     ///   conflict_index from jumping next_index forward (SEC-0076).
     /// - Never moves next_index to or below match_index: the peer acked
@@ -53,9 +57,10 @@ pub const PeerProgress = struct {
         conflict_term: u64,
     ) bool {
         _ = conflict_term;
-        if (rejected_index == 0) return false;
-        if (rejected_index +| 1 != self.next_index) return false;
-        if (conflict_index > rejected_index) return false;
+        if (rejected_index != 0) {
+            if (rejected_index +| 1 != self.next_index) return false;
+            if (conflict_index > rejected_index) return false;
+        }
         const floor = std.math.add(u64, self.match_index, 1) catch self.match_index;
         const new_next = @max(conflict_index, floor, 1);
         // Only allow backward movement (SEC-0076).
@@ -543,10 +548,8 @@ test "maybeDecrTo ignores a stale rejection below the acked match_index" {
     try std.testing.expectEqual(@as(u64, 11), probe.next_index);
 }
 
-test "maybeDecrTo ignores position-less and duplicate rejections (SONNY-6611)" {
+test "maybeDecrTo ignores duplicate rejections and hints past the rejected index (SONNY-6611)" {
     var pp = PeerProgress{ .next_index = 20, .match_index = 0 };
-    // Stale term / malformed: no position.
-    try std.testing.expect(!pp.maybeDecrTo(0, 0, 0));
     try std.testing.expect(pp.maybeDecrTo(19, 12, 0));
     try std.testing.expectEqual(@as(u64, 12), pp.next_index);
     // The same rejection again (a second heartbeat sent from 20): stale.
@@ -572,4 +575,17 @@ test "backtrackHint skips to the leader's last entry of the conflicting term (SO
     try std.testing.expectEqual(@as(u64, 6), backtrackHint(&log, 9, 6, 3));
     // Log too short.
     try std.testing.expectEqual(@as(u64, 4), backtrackHint(&log, 9, 4, 0));
+}
+
+test "maybeDecrTo still backs off on a rejection without a position (mixed versions)" {
+    // A follower on raft <= 0.2.1 (or a transport that drops the hints)
+    // reports a rejection with match_index 0 and no conflict hint. The
+    // leader must keep backing off, as before, or that follower stalls.
+    var pp = PeerProgress{ .next_index = 20, .match_index = 6 };
+    try std.testing.expect(pp.maybeDecrTo(0, 0, 0));
+    try std.testing.expectEqual(@as(u64, 7), pp.next_index);
+    // An old follower's hint (its rejected prev_log_index) is still used.
+    var hinted = PeerProgress{ .next_index = 20, .match_index = 0 };
+    try std.testing.expect(hinted.maybeDecrTo(0, 15, 2));
+    try std.testing.expectEqual(@as(u64, 15), hinted.next_index);
 }
