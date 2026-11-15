@@ -809,14 +809,37 @@ pub const FileStorage = struct {
     fn truncateFrom(self: *FileStorage, from_index: u64) !void {
         const pos = self.findIndexPos(from_index) orelse return;
 
-        // Truncate in-memory index.
-        self.index.shrinkRetainingCapacity(pos);
-
         // Truncate WAL: remove all records with LSN >= from_index.
         if (self.wal_log) |*w| {
             const after_lsn = if (pos == 0) 0 else self.index.items[pos - 1].raft_index;
-            try w.truncateAfter(after_lsn);
+            // wal's truncateAfter finds its cut with the recovery scan, which
+            // stops at the first damaged record: a damaged record below the
+            // cut would make it cut there instead, silently dropping the
+            // valid records after it. Refuse unless every record it keeps is
+            // readable (SONNY-6611).
+            if (after_lsn > 0) try verifyReadableThrough(w, after_lsn);
+            w.truncateAfter(after_lsn) catch |err| return mapWalError(err);
         }
+
+        // Truncate the in-memory index only once the WAL matches it.
+        self.index.shrinkRetainingCapacity(pos);
+    }
+
+    /// LogCorrupted unless the WAL's records can be read in order up to and
+    /// including `lsn` (the iterator stops at the first damaged record).
+    fn verifyReadableThrough(w: *wal_mod.WriteAheadLog, lsn: u64) !void {
+        var iter = w.iterator(0) catch |err| return mapWalError(err);
+        defer iter.deinit();
+        while (true) {
+            var entry_opt = iter.next() catch |err| return mapWalError(err);
+            if (entry_opt == null) break;
+            var wal_entry = &entry_opt.?;
+            defer wal_entry.deinit();
+            if (wal_entry.lsn == lsn) return;
+            if (wal_entry.lsn > lsn) break;
+        }
+        std.log.warn("raft: FileStorage: entries.wal is damaged below index {d}; refusing to truncate it", .{lsn});
+        return stg.StorageError.LogCorrupted;
     }
 
     // ========================================================================
@@ -1290,4 +1313,30 @@ test "FileStorage: a failed WAL compaction rolls the snapshot back (SONNY-6611)"
     const all = try fs.entriesImpl(1, 6);
     defer rpc.freeEntries(std.testing.allocator, all);
     try std.testing.expectEqualStrings("entry-2-payload", all[1].data);
+}
+
+test "FileStorage: truncating over a damaged record refuses instead of dropping entries (SONNY-6611)" {
+    var tmp = testDir();
+    defer tmp.cleanup();
+    const full_path = testPath(std.testing.allocator, &tmp, "fs-test-truncate-damaged");
+    defer std.testing.allocator.free(full_path);
+
+    {
+        var fs = try FileStorage.init(std.testing.allocator, full_path);
+        defer fs.deinit();
+        const ents = payloadEntries();
+        try fs.appendEntriesImpl(&ents);
+        try corruptWalPayload(full_path, "entry-2-payload");
+
+        // A conflicting entry at 4 truncates after 3: records 1..3 must be
+        // kept, but record 2 cannot be read.
+        const replacement = [_]rpc.Entry{.{ .index = 4, .term = 2, .kind = .normal, .data = "replacement" }};
+        if (fs.appendEntriesImpl(&replacement)) |_| {
+            return error.TestExpectedRefusal;
+        } else |err| {
+            try std.testing.expectEqualStrings("LogCorrupted", @errorName(err));
+        }
+    }
+    // The file was not cut back to before the damaged record.
+    try expectOpenRefused(full_path, "LogCorrupted");
 }
