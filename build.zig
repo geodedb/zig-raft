@@ -336,7 +336,7 @@ pub fn build(b: *std.Build) void {
     // Example executable (QA-038: compile examples to prevent silent rot)
     const example = b.addExecutable(.{
         .name = "example",
-        .root_module = addRaftModule(b, b.path("examples/basic.zig"), target, optimize, &.{}),
+        .root_module = addRaftModule(b, b.path("examples/basic.zig"), target, optimize, raft_imports),
     });
     const run_example = b.addRunArtifact(example);
     const example_step = b.step("example", "Run the basic example");
@@ -368,4 +368,8 @@ pub fn build(b: *std.Build) void {
         check.root_module.addImport("observability_init", m);
     }
     check_step.dependOn(&check.step);
+    // Compile the examples too, so `zig build check` (the CI build job)
+    // catches them rotting (SONNY-6611: examples/basic.zig did).
+    check_step.dependOn(&example.step);
+    check_step.dependOn(&parallel_example.step);
 }
