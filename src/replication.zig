@@ -35,6 +35,11 @@ pub const PeerProgress = struct {
     /// Returns true if next_index changed.
     /// Only allows backward movement of next_index to prevent a malicious
     /// conflict_index from jumping next_index forward (SEC-0076).
+    /// Never moves next_index to or below match_index: the peer acked those
+    /// entries, so a rejection that points there is stale (a reply to an
+    /// older AppendEntries delivered late). Acting on it sent a peer that had
+    /// just installed a snapshot back below the snapshot, re-sending it
+    /// forever.
     pub fn maybeDecrTo(
         self: *PeerProgress,
         rejected_index: u64,
@@ -43,7 +48,8 @@ pub const PeerProgress = struct {
     ) bool {
         _ = rejected_index;
         _ = conflict_term;
-        const new_next = @max(conflict_index, 1);
+        const floor = std.math.add(u64, self.match_index, 1) catch self.match_index;
+        const new_next = @max(conflict_index, floor, 1);
         // Only allow backward movement (SEC-0076).
         if (new_next >= self.next_index) return false;
         self.next_index = new_next;
@@ -447,4 +453,20 @@ test "maybeCommit does NOT commit entries from prior term (section 5.4.2)" {
     const committed = try rs.maybeCommit(&log, &voters, &.{}, 3, 1);
     try std.testing.expect(!committed);
     try std.testing.expectEqual(@as(u64, 0), log.committed);
+}
+
+test "maybeDecrTo ignores a stale rejection below the acked match_index" {
+    // The peer acked through 10 (e.g. a snapshot install); a rejection of an
+    // older AppendEntries that arrives late must not send it back below that.
+    var pp = PeerProgress{ .next_index = 11, .match_index = 10 };
+    try std.testing.expect(!pp.maybeDecrTo(0, 3, 1));
+    try std.testing.expectEqual(@as(u64, 11), pp.next_index);
+    try std.testing.expect(!pp.needsSnapshot(10));
+
+    // A real rejection above match_index still backs off, down to match + 1.
+    var probe = PeerProgress{ .next_index = 20, .match_index = 10 };
+    try std.testing.expect(probe.maybeDecrTo(0, 15, 2));
+    try std.testing.expectEqual(@as(u64, 15), probe.next_index);
+    try std.testing.expect(probe.maybeDecrTo(0, 4, 1));
+    try std.testing.expectEqual(@as(u64, 11), probe.next_index);
 }
