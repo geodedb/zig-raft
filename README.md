@@ -21,7 +21,7 @@ Add to your `build.zig.zon`:
 ```zig
 .dependencies = .{
     .raft = .{
-        .url = "https://gitlab.com/devnw/zig/raft/-/archive/v0.1.0/raft-v0.1.0.tar.gz",
+        .url = "https://gitlab.com/devnw/zig/raft/-/archive/v0.2.0/raft-v0.2.0.tar.gz",
         .hash = "...",
     },
 },
@@ -56,14 +56,28 @@ pub fn main() !void {
     var node = try raft.RaftNode.init(allocator, config, store.storage());
     defer node.deinit();
 
-    // Consumer loop: tick → ready → persist/send/apply → advance.
+    // Consumer loop: tick/step → ready → persist → send → apply.
     try node.tick(null);
-    var rd = try node.ready();
-    // ... persist rd.hard_state, send rd.messages, apply rd.committed_entries ...
-    _ = rd;
-    try node.advance();
+    const rd = try node.ready();
+    // Persist rd.hard_state, the new entries and rd.snapshot.
+    try node.advancePersist();
+    // Only now send rd.messages (votes, acks): they announce what was just
+    // persisted. Each carries its destination.
+    for (rd.messages) |out| {
+        _ = out; // my_network.send(out.to, out.msg);
+    }
+    // ... apply rd.committed_entries to your state machine ...
+    try node.advanceApply();
 }
 ```
+
+`Ready.messages` and `Ready.committed_entries` stay valid until
+`advanceApply()`. Leader replication (AppendEntries, InstallSnapshot) goes out
+at once through the `Transport` set with `node.setTransport`; the node frees
+those payloads when `send` returns, so a transport that queues a message must
+copy its entries with `raft.dupeEntries` (data included) and free them with
+`raft.freeEntries`. `Storage.entries` and `RaftLog.slice` hand out entries
+whose slice and data the caller owns (`raft.freeEntries`).
 
 ## Thread-pool integration
 

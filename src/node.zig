@@ -512,6 +512,14 @@ pub const RaftNode = struct {
         } else {
             self.election_state.tickElection();
             if (self.election_state.electionTimeoutElapsed()) {
+                // A node outside its own voter set (removed by a membership
+                // change) must not campaign (etcd `promotable`): peers still
+                // in the joint config would elect it, and its first act as
+                // leader is to step down again, starving the real voters.
+                if (!mem.isVoter(self.membership_state.config(), self.id)) {
+                    self.election_state.resetElectionElapsed();
+                    return;
+                }
                 // RC-B it.2: a candidate whose election just timed out made no
                 // progress this round (no win → would still be a candidate; a
                 // win or a higher-term message resets the counter via
@@ -552,15 +560,11 @@ pub const RaftNode = struct {
                     slice_lo,
                     slice_hi,
                 );
-                // Free slice on error so addCommittedEntries failure doesn't leak (SEC-0117).
-                errdefer if (entries.len > 0) self.allocator.free(entries);
-
-                try self.ready_state.addCommittedEntries(entries);
-
-                // Free the slice allocated by log.slice() — entries have been copied into ready_state.
-                if (entries.len > 0) {
-                    self.allocator.free(entries);
-                }
+                // The Ready owns the slice and its data until advance(); it is
+                // freed here only if handing it over failed (SEC-0117,
+                // SONNY-6592).
+                errdefer rpc.freeEntries(self.allocator, entries);
+                try self.ready_state.addOwnedCommittedEntries(entries);
             }
         }
 
@@ -573,15 +577,17 @@ pub const RaftNode = struct {
     }
 
     /// Convenience method that calls advancePersist() then advanceApply().
-    /// Use the split methods directly for pipelined persist+send (PERF-006).
+    /// It releases `Ready.messages` unsent: a consumer with peers calls
+    /// advancePersist(), sends `Ready.messages`, then advanceApply().
     pub fn advance(self: *RaftNode) !void {
         try self.advancePersist();
         try self.advanceApply();
     }
 
     /// Phase 1: persist hard state and unstable entries to storage.
-    /// After this returns, the consumer may send Ready.messages over the
-    /// network in parallel with disk I/O completion (PERF-006).
+    /// Only after this returns may the consumer send `Ready.messages`; they
+    /// announce the vote, term and entries just persisted (SONNY-6592). If
+    /// it fails, do not send them.
     pub fn advancePersist(self: *RaftNode) !void {
         const hs = self.currentHardState();
 
@@ -830,7 +836,7 @@ pub const RaftNode = struct {
         } };
 
         for (peers) |peer| {
-            self.sendMsg(peer, msg);
+            self.sendAfterPersist(peer, msg);
         }
         observability.endRpcClientSpan(__obs_span, true, 0);
     }
@@ -860,7 +866,7 @@ pub const RaftNode = struct {
         const cfg = self.membership_state.config();
         if (!mem.isVoter(cfg, msg.candidate_id)) {
             std.log.warn("raft: RequestVote from non-member {d}, rejecting", .{msg.candidate_id});
-            self.sendMsg(msg.candidate_id, rpc.Message{ .request_vote_response = .{
+            self.sendAfterPersist(msg.candidate_id, rpc.Message{ .request_vote_response = .{
                 .term = self.current_term,
                 .vote_granted = false,
                 .pre_vote = msg.pre_vote,
@@ -874,7 +880,7 @@ pub const RaftNode = struct {
         // for same-term requests to prevent disruption (SEC-0133).
         if (msg.pre_vote) {
             if (self.role == .leader) {
-                self.sendMsg(msg.candidate_id, rpc.Message{ .request_vote_response = .{
+                self.sendAfterPersist(msg.candidate_id, rpc.Message{ .request_vote_response = .{
                     .term = self.current_term,
                     .vote_granted = false,
                     .pre_vote = true,
@@ -882,7 +888,7 @@ pub const RaftNode = struct {
                 return;
             }
             if (self.leader_id != null and msg.term <= self.current_term) {
-                self.sendMsg(msg.candidate_id, rpc.Message{ .request_vote_response = .{
+                self.sendAfterPersist(msg.candidate_id, rpc.Message{ .request_vote_response = .{
                     .term = self.current_term,
                     .vote_granted = false,
                     .pre_vote = true,
@@ -915,7 +921,7 @@ pub const RaftNode = struct {
             .vote_granted = should_grant,
             .pre_vote = msg.pre_vote,
         } };
-        self.sendMsg(msg.candidate_id, response);
+        self.sendAfterPersist(msg.candidate_id, response);
         observability.endRpcServerSpan(__obs_span, true, 0);
     }
 
@@ -1014,7 +1020,7 @@ pub const RaftNode = struct {
     /// Send a rejection AppendEntries response to the given leader (QA-002).
     /// Used for stale-term, malformed, or invalid AppendEntries messages.
     fn rejectAppendEntries(self: *RaftNode, leader_id: u64) void {
-        self.sendMsg(leader_id, rpc.Message{ .append_entries_response = .{
+        self.sendAfterPersist(leader_id, rpc.Message{ .append_entries_response = .{
             .term = self.current_term,
             .success = false,
             .match_index = 0,
@@ -1089,7 +1095,7 @@ pub const RaftNode = struct {
         );
 
         if (result) |match_index| {
-            self.sendMsg(msg.leader_id, rpc.Message{ .append_entries_response = .{
+            self.sendAfterPersist(msg.leader_id, rpc.Message{ .append_entries_response = .{
                 .term = self.current_term,
                 .success = true,
                 .match_index = match_index,
@@ -1098,7 +1104,7 @@ pub const RaftNode = struct {
             } });
         } else {
             const conflict = self.log.findConflict(msg.prev_log_index);
-            self.sendMsg(msg.leader_id, rpc.Message{ .append_entries_response = .{
+            self.sendAfterPersist(msg.leader_id, rpc.Message{ .append_entries_response = .{
                 .term = self.current_term,
                 .success = false,
                 .match_index = 0,
@@ -1177,7 +1183,7 @@ pub const RaftNode = struct {
         }
 
         if (msg.term < self.current_term) {
-            self.sendMsg(msg.leader_id, rpc.Message{ .install_snapshot_response = .{
+            self.sendAfterPersist(msg.leader_id, rpc.Message{ .install_snapshot_response = .{
                 .term = self.current_term,
                 .success = false,
             } });
@@ -1191,7 +1197,7 @@ pub const RaftNode = struct {
             std.log.warn("InstallSnapshot from leader {d} failed: {s}", .{
                 msg.leader_id, @errorName(err),
             });
-            self.sendMsg(msg.leader_id, rpc.Message{ .install_snapshot_response = .{
+            self.sendAfterPersist(msg.leader_id, rpc.Message{ .install_snapshot_response = .{
                 .term = self.current_term,
                 .success = false,
             } });
@@ -1224,7 +1230,7 @@ pub const RaftNode = struct {
             // on normal return since setSnapshot is infallible.
             self.ready_state.setSnapshot(snapshot_val);
             self.perf_stats.snapshots_installed += 1;
-            self.sendMsg(msg.leader_id, rpc.Message{ .install_snapshot_response = .{
+            self.sendAfterPersist(msg.leader_id, rpc.Message{ .install_snapshot_response = .{
                 .term = self.current_term,
                 .success = true,
             } });
@@ -1539,16 +1545,25 @@ pub const RaftNode = struct {
         }
     }
 
-    /// Free the heap-allocated entries slice inside an AppendEntries message
-    /// that was built by `buildAppendEntries` (via `log.slice()`).
-    /// Must be called after `sendMsg` since transport copies by value (SEC-0140).
+    /// Queue a message that announces state not yet durable (a granted vote,
+    /// a new term, appended entries, an installed snapshot) in the Ready, for
+    /// the consumer to send after `advancePersist()`. Sending it from inside
+    /// step() / tick() let a crash before the save lose the vote or the
+    /// entries the message acknowledged (Raft §5.2, §5.3; SONNY-6592). Only
+    /// messages without borrowed slices are queued. A message that cannot be
+    /// queued (OOM) is dropped: the peer retries.
+    fn sendAfterPersist(self: *RaftNode, to: u64, msg: rpc.Message) void {
+        self.ready_state.addMessage(to, msg) catch {};
+    }
+
+    /// Free the entries (slice and data) inside an AppendEntries message
+    /// built by `buildAppendEntries` (via `log.slice()`).
+    /// Must be called after `sendMsg`: a transport that keeps the message
+    /// past `send` must deep-copy the entries, data included (SEC-0140,
+    /// SONNY-6592).
     fn freeAppendEntriesPayload(self: *RaftNode, msg: rpc.Message) void {
         switch (msg) {
-            .append_entries => |ae| {
-                if (ae.entries.len > 0) {
-                    self.allocator.free(ae.entries);
-                }
-            },
+            .append_entries => |ae| rpc.freeEntries(self.allocator, ae.entries),
             else => {},
         }
     }
@@ -1661,7 +1676,7 @@ test "leader appends noop on election" {
 
     // Verify it is a noop.
     const entries = try node.log.slice(last_idx, last_idx + 1);
-    defer std.testing.allocator.free(entries);
+    defer rpc.freeEntries(std.testing.allocator, entries);
     try std.testing.expectEqual(rpc.EntryKind.noop, entries[0].kind);
 }
 
@@ -1694,7 +1709,7 @@ test "propose on leader succeeds" {
 
     // Verify the entry has the right data.
     const entries = try node.log.slice(after, after + 1);
-    defer std.testing.allocator.free(entries);
+    defer rpc.freeEntries(std.testing.allocator, entries);
     try std.testing.expectEqual(rpc.EntryKind.normal, entries[0].kind);
 }
 
@@ -2120,4 +2135,33 @@ test "handleInstallSnapshotResponse clears pending on success and failure (SEC-0
     try node.handleInstallSnapshotResponse(2, .{ .term = node.current_term, .success = false });
     try std.testing.expectEqual(@as(u64, 0), progress.pending_snapshot_index);
     try std.testing.expectEqual(@as(u32, 0), progress.pending_snapshot_ticks);
+}
+
+test "a node outside its own voter set does not start elections" {
+    var mem_store = stg.InMemoryStorage.init(std.testing.allocator);
+    defer mem_store.deinit();
+    // Restored from a snapshot whose config no longer includes node 1
+    // (it was removed by a membership change).
+    try mem_store.storage().saveSnapshot(.{
+        .metadata = .{ .index = 5, .term = 2, .config = .{
+            .voters = &.{ 2, 3 },
+            .voters_outgoing = &.{},
+            .is_joint = false,
+        } },
+        .data = "s",
+    });
+
+    var node = try RaftNode.init(std.testing.allocator, .{
+        .id = 1,
+        .peers = &.{ 2, 3 },
+        .pre_vote = false,
+        .rng_seed = 3,
+    }, mem_store.storage());
+    defer node.deinit();
+
+    var i: u32 = 0;
+    while (i < 100) : (i += 1) try node.tick(null);
+    try std.testing.expectEqual(st.Role.follower, node.role);
+    try std.testing.expectEqual(@as(u64, 0), node.stats().elections_started);
+    try std.testing.expectEqual(@as(u64, 0), node.current_term);
 }

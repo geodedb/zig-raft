@@ -215,8 +215,10 @@ test "scenario: no_double_vote_same_term" {
     // The follower must NOT have changed its vote.
     try std.testing.expect(follower.voted_for.? != 99);
 
-    // Verify a rejection was enqueued in the message queue.
-    // The harness collects outbound messages in net.queue.list.
+    // The reply leaves through the Ready, after persist (SONNY-6592): run
+    // the follower's Ready cycle, then look for the rejection in the queue
+    // the harness collects outbound messages in.
+    try net.drainReady(follower_id);
     var found_rejection = false;
     for (net.queue.list.items) |pm| {
         if (pm.from == follower_id and pm.to == 99) {
@@ -253,7 +255,7 @@ test "scenario: noop_entry_enables_prior_term_commit" {
     var idx: u64 = last_idx;
     while (idx >= 1) : (idx -= 1) {
         const entries = try leader.log.slice(idx, idx + 1);
-        defer net.allocator.free(entries);
+        defer raft.freeEntries(net.allocator, entries);
         if (entries.len > 0 and entries[0].kind == .noop and entries[0].term == leader.current_term) {
             found_noop = true;
             break;

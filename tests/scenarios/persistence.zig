@@ -75,7 +75,7 @@ test "persistence: log survives restart" {
 
     // Retrieve all persisted entries.
     const entries = try store.entriesImpl(1, last_idx + 1);
-    defer net.allocator.free(entries);
+    defer raft.freeEntries(net.allocator, entries);
 
     // Find the entry containing our proposed data.
     var found = false;
@@ -163,7 +163,7 @@ test "persistence: storage entries after compaction" {
 
     // Entries after the compaction point should be retrievable.
     const remaining = try store.entriesImpl(4, 6);
-    defer std.testing.allocator.free(remaining);
+    defer raft.freeEntries(std.testing.allocator, remaining);
 
     try std.testing.expectEqual(@as(usize, 2), remaining.len);
     try std.testing.expectEqual(@as(u64, 4), remaining[0].index);

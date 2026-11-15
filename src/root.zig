@@ -49,6 +49,7 @@ pub const RaftNode = node.RaftNode;
 pub const Config = node.Config;
 pub const Stats = node.Stats;
 pub const Ready = ready.Ready;
+pub const Outbound = ready.Outbound;
 pub const Role = state.Role;
 pub const HardState = state.HardState;
 pub const SoftState = state.SoftState;
@@ -61,6 +62,8 @@ pub const ClusterConfig = rpc.ClusterConfig;
 pub const Storage = storage.Storage;
 pub const InMemoryStorage = storage.InMemoryStorage;
 pub const freeSnapshot = storage.freeSnapshot;
+pub const freeEntries = rpc.freeEntries;
+pub const dupeEntries = rpc.dupeEntries;
 pub const FileStorage = file_storage.FileStorage;
 pub const Transport = transport.Transport;
 pub const InProcessTransport = transport.InProcessTransport;
@@ -68,4 +71,5 @@ pub const isNoop = rpc.Entry.isNoop;
 
 test {
     std.testing.refAllDecls(@This());
+    _ = @import("sonny6592_test.zig");
 }

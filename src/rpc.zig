@@ -20,6 +20,31 @@ pub const Entry = struct {
     }
 };
 
+/// Free entries whose data the caller owns (`RaftLog.slice`,
+/// `Storage.entries`, `dupeEntries`): each entry's data, then the slice.
+pub fn freeEntries(allocator: std.mem.Allocator, entries: []const Entry) void {
+    if (entries.len == 0) return;
+    for (entries) |e| if (e.data.len > 0) allocator.free(e.data);
+    allocator.free(entries);
+}
+
+/// A copy of `src` whose entries own their data; free with `freeEntries`.
+pub fn dupeEntries(allocator: std.mem.Allocator, src: []const Entry) ![]Entry {
+    if (src.len == 0) return &[_]Entry{};
+    const out = try allocator.alloc(Entry, src.len);
+    var n: usize = 0;
+    errdefer {
+        for (out[0..n]) |e| if (e.data.len > 0) allocator.free(e.data);
+        allocator.free(out);
+    }
+    for (src, 0..) |e, i| {
+        out[i] = e;
+        if (e.data.len > 0) out[i].data = try allocator.dupe(u8, e.data);
+        n += 1;
+    }
+    return out;
+}
+
 pub const ClusterConfig = struct {
     voters: []const u64,
     voters_outgoing: []const u64,

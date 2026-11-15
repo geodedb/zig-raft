@@ -196,12 +196,10 @@ test "parallel tick: full cluster round-trip with parallel heartbeats" {
             }
         }
 
-        // Ready/advance.
+        // Ready / persist / send / apply.
         for (net.node_ids.items) |id| {
             if (net.paused_nodes.contains(id)) continue;
-            const n = net.nodes.get(id).?;
-            _ = try n.ready();
-            try n.advance();
+            try net.drainReady(id);
         }
     }
 

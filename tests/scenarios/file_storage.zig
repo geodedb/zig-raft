@@ -12,7 +12,8 @@
 //! 2. Implement the 8 required methods matching `Storage.VTable` signatures:
 //!    - `saveHardState(hs)` — persist term + voted_for durably.
 //!    - `appendEntries(entries)` — append entries; handle truncation on conflict.
-//!    - `entries(lo, hi)` — return entries in [lo, hi); caller owns the slice.
+//!    - `entries(lo, hi)` — return entries in [lo, hi); the caller owns the
+//!      slice and each entry's data (return copies; freed with `raft.freeEntries`).
 //!    - `term(index)` — return the term for a given log index.
 //!    - `lastIndex()` — return the highest log index, or snapshot_index if empty.
 //!    - `saveSnapshot(snap)` — persist snapshot data + metadata.
@@ -62,13 +63,13 @@ const TestTransport = struct {
 
     fn sendImpl(ptr: *anyopaque, to: u64, msg: raft.Message) void {
         const self: *TestTransport = @ptrCast(@alignCast(ptr));
-        // Deep-copy AppendEntries entries so the sender can free its
-        // slice after send without leaving dangling pointers (SEC-0140).
+        // Deep-copy AppendEntries entries, data included: the sender frees
+        // both once send returns (SEC-0140, SONNY-6592).
         var queued_msg = msg;
         switch (msg) {
             .append_entries => |ae| {
                 if (ae.entries.len > 0) {
-                    const dup = self.allocator.dupe(raft.Entry, ae.entries) catch return;
+                    const dup = raft.dupeEntries(self.allocator, ae.entries) catch return;
                     queued_msg = raft.Message{ .append_entries = .{
                         .term = ae.term,
                         .leader_id = ae.leader_id,
@@ -202,10 +203,15 @@ const TestCluster = struct {
             try node.step(pm.from, pm.msg);
         }
 
-        // Phase 3: ready / advance.
+        // Phase 3: ready / persist / send / apply. Ready.messages leave only
+        // once advancePersist() has made what they announce durable.
         for (self.nodes) |n| {
-            _ = try n.ready();
-            try n.advance();
+            const rd = try n.ready();
+            try n.advancePersist();
+            for (rd.messages) |out| {
+                try self.queue.append(self.allocator, .{ .from = n.id, .to = out.to, .msg = out.msg });
+            }
+            try n.advanceApply();
         }
     }
 

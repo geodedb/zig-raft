@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-15
+
+### Changed (breaking)
+
+- `Ready.messages` is now `[]const Outbound` (`{ to: u64, msg: Message }`,
+  `raft.Outbound`) and `ReadyState.addMessage` takes the destination.
+  RequestVote, AppendEntries and InstallSnapshot replies, and a candidate's
+  RequestVote, are no longer sent through the `Transport` from inside
+  `step()` / `tick()`; they are queued in the Ready for the consumer to send
+  after `advancePersist()` and before `advanceApply()` (SONNY-6592). Leader
+  replication (AppendEntries, InstallSnapshot) still goes through the
+  `Transport` at once. A consumer that only calls `advance()` never sends
+  votes or acks.
+- `Storage.entries` and `RaftLog.slice` hand the caller both the slice and
+  each entry's data; free them with the new `raft.freeEntries`.
+  `InMemoryStorage.entries` now returns copies, as `FileStorage` does, and a
+  custom `Storage` must do the same. A transport that keeps an AppendEntries
+  past `send()` must copy its entries' data (`raft.dupeEntries`).
+
+### Fixed
+
+- Entry data read back through `Storage.entries` leaked: committed entries
+  delivered by `ready()` and AppendEntries built from stable entries (and
+  the entries trimmed off by `max_bytes_per_msg`) freed only the outer slice
+  (SONNY-6592).
+- Votes and AppendEntries / InstallSnapshot acks went out before the hard
+  state and entries they announce were persisted; a crash in between could
+  lose a granted vote or acked entries (SONNY-6592).
+- A message queued between `ready()` and `advance()` was dropped by
+  `advance()`; it now goes in the next Ready.
+- A stale AppendEntries rejection delivered after a snapshot install could
+  move the leader's `next_index` below the acked `match_index`, re-sending
+  the snapshot forever (`PeerProgress.maybeDecrTo`).
+- A node removed from the voter set kept starting elections and could be
+  re-elected by peers still in the joint configuration.
+- `InProcessTransport` aliased AppendEntries entry data and leaked the
+  copies it queued; it now deep-copies and frees them (`freeMessage`).
+
+### Added
+
+- `raft.freeEntries`, `raft.dupeEntries`, `raft.Outbound`,
+  `InProcessTransport.freeMessage`, `ReadyState.addOwnedCommittedEntries`.
+
 ## [0.1.22] - 2026-11-12
 
 ### Changed

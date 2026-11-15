@@ -54,13 +54,13 @@ const NodeTransport = struct {
 
     fn sendImpl(ptr: *anyopaque, to: u64, msg: raft.Message) void {
         const self: *NodeTransport = @ptrCast(@alignCast(ptr));
-        // Deep-copy AppendEntries entries so the sender can free its
-        // slice after send without leaving dangling pointers (SEC-0140).
+        // Deep-copy AppendEntries entries, data included: the sender frees
+        // both once send returns (SEC-0140, SONNY-6592).
         var queued_msg = msg;
         switch (msg) {
             .append_entries => |ae| {
                 if (ae.entries.len > 0) {
-                    const dup = self.queue.allocator.dupe(raft.Entry, ae.entries) catch return;
+                    const dup = raft.rpc.dupeEntries(self.queue.allocator, ae.entries) catch return;
                     queued_msg = raft.Message{ .append_entries = .{
                         .term = ae.term,
                         .leader_id = ae.leader_id,
@@ -203,6 +203,7 @@ pub const Network = struct {
 
         var cit = self.committed.iterator();
         while (cit.next()) |entry| {
+            for (entry.value_ptr.items) |e| if (e.data.len > 0) self.allocator.free(e.data);
             entry.value_ptr.deinit(self.allocator);
         }
         self.committed.deinit();
@@ -258,20 +259,33 @@ pub const Network = struct {
             }
         }
 
-        // Phase 3: ready / advance -- collect committed entries.
+        // Phase 3: ready / persist / send / apply -- collect committed entries.
         for (self.node_ids.items) |id| {
             if (self.paused_nodes.contains(id)) continue;
-            const n = self.nodes.get(id).?;
-            const r = try n.ready();
-            for (r.committed_entries) |entry| {
-                const list = self.committed.getPtr(id).?;
-                try list.append(self.allocator, entry);
-            }
-            try n.advance();
+            try self.drainReady(id);
         }
 
-        // Discard any remaining queued messages from the ready/advance phase;
-        // they will be delivered on the next tickAll round.
+        // Messages released by Phase 3 are delivered on the next tickAll round.
+    }
+
+    /// Run one Ready cycle on node `id` the way a consumer must: persist,
+    /// then queue `Ready.messages` for delivery, then apply. Committed
+    /// entries are recorded (with a private copy of their data, which the
+    /// node frees at advance).
+    pub fn drainReady(self: *Network, id: u64) !void {
+        const n = self.nodes.get(id).?;
+        const r = try n.ready();
+        const list = self.committed.getPtr(id).?;
+        for (r.committed_entries) |entry| {
+            var copy = entry;
+            if (entry.data.len > 0) copy.data = try self.allocator.dupe(u8, entry.data);
+            try list.append(self.allocator, copy);
+        }
+        try n.advancePersist();
+        for (r.messages) |out| {
+            self.queue.append(.{ .from = id, .to = out.to, .msg = out.msg });
+        }
+        try n.advanceApply();
     }
 
     /// Tick repeatedly until exactly one leader exists, returning its ID.
