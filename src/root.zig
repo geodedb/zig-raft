@@ -80,4 +80,6 @@ test {
     _ = @import("sonny6611_test.zig");
     _ = @import("sonny6652_test.zig");
     _ = @import("sonny6653_test.zig");
+    _ = @import("sonny6666_gap_test.zig");
+    _ = @import("sonny6666_install_test.zig");
 }
