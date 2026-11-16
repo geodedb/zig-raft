@@ -5,6 +5,8 @@ const std = @import("std");
 const tp = @import("thread_pool");
 const rpc = @import("rpc.zig");
 const membership = @import("membership.zig");
+const trans = @import("transport.zig");
+const ready = @import("ready.zig");
 
 const zero_checksum: [32]u8 = .{0} ** 32;
 
@@ -104,7 +106,7 @@ pub const SnapshotState = struct {
     // fips-exempt: non-security — snapshot-data integrity digest only (detects
     // corruption/truncation of snapshot bytes in transit and on disk); not
     // authentication and not protecting a secret.
-    const Blake3 = std.crypto.hash.Blake3;
+    pub const Blake3 = std.crypto.hash.Blake3;
 
     pub fn buildInstallSnapshotMessages(
         self: *SnapshotState,
@@ -114,6 +116,22 @@ pub const SnapshotState = struct {
         pool: ?*tp.ThreadPool,
     ) ![]rpc.Message {
         _ = pool; // Reserved for future parallel hashing when Blake3 tree API available.
+        return self.buildInstallSnapshotMessagesFrom(snapshot, term, leader_id, 0);
+    }
+
+    /// `buildInstallSnapshotMessages` for the chunks from `start_offset` on:
+    /// resumes a transfer whose follower reported, after a chunk was lost,
+    /// that it expects `start_offset` next (SONNY-6652). An offset at or
+    /// past the end of the data builds the whole snapshot. The last chunk
+    /// still carries the digest of all of it, which the follower checks
+    /// against everything it assembled.
+    pub fn buildInstallSnapshotMessagesFrom(
+        self: *SnapshotState,
+        snapshot: rpc.Snapshot,
+        term: u64,
+        leader_id: u64,
+        start_offset: u64,
+    ) ![]rpc.Message {
         const data = snapshot.data;
 
         // Compute BLAKE3 digest of the full snapshot data.
@@ -123,10 +141,12 @@ pub const SnapshotState = struct {
         var digest: [32]u8 = undefined;
         hasher.final(&digest);
 
-        const num_chunks = if (data.len == 0) 1 else (data.len + self.chunk_size - 1) / self.chunk_size;
+        const start: usize = if (start_offset < data.len) @intCast(start_offset) else 0;
+        const remaining = data.len - start;
+        const num_chunks = if (remaining == 0) 1 else (remaining + self.chunk_size - 1) / self.chunk_size;
         const messages = try self.allocator.alloc(rpc.Message, num_chunks);
 
-        var offset: usize = 0;
+        var offset: usize = start;
         for (0..num_chunks) |i| {
             const end = @min(offset + self.chunk_size, data.len);
             const chunk_data = data[offset..end];
@@ -209,6 +229,14 @@ pub const SnapshotState = struct {
         if (msg.offset != pending.expected_offset) {
             return SnapshotError.UnexpectedOffset;
         }
+        // A later chunk must belong to the snapshot being assembled: one of
+        // another snapshot at the expected offset would splice two snapshots
+        // together (caught only by the final digest) (SONNY-6652).
+        if (msg.offset != 0 and (msg.last_included_index != pending.last_included_index or
+            msg.last_included_term != pending.last_included_term))
+        {
+            return SnapshotError.UnexpectedOffset;
+        }
 
         // Enforce max_snapshot_size BEFORE allocation (SEC-0063). 0 = unlimited.
         if (self.max_snapshot_size > 0) {
@@ -277,6 +305,15 @@ pub const SnapshotState = struct {
         return null;
     }
 
+    /// The offset the next chunk of snapshot `index` / `term` must carry:
+    /// what a follower reports after a chunk was lost so the leader resumes
+    /// there (SONNY-6652). 0 when no such snapshot is being assembled.
+    pub fn resumeOffset(self: *const SnapshotState, index: u64, term: u64) u64 {
+        const pending = self.pending_snapshot orelse return 0;
+        if (pending.last_included_index != index or pending.last_included_term != term) return 0;
+        return pending.expected_offset;
+    }
+
     /// Reset/clear any pending snapshot receive state.
     pub fn clearPending(self: *SnapshotState) void {
         if (self.pending_snapshot) |*pending| {
@@ -284,6 +321,107 @@ pub const SnapshotState = struct {
             pending.deinitConfig(self.allocator);
             self.pending_snapshot = null;
         }
+    }
+};
+
+pub const StreamError = error{
+    /// The storage's snapshot is older than the one the send was asked for,
+    /// or changed under the reader.
+    SnapshotChanged,
+    /// The data read does not match the digest committed with it; the last
+    /// chunk was not sent.
+    SnapshotDigestMismatch,
+    InvalidSnapshotChunkSize,
+};
+
+/// Stream a snapshot to a follower for a `Ready.snapshot_sends` request
+/// (SONNY-6653). Meant to run WITHOUT the node lock: it reads `reader` one
+/// chunk at a time (never the whole snapshot) and sends each chunk through
+/// `transport` (which must copy the chunk before `send` returns, and must be
+/// safe to call from this thread while the node uses it). `reader` is
+/// `FileStorage.SnapshotReader` (`FileStorage.openSnapshotReader`) or
+/// `MemorySnapshotReader`, or anything with `metadata`, `expected_digest`,
+/// `size` and `readAt(buf, offset) !usize`.
+///
+/// It sends the reader's snapshot if it is the requested one or newer (a
+/// newer one was committed since the request; the follower reports the
+/// index it installed). It resumes at `req.offset` only for the requested
+/// snapshot. The whole snapshot is hashed as it is read, and the last chunk
+/// (the one the follower installs on) goes out only if the digest matches
+/// the one committed with the data.
+///
+/// Errors leave the transfer in flight on the leader: it re-sends after the
+/// retry interval (`node.SNAPSHOT_RESEND_TICKS`).
+pub fn streamSnapshot(
+    allocator: std.mem.Allocator,
+    reader: anytype,
+    req: ready.SnapshotSend,
+    transport: trans.Transport,
+) !void {
+    if (req.chunk_size == 0) return StreamError.InvalidSnapshotChunkSize;
+    const meta = reader.metadata;
+    if (meta.index < req.index) return StreamError.SnapshotChanged;
+    const size = reader.size;
+    const start: u64 = if (meta.index == req.index and req.offset < size) req.offset else 0;
+
+    const buf = try allocator.alloc(u8, @intCast(@min(@as(u64, req.chunk_size), @max(size, 1))));
+    defer allocator.free(buf);
+
+    // fips-exempt: non-security — snapshot-data integrity digest.
+    var hasher = SnapshotState.Blake3.init(.{});
+    var offset: u64 = 0;
+    // The part the follower already has: hashed, not sent.
+    while (offset < start) {
+        const n: usize = @intCast(@min(@as(u64, buf.len), start - offset));
+        if (try reader.readAt(buf[0..n], offset) != n) return StreamError.SnapshotChanged;
+        hasher.update(buf[0..n]);
+        offset += n;
+    }
+    while (true) {
+        const n: usize = @intCast(@min(@as(u64, buf.len), size - offset));
+        if (n > 0 and try reader.readAt(buf[0..n], offset) != n) return StreamError.SnapshotChanged;
+        hasher.update(buf[0..n]);
+        const last = offset + n == size;
+        var checksum: [32]u8 = zero_checksum;
+        if (last) {
+            hasher.final(&checksum);
+            if (reader.expected_digest) |expected| {
+                if (!std.mem.eql(u8, &expected, &checksum)) return StreamError.SnapshotDigestMismatch;
+            }
+        }
+        transport.send(req.to, .{ .install_snapshot = .{
+            .term = req.term,
+            .leader_id = req.leader_id,
+            .last_included_index = meta.index,
+            .last_included_term = meta.term,
+            .offset = offset,
+            .data = buf[0..n],
+            .done = last,
+            .checksum = checksum,
+            .config = meta.config,
+        } });
+        offset += n;
+        if (last) return;
+    }
+}
+
+/// A `streamSnapshot` reader over a snapshot in memory (e.g. one from
+/// `Storage.loadSnapshot`), for storages without a file reader. Borrows it.
+pub const MemorySnapshotReader = struct {
+    metadata: rpc.SnapshotMetadata,
+    expected_digest: ?[32]u8 = null,
+    size: u64,
+    data: []const u8,
+
+    pub fn init(snapshot: rpc.Snapshot) MemorySnapshotReader {
+        return .{ .metadata = snapshot.metadata, .size = snapshot.data.len, .data = snapshot.data };
+    }
+
+    pub fn readAt(self: *MemorySnapshotReader, buf: []u8, offset: u64) !usize {
+        if (offset >= self.data.len) return 0;
+        const n = @min(buf.len, self.data.len - @as(usize, @intCast(offset)));
+        @memcpy(buf[0..n], self.data[@intCast(offset)..][0..n]);
+        return n;
     }
 };
 

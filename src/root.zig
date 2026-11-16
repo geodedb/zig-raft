@@ -49,6 +49,11 @@ pub const RaftNode = node.RaftNode;
 pub const Config = node.Config;
 pub const Stats = node.Stats;
 pub const Ready = ready.Ready;
+pub const SnapshotSend = ready.SnapshotSend;
+pub const SnapshotPoint = node.SnapshotPoint;
+pub const StagedSnapshot = storage.StagedSnapshot;
+pub const streamSnapshot = snapshot_mod.streamSnapshot;
+pub const MemorySnapshotReader = snapshot_mod.MemorySnapshotReader;
 pub const Outbound = ready.Outbound;
 pub const Role = state.Role;
 pub const HardState = state.HardState;
@@ -73,4 +78,6 @@ test {
     std.testing.refAllDecls(@This());
     _ = @import("sonny6592_test.zig");
     _ = @import("sonny6611_test.zig");
+    _ = @import("sonny6652_test.zig");
+    _ = @import("sonny6653_test.zig");
 }

@@ -45,6 +45,32 @@ pub const ConfigError = error{
     SelfInPeers,
 };
 
+/// From `RaftNode.snapshotPoint`: the index, term and (owned) config a
+/// snapshot taken at the applied index carries (SONNY-6653).
+pub const SnapshotPoint = struct {
+    index: u64,
+    term: u64,
+    voters: []u64,
+    voters_outgoing: []u64,
+    is_joint: bool,
+    allocator: std.mem.Allocator,
+
+    /// Borrows this point's config.
+    pub fn metadata(self: *const SnapshotPoint) rpc.SnapshotMetadata {
+        return .{ .index = self.index, .term = self.term, .config = .{
+            .voters = self.voters,
+            .voters_outgoing = self.voters_outgoing,
+            .is_joint = self.is_joint,
+        } };
+    }
+
+    pub fn deinit(self: *SnapshotPoint) void {
+        self.allocator.free(self.voters);
+        self.allocator.free(self.voters_outgoing);
+        self.* = undefined;
+    }
+};
+
 pub const Config = struct {
     id: u64,
     peers: []const u64,
@@ -67,6 +93,13 @@ pub const Config = struct {
     /// 0 disables it (pre-it.2 behaviour: a candidate re-elects forever).
     candidate_demote_threshold: u32 = 4,
     rng_seed: ?u64 = null,
+    /// Leave InstallSnapshot transfers to the consumer (SONNY-6653). When a
+    /// peer needs a snapshot the leader does not read it from storage inside
+    /// `tick()` / `step()`; it puts a request in `Ready.snapshot_sends`, and
+    /// the consumer streams the snapshot with `snapshot.streamSnapshot` after
+    /// releasing its node lock. Off by default: the leader loads the whole
+    /// snapshot and sends it from inside the call, as before.
+    stream_snapshots: bool = false,
 
     pub fn validate(self: Config) ConfigError!void {
         if (self.id == 0) return ConfigError.InvalidId;
@@ -692,6 +725,55 @@ pub const RaftNode = struct {
         }
     }
 
+    /// Where a snapshot of the state machine taken now must stand: the
+    /// applied index, its term and the current configuration (SONNY-6653).
+    /// Call under the node lock, then build the snapshot of the state at
+    /// that index, stage it with `Storage.stageSnapshot` (off the lock) and
+    /// commit it with `commitSnapshot` (under the lock).
+    pub fn snapshotPoint(self: *RaftNode) !SnapshotPoint {
+        const index = self.log.applied;
+        const term = self.log.term(index) catch 0;
+        const cfg = self.membership_state.config();
+        const voters = try self.allocator.dupe(u64, cfg.voters);
+        errdefer self.allocator.free(voters);
+        const outgoing = try self.allocator.dupe(u64, cfg.voters_outgoing);
+        return .{
+            .index = index,
+            .term = term,
+            .voters = voters,
+            .voters_outgoing = outgoing,
+            .is_joint = cfg.is_joint,
+            .allocator = self.allocator,
+        };
+    }
+
+    /// Commit a snapshot staged off the lock (SONNY-6653): the staged
+    /// counterpart of `reportSnapshot`. Call under the node lock. With
+    /// `FileStorage` this does only small writes (metadata, renames,
+    /// directory syncs) and the log compaction, whatever the snapshot size.
+    ///
+    /// error.SnapshotOutOfDate: the log is already compacted to or past the
+    /// staged index (a newer snapshot was committed or installed meanwhile);
+    /// error.SnapshotNotApplied: the index is past the applied index;
+    /// error.SnapshotTermMismatch: the log's term at that index differs.
+    /// In each case nothing changed; release the staged snapshot.
+    pub fn commitSnapshot(self: *RaftNode, staged: *stg.StagedSnapshot) !void {
+        const index = staged.metadata.index;
+        if (index <= self.log.snapshot_index) return error.SnapshotOutOfDate;
+        if (index > self.log.applied) return error.SnapshotNotApplied;
+        const term = self.log.term(index) catch return error.SnapshotOutOfDate;
+        if (term != staged.metadata.term) return error.SnapshotTermMismatch;
+
+        try self.storage.commitStagedSnapshot(staged);
+        self.snapshot_state.snapshot_index = index;
+        self.snapshot_state.snapshot_term = term;
+        try self.log.compact(index);
+    }
+
+    /// Write the snapshot and compact the log in one call, under the node
+    /// lock. The data write (and with `FileStorage` its fsync) happens
+    /// inside: for large snapshots use `snapshotPoint`,
+    /// `Storage.stageSnapshot` and `commitSnapshot` (SONNY-6653).
     pub fn reportSnapshot(self: *RaftNode, data: []const u8) !void {
         const last_applied = self.log.applied;
         const applied_term = self.log.term(last_applied) catch 0;
@@ -1228,13 +1310,41 @@ pub const RaftNode = struct {
         self.becomeFollower(msg.term, msg.leader_id);
         self.election_state.resetElectionElapsed();
 
+        // Already holds this snapshot or a newer one (a re-send after a lost
+        // ack, or one that arrived after a restart): that is an install, not
+        // a refusal. Acknowledge it with the index held so the leader
+        // advances, instead of answering StaleSnapshot (which the leader
+        // counted as a refusal and backed off on) or installing it again
+        // (SONNY-6652). Answer the first and the last chunk only; the ones
+        // in between change nothing. The ack goes out after the next
+        // advancePersist(), so a snapshot held only in memory is durable
+        // first.
+        const held = @max(self.log.snapshot_index, self.snapshot_state.snapshot_index);
+        if (held > 0 and msg.last_included_index <= held) {
+            if (msg.offset == 0 or msg.done) {
+                self.sendAfterPersist(msg.leader_id, rpc.Message{ .install_snapshot_response = .{
+                    .term = self.current_term,
+                    .success = true,
+                    .last_index = held,
+                } });
+            }
+            observability.endRpcServerSpan(__obs_span, true, 0);
+            return;
+        }
+
         const result = self.snapshot_state.receiveChunk(msg) catch |err| {
             std.log.warn("InstallSnapshot from leader {d} failed: {s}", .{
                 msg.leader_id, @errorName(err),
             });
+            // A chunk out of order means one before it was lost in transit:
+            // tell the leader where to resume rather than refusing the
+            // snapshot (SONNY-6652).
+            const gap = err == snap.SnapshotError.UnexpectedOffset;
             self.sendAfterPersist(msg.leader_id, rpc.Message{ .install_snapshot_response = .{
                 .term = self.current_term,
                 .success = false,
+                .last_index = if (gap) msg.last_included_index else 0,
+                .next_offset = if (gap) self.snapshot_state.resumeOffset(msg.last_included_index, msg.last_included_term) else 0,
             } });
             return;
         };
@@ -1270,6 +1380,7 @@ pub const RaftNode = struct {
             self.sendAfterPersist(msg.leader_id, rpc.Message{ .install_snapshot_response = .{
                 .term = self.current_term,
                 .success = true,
+                .last_index = snapshot_val.metadata.index,
             } });
         }
         observability.endRpcServerSpan(__obs_span, true, 0);
@@ -1296,18 +1407,39 @@ pub const RaftNode = struct {
 
         // Update peer progress on successful snapshot install (SEC-0074).
         if (msg.success) {
-            // Use log.snapshot_index (persisted) rather than
-            // snapshot_state.snapshot_index which may have advanced since
+            // The follower reports the snapshot index it holds (SONNY-6652):
+            // the one sent, or a newer one it already had. Every snapshot
+            // holds only committed entries, which this leader's log holds
+            // too (Leader Completeness), so that index matches; it is capped
+            // at lastIndex all the same. A follower on raft <= 0.2.4 reports
+            // nothing: use log.snapshot_index (persisted) rather than
+            // snapshot_state.snapshot_index, which may have advanced since
             // the snapshot was sent (SEC-0113).
             //
             // maybeUpdate is forward-only, so a late/duplicate ack can never
             // regress next_index (SEC-0113); clearing pending lets the driver
             // resume normal AppendEntries replication for forward progress.
-            _ = progress.maybeUpdate(self.log.snapshot_index);
-            progress.pending_snapshot_index = 0;
-            progress.pending_snapshot_ticks = 0;
-            progress.snapshot_refusals = 0;
+            const acked = if (msg.last_index != 0) @min(msg.last_index, self.log.lastIndex()) else self.log.snapshot_index;
+            _ = progress.maybeUpdate(acked);
+            // An ack of an older snapshot than the one in flight leaves it
+            // in flight.
+            if (msg.last_index == 0 or msg.last_index >= progress.pending_snapshot_index) {
+                progress.pending_snapshot_index = 0;
+                progress.pending_snapshot_ticks = 0;
+                progress.snapshot_refusals = 0;
+                progress.snapshot_resume_offset = 0;
+            }
             self.maybeCommit();
+        } else if (progress.pending_snapshot_index != 0 and msg.last_index != 0 and
+            msg.last_index == progress.pending_snapshot_index)
+        {
+            // A chunk of the snapshot in flight was lost in transit and the
+            // follower could not place the ones after it. Not a refusal: no
+            // back-off, and the next send (on the normal retry interval)
+            // resumes at the offset the follower expects (SONNY-6652; before,
+            // each of those chunks counted as a refusal and the snapshot was
+            // sent again from offset 0).
+            progress.snapshot_resume_offset = msg.next_offset;
         } else if (progress.pending_snapshot_index != 0) {
             // Snapshot refused (a digest the follower cannot match, a state
             // machine that cannot take it). Sending it again at once is
@@ -1317,6 +1449,7 @@ pub const RaftNode = struct {
             // heartbeat round, SEC-0144).
             progress.snapshot_refusals +|= 1;
             progress.pending_snapshot_ticks = 0;
+            progress.snapshot_resume_offset = 0;
         }
     }
 
@@ -1518,6 +1651,13 @@ pub const RaftNode = struct {
             // Retry interval elapsed — fall through and re-send the snapshot.
         }
 
+        if (self.config.stream_snapshots) {
+            self.requestSnapshotSend(peer, progress) catch {
+                self.sendMsg(peer, emptyHeartbeat(self.current_term, self.id, self.log.committed));
+            };
+            return;
+        }
+
         self.sendSnapshotTo(peer, progress) catch {
             // No persisted snapshot available (or load/build failure): keep the
             // peer alive with a heartbeat. The compaction gap persists, so the
@@ -1538,11 +1678,14 @@ pub const RaftNode = struct {
         const loaded = (try self.storage.loadSnapshot()) orelse return error.NoSnapshot;
         defer stg.freeSnapshot(self.allocator, loaded);
 
-        const msgs = try self.snapshot_state.buildInstallSnapshotMessages(
+        // Resume a transfer of this same snapshot where the follower said it
+        // stopped (SONNY-6652); anything else is sent whole.
+        const start = if (progress.pending_snapshot_index == loaded.metadata.index) progress.snapshot_resume_offset else 0;
+        const msgs = try self.snapshot_state.buildInstallSnapshotMessagesFrom(
             loaded,
             self.current_term,
             self.id,
-            null, // Snapshots are rare; do not fan chunk-build across the pool.
+            start,
         );
         defer self.allocator.free(msgs);
 
@@ -1551,6 +1694,28 @@ pub const RaftNode = struct {
         }
 
         progress.pending_snapshot_index = loaded.metadata.index;
+        progress.pending_snapshot_ticks = 0;
+        self.perf_stats.snapshots_sent += 1;
+    }
+
+    /// `Config.stream_snapshots`: hand the transfer to the consumer in the
+    /// next Ready instead of reading the snapshot here (SONNY-6653). The
+    /// snapshot is the one at the log's snapshot point, which the storage
+    /// holds (reportSnapshot / commitSnapshot / an installed snapshot persist
+    /// it before or as the log moves there).
+    fn requestSnapshotSend(self: *RaftNode, peer: u64, progress: *repl.PeerProgress) !void {
+        const index = self.log.snapshot_index;
+        if (index == 0) return error.NoSnapshot;
+        const start = if (progress.pending_snapshot_index == index) progress.snapshot_resume_offset else 0;
+        try self.ready_state.addSnapshotSend(.{
+            .to = peer,
+            .term = self.current_term,
+            .leader_id = self.id,
+            .index = index,
+            .offset = start,
+            .chunk_size = self.config.snapshot_chunk_size,
+        });
+        progress.pending_snapshot_index = index;
         progress.pending_snapshot_ticks = 0;
         self.perf_stats.snapshots_sent += 1;
     }

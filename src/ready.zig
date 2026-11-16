@@ -14,6 +14,23 @@ pub const Outbound = struct {
     msg: rpc.Message,
 };
 
+/// An InstallSnapshot transfer the leader hands to the consumer
+/// (`Config.stream_snapshots`, SONNY-6653): stream the storage's committed
+/// snapshot to `to` with `snapshot.streamSnapshot`, after releasing the
+/// node lock. Scalars only; copy it out before `advanceApply()`.
+pub const SnapshotSend = struct {
+    to: u64,
+    /// The leader's term and id when it asked for the send.
+    term: u64,
+    leader_id: u64,
+    /// The snapshot index the leader is sending (its snapshot point).
+    index: u64,
+    /// Where to start: the offset the follower expects after a lost chunk,
+    /// or 0 for the whole snapshot.
+    offset: u64,
+    chunk_size: usize,
+};
+
 pub const Ready = struct {
     hard_state: ?state.HardState,
     snapshot: ?rpc.Snapshot,
@@ -26,6 +43,10 @@ pub const Ready = struct {
     /// the Transport at once (Raft thesis §10.2.1).
     messages: []const Outbound,
     should_snapshot: bool,
+    /// InstallSnapshot transfers for the consumer to stream off the lock
+    /// (only with `Config.stream_snapshots`; empty otherwise). Released by
+    /// `advanceApply()`.
+    snapshot_sends: []const SnapshotSend = &.{},
 };
 
 pub const ReadyState = struct {
@@ -50,6 +71,10 @@ pub const ReadyState = struct {
     /// goes in the next Ready instead of being dropped (SONNY-6611).
     ready_snapshot: ?rpc.Snapshot = null,
     pending_should_snapshot: bool,
+    /// Snapshot sends for the next Ready / handed out by the current one
+    /// (as `pending_messages` / `ready_messages`).
+    pending_snapshot_sends: std.ArrayList(SnapshotSend) = .empty,
+    ready_snapshot_sends: std.ArrayList(SnapshotSend) = .empty,
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, initial_hs: state.HardState) ReadyState {
@@ -67,6 +92,8 @@ pub const ReadyState = struct {
     pub fn deinit(self: *ReadyState) void {
         self.pending_messages.deinit(self.allocator);
         self.ready_messages.deinit(self.allocator);
+        self.pending_snapshot_sends.deinit(self.allocator);
+        self.ready_snapshot_sends.deinit(self.allocator);
         self.pending_committed_entries.deinit(self.allocator);
         self.freeOwnedCommitted();
         self.owned_committed.deinit(self.allocator);
@@ -82,6 +109,11 @@ pub const ReadyState = struct {
     /// Accumulate a message for `to` to be included in the next Ready.
     pub fn addMessage(self: *ReadyState, to: u64, msg: rpc.Message) !void {
         try self.pending_messages.append(self.allocator, .{ .to = to, .msg = msg });
+    }
+
+    /// Queue a snapshot send for the next Ready (SONNY-6653).
+    pub fn addSnapshotSend(self: *ReadyState, send: SnapshotSend) !void {
+        try self.pending_snapshot_sends.append(self.allocator, send);
     }
 
     /// Accumulate multiple messages.
@@ -135,6 +167,7 @@ pub const ReadyState = struct {
         // Hand the accumulated messages to this Ready; later ones accumulate
         // afresh for the next (ready_messages is empty: advance cleared it).
         std.mem.swap(std.ArrayList(Outbound), &self.pending_messages, &self.ready_messages);
+        std.mem.swap(std.ArrayList(SnapshotSend), &self.pending_snapshot_sends, &self.ready_snapshot_sends);
         // Likewise the snapshot (ready_snapshot is null: advance freed it).
         self.ready_snapshot = self.pending_snapshot;
         self.pending_snapshot = null;
@@ -145,6 +178,7 @@ pub const ReadyState = struct {
             .committed_entries = self.pending_committed_entries.items,
             .messages = self.ready_messages.items,
             .should_snapshot = self.pending_should_snapshot,
+            .snapshot_sends = self.ready_snapshot_sends.items,
         };
     }
 
@@ -155,6 +189,7 @@ pub const ReadyState = struct {
         self.has_pending_ready = false;
 
         self.ready_messages.clearRetainingCapacity();
+        self.ready_snapshot_sends.clearRetainingCapacity();
         self.pending_committed_entries.clearRetainingCapacity();
         self.freeOwnedCommitted();
         if (self.ready_snapshot) |snap| stg.freeSnapshot(self.allocator, snap);
@@ -165,6 +200,7 @@ pub const ReadyState = struct {
     /// Returns true if there's anything to deliver.
     pub fn hasReady(self: *const ReadyState, current_hs: state.HardState) bool {
         if (self.pending_messages.items.len > 0) return true;
+        if (self.pending_snapshot_sends.items.len > 0) return true;
         if (self.pending_committed_entries.items.len > 0) return true;
         if (self.pending_snapshot != null) return true;
         if (self.pending_should_snapshot) return true;
