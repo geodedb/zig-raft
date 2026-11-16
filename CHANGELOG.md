@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-11-16
+
+### Changed
+
+- wal v0.1.24 -> v0.1.26 and otel v0.1.28 -> v0.1.29, so raft and its
+  consumers resolve a single thread-pool (SONNY-6630).
+
 ## [0.2.3] - 2026-11-15
 
 ### Fixed
