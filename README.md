@@ -131,8 +131,39 @@ renaming the metadata into place is the commit point. A crash before it
 leaves the previous snapshot; a crash after it is completed when
 `FileStorage` next opens. Leftover staged files are removed then.
 
-Not covered yet: a follower still writes an installed snapshot inside
-`advancePersist()`, and assembles it in memory while receiving it.
+Installing one (0.2.6, SONNY-6666). With
+`Config{ .stage_received_snapshots = true }` a follower writes each incoming
+chunk to a staged file as it arrives (one chunk's write per `step()`, never
+the whole snapshot in memory) and hands the finished snapshot to the Ready
+as `staged_snapshot`. Sync it with the lock released; `advancePersist()`
+then only commits it (renames and directory syncs):
+
+```zig
+const rd = try node.ready(); // under the lock
+if (rd.staged_snapshot) |staged| {
+    // ... unlock ...
+    try storage.syncStagedSnapshot(staged); // fsync data + metadata, no lock needed
+    // ... lock ...
+}
+try node.advancePersist(); // commits the staged snapshot (syncs it here if you did not)
+```
+
+With `FileStorage`, `rd.snapshot` then carries the metadata only; restore
+the state machine from `file_storage.openSnapshotReader()` after
+`advancePersist()`. Followers receiving large snapshots also need
+`Config.max_snapshot_size` raised (0 = unlimited).
+
+Releasing the lock between `ready()` and `advancePersist()` is safe: other
+threads may step, tick or propose meanwhile. The Ready owns copies of its
+committed entries, `advanceApply()` marks applied only what the Ready
+delivered, entries appended after a snapshot installed in that gap are
+persisted after it, and a snapshot below the follower's commit index
+is acknowledged without being installed. Do not release it between
+`advancePersist()` and `advanceApply()`.
+
+`RaftNode.init` reads only the snapshot's metadata
+(`Storage.loadSnapshotMetadata`); the data's digest is checked when it is
+read.
 
 ## Thread-pool integration
 

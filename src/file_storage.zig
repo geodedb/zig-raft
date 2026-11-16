@@ -89,7 +89,7 @@ pub const FileStorage = struct {
 
     pub const DirectoryAlreadyLocked = error.WouldBlock;
 
-    pub const CrashPoint = enum { none, before_meta_rename, after_meta_rename };
+    pub const CrashPoint = enum { none, before_meta_rename, after_meta_rename, after_data_rename };
 
     const stage_prefix = "snapshot.stage.";
     const commit_prefix = "snapshot.commit.";
@@ -220,6 +220,10 @@ pub const FileStorage = struct {
         .stageSnapshot = typeErasedStageSnapshot,
         .commitStagedSnapshot = typeErasedCommitStagedSnapshot,
         .discardStagedSnapshot = typeErasedDiscardStagedSnapshot,
+        .beginStagedSnapshot = typeErasedBeginStagedSnapshot,
+        .appendStagedSnapshot = typeErasedAppendStagedSnapshot,
+        .syncStagedSnapshot = typeErasedSyncStagedSnapshot,
+        .loadSnapshotMetadata = typeErasedLoadSnapshotMetadata,
     };
 
     // ========================================================================
@@ -392,36 +396,53 @@ pub const FileStorage = struct {
     /// other call, if `allocator` is thread-safe. Release the result with
     /// `releaseStagedSnapshot` (or `Storage.releaseStagedSnapshot`).
     pub fn stageSnapshot(self: *FileStorage, snap: rpc.Snapshot) !stg.StagedSnapshot {
-        const io = std.Io.Threaded.global_single_threaded.io();
-        var staged = try stg.StagedSnapshot.initMetadata(self.allocator, @ptrCast(self), snap.metadata);
-        errdefer staged.deinit();
+        var staged = try self.beginStagedSnapshot(snap.metadata);
+        errdefer self.releaseStagedSnapshot(&staged);
+        try self.appendStagedSnapshot(&staged, snap.data);
+        staged.noteAppended(snap.data);
+        _ = staged.finish();
+        try self.syncStagedSnapshot(&staged);
+        return staged;
+    }
 
+    /// Create the staged data file for a snapshot that arrives in pieces
+    /// (SONNY-6666). Safe without the node lock.
+    pub fn beginStagedSnapshot(self: *FileStorage, meta: rpc.SnapshotMetadata) !stg.StagedSnapshot {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var staged = try stg.StagedSnapshot.initMetadata(self.allocator, @ptrCast(self), meta);
+        errdefer staged.deinit();
         var base_buf: [stage_prefix.len + 20]u8 = undefined;
         const base = std.fmt.bufPrint(&base_buf, stage_prefix ++ "{d}", .{self.stage_seq.fetchAdd(1, .monotonic)}) catch unreachable;
         staged.payload = try self.allocator.dupe(u8, base);
         var data_buf: StageName = undefined;
-        const name = stageFile(&data_buf, base, ".data");
-        var meta_buf: StageName = undefined;
-        const meta_name = stageFile(&meta_buf, base, ".meta");
-
-        // fips-exempt: non-security — snapshot-data integrity digest on disk.
-        std.crypto.hash.Blake3.hash(snap.data, &staged.digest, .{});
-        staged.size = snap.data.len;
-
-        {
-            var tmp = try self.dir.createFile(io, name, .{ .exclusive = true });
-            errdefer {
-                tmp.close(io);
-                self.dir.deleteFile(io, name) catch {};
-            }
-            try tmp.writeStreamingAll(io, snap.data);
-            try tmp.sync(io);
-            tmp.close(io);
-        }
-        errdefer self.dir.deleteFile(io, name) catch {};
-        // The metadata too, so the commit writes nothing but renames.
-        try self.writeSnapshotMetaFile(meta_name, snap.metadata.index, snap.metadata.term, staged.digest, snap.metadata.config);
+        staged.file = try self.dir.createFile(io, stageFile(&data_buf, base, ".data"), .{ .exclusive = true });
         return staged;
+    }
+
+    /// Write the next piece at the staged file's end. No sync: that is
+    /// `syncStagedSnapshot`'s, off the lock. Callers go through
+    /// `Storage.appendStagedSnapshot`, which updates the digest and size.
+    pub fn appendStagedSnapshot(self: *FileStorage, staged: *stg.StagedSnapshot, bytes: []const u8) !void {
+        _ = self;
+        const file = staged.file orelse return error.StagedSnapshotFinished;
+        try file.writePositionalAll(std.Io.Threaded.global_single_threaded.io(), bytes, staged.size);
+    }
+
+    /// Sync the staged data and write and sync its metadata next to it
+    /// (SONNY-6666): the slow part of an install. Touches only the staged
+    /// files: safe WITHOUT the node lock, concurrently with any other call.
+    pub fn syncStagedSnapshot(self: *FileStorage, staged: *stg.StagedSnapshot) !void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        if (!staged.finished) return error.StagedSnapshotUnfinished;
+        if (staged.synced) return;
+        if (staged.file) |f| {
+            try f.sync(io);
+            f.close(io);
+            staged.file = null;
+        }
+        var meta_buf: StageName = undefined;
+        try self.writeSnapshotMetaFile(stageFile(&meta_buf, staged.payload, ".meta"), staged.metadata.index, staged.metadata.term, staged.digest, staged.metadata.config);
+        staged.synced = true;
     }
 
     /// Make a staged snapshot this storage's snapshot (SONNY-6653). Call
@@ -436,6 +457,9 @@ pub const FileStorage = struct {
         const io = std.Io.Threaded.global_single_threaded.io();
         if (staged.committed) return error.SnapshotAlreadyCommitted;
         if (staged.owner != @as(?*anyopaque, @ptrCast(self))) return error.StagedSnapshotForeign;
+        if (!staged.finished) return error.StagedSnapshotUnfinished;
+        // The consumer did not sync it off the lock: do it here.
+        if (!staged.synced) try self.syncStagedSnapshot(staged);
 
         const prev_snapshot_index = self.snapshot_index;
         const cfg = staged.metadata.config;
@@ -484,6 +508,7 @@ pub const FileStorage = struct {
         if (builtin.is_test and self.crash_at == .after_meta_rename) return error.SimulatedCrash;
 
         try self.dir.rename(&commit_name, self.dir, "snapshot.data", io);
+        if (builtin.is_test and self.crash_at == .after_data_rename) return error.SimulatedCrash;
         try self.syncDir();
 
         if (staged.metadata.index > prev_snapshot_index) {
@@ -500,6 +525,10 @@ pub const FileStorage = struct {
 
     fn discardStaged(self: *FileStorage, staged: *stg.StagedSnapshot) void {
         const io = std.Io.Threaded.global_single_threaded.io();
+        if (staged.file) |f| {
+            f.close(io);
+            staged.file = null;
+        }
         var buf: StageName = undefined;
         self.dir.deleteFile(io, stageFile(&buf, staged.payload, ".data")) catch {};
         self.dir.deleteFile(io, stageFile(&buf, staged.payload, ".meta")) catch {};
@@ -609,6 +638,34 @@ pub const FileStorage = struct {
         };
 
         return self.finishLoadSnapshot(meta, data_file);
+    }
+
+    /// The committed snapshot's index, term and config, without reading the
+    /// data (SONNY-6666; `RaftNode.init` needs nothing else). Null when
+    /// there is no snapshot data, as `loadSnapshotImpl`. The data's digest
+    /// is checked when it is read (`loadSnapshotImpl`, `openSnapshotReader`
+    /// + `streamSnapshot`), not here.
+    pub fn loadSnapshotMetadataImpl(self: *FileStorage) !?rpc.SnapshotMetadata {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var meta = self.readSnapshotMeta() catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer meta.freeConfig(self.allocator);
+        if (meta.data_digest) |d| try self.rollForwardCommit(d);
+        self.dir.access(io, "snapshot.data", .{}) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        const cfg = meta.config orelse rpc.ClusterConfig{ .voters = &.{}, .voters_outgoing = &.{}, .is_joint = false };
+        const voters = try self.allocator.dupe(u64, cfg.voters);
+        errdefer self.allocator.free(voters);
+        const outgoing = try self.allocator.dupe(u64, cfg.voters_outgoing);
+        return .{ .index = meta.index, .term = meta.term, .config = .{
+            .voters = voters,
+            .voters_outgoing = outgoing,
+            .is_joint = cfg.is_joint,
+        } };
     }
 
     fn finishLoadSnapshot(self: *FileStorage, meta: SnapshotMeta, data_file: std.Io.File) !?rpc.Snapshot {
@@ -1123,6 +1180,26 @@ pub const FileStorage = struct {
     fn typeErasedCommitStagedSnapshot(ptr: *anyopaque, staged: *stg.StagedSnapshot) anyerror!void {
         const self: *FileStorage = @ptrCast(@alignCast(ptr));
         return self.commitStagedSnapshot(staged);
+    }
+
+    fn typeErasedBeginStagedSnapshot(ptr: *anyopaque, meta: rpc.SnapshotMetadata) anyerror!stg.StagedSnapshot {
+        const self: *FileStorage = @ptrCast(@alignCast(ptr));
+        return self.beginStagedSnapshot(meta);
+    }
+
+    fn typeErasedAppendStagedSnapshot(ptr: *anyopaque, staged: *stg.StagedSnapshot, bytes: []const u8) anyerror!void {
+        const self: *FileStorage = @ptrCast(@alignCast(ptr));
+        return self.appendStagedSnapshot(staged, bytes);
+    }
+
+    fn typeErasedSyncStagedSnapshot(ptr: *anyopaque, staged: *stg.StagedSnapshot) anyerror!void {
+        const self: *FileStorage = @ptrCast(@alignCast(ptr));
+        return self.syncStagedSnapshot(staged);
+    }
+
+    fn typeErasedLoadSnapshotMetadata(ptr: *anyopaque) anyerror!?rpc.SnapshotMetadata {
+        const self: *FileStorage = @ptrCast(@alignCast(ptr));
+        return self.loadSnapshotMetadataImpl();
     }
 
     fn typeErasedDiscardStagedSnapshot(ptr: *anyopaque, staged: *stg.StagedSnapshot) void {

@@ -41,6 +41,16 @@ pub const Storage = struct {
         /// Remove what an uncommitted staged snapshot left behind (not its
         /// memory: `releaseStagedSnapshot` frees that).
         discardStagedSnapshot: ?*const fn (*anyopaque, *StagedSnapshot) void = null,
+        /// Optional incremental staging (SONNY-6666): a follower writes an
+        /// incoming snapshot chunk by chunk. Implemented together with the
+        /// three above; null gets the fallback (chunks kept in memory).
+        beginStagedSnapshot: ?*const fn (*anyopaque, rpc.SnapshotMetadata) anyerror!StagedSnapshot = null,
+        appendStagedSnapshot: ?*const fn (*anyopaque, *StagedSnapshot, []const u8) anyerror!void = null,
+        syncStagedSnapshot: ?*const fn (*anyopaque, *StagedSnapshot) anyerror!void = null,
+        /// Optional: the snapshot's metadata without its data (SONNY-6666).
+        /// The config slices are owned (`freeSnapshotMetadata`). Null falls
+        /// back to `loadSnapshot`.
+        loadSnapshotMetadata: ?*const fn (*anyopaque) anyerror!?rpc.SnapshotMetadata = null,
     };
 
     pub fn saveHardState(self: Storage, hs: state.HardState) anyerror!void {
@@ -82,6 +92,58 @@ pub const Storage = struct {
         return self.vtable.compact(self.ptr, index);
     }
 
+    /// The snapshot's index, term and config without reading its data
+    /// (SONNY-6666); null when there is none. Free with
+    /// `freeSnapshotMetadata`. The data is checked against its digest when
+    /// it is read, not here.
+    pub fn loadSnapshotMetadata(self: Storage, allocator: std.mem.Allocator) anyerror!?rpc.SnapshotMetadata {
+        if (self.vtable.loadSnapshotMetadata) |f| return f(self.ptr);
+        const snap = (try self.loadSnapshot()) orelse return null;
+        if (snap.data.len > 0) allocator.free(snap.data);
+        return snap.metadata;
+    }
+
+    /// Start staging a snapshot whose data arrives in pieces (SONNY-6666):
+    /// `appendStagedSnapshot` each piece in order, `StagedSnapshot.finish`
+    /// for the digest, then `syncStagedSnapshot` (no lock needed) and
+    /// `commitStagedSnapshot` (under the lock). `FileStorage` writes each
+    /// piece to the staged file; the fallback keeps them in memory.
+    pub fn beginStagedSnapshot(self: Storage, allocator: std.mem.Allocator, meta: rpc.SnapshotMetadata) anyerror!StagedSnapshot {
+        if (self.vtable.beginStagedSnapshot) |f| return f(self.ptr, meta);
+        return StagedSnapshot.initMetadata(allocator, null, meta);
+    }
+
+    /// Append the next piece of a staged snapshot (written at its current
+    /// size). Costs one piece's write, not a sync.
+    pub fn appendStagedSnapshot(self: Storage, staged: *StagedSnapshot, bytes: []const u8) anyerror!void {
+        if (staged.finished) return error.StagedSnapshotFinished;
+        if (staged.owner == null) {
+            try staged.buffer.appendSlice(staged.allocator, bytes);
+        } else {
+            if (staged.owner != @as(?*anyopaque, self.ptr)) return error.StagedSnapshotForeign;
+            const f = self.vtable.appendStagedSnapshot orelse return error.StagedSnapshotForeign;
+            try f(self.ptr, staged, bytes);
+        }
+        staged.noteAppended(bytes);
+    }
+
+    /// Make a finished staged snapshot durable, but not yet the storage's
+    /// snapshot (SONNY-6666). `FileStorage` syncs the staged data and
+    /// writes and syncs its metadata: the slow part of an install, safe
+    /// WITHOUT the node lock and concurrently with any other call. A commit
+    /// of an unsynced staged snapshot syncs it first (under the lock).
+    pub fn syncStagedSnapshot(self: Storage, staged: *StagedSnapshot) anyerror!void {
+        if (!staged.finished) return error.StagedSnapshotUnfinished;
+        if (staged.synced) return;
+        if (staged.owner == null) {
+            staged.synced = true;
+            return;
+        }
+        if (staged.owner != @as(?*anyopaque, self.ptr)) return error.StagedSnapshotForeign;
+        const f = self.vtable.syncStagedSnapshot orelse return error.StagedSnapshotForeign;
+        try f(self.ptr, staged);
+    }
+
     /// Stage a snapshot for a later `commitStagedSnapshot` (SONNY-6653):
     /// the expensive part of saving it (writing and syncing the data).
     /// Storages that implement it (`FileStorage`) allow this call WITHOUT
@@ -93,9 +155,10 @@ pub const Storage = struct {
         if (self.vtable.stageSnapshot) |f| return f(self.ptr, snap);
         var staged = try StagedSnapshot.initMetadata(allocator, null, snap.metadata);
         errdefer staged.deinit();
-        staged.payload = try allocator.dupe(u8, snap.data);
-        staged.size = snap.data.len;
-        staged.digest = blake3(snap.data);
+        try staged.buffer.appendSlice(allocator, snap.data);
+        staged.noteAppended(snap.data);
+        _ = staged.finish();
+        staged.synced = true;
         return staged;
     }
 
@@ -109,10 +172,11 @@ pub const Storage = struct {
         if (staged.committed) return error.SnapshotAlreadyCommitted;
         if (staged.owner != (if (self.vtable.stageSnapshot != null) self.ptr else null))
             return error.StagedSnapshotForeign;
+        if (!staged.finished) return error.StagedSnapshotUnfinished;
         if (self.vtable.commitStagedSnapshot) |f| {
             try f(self.ptr, staged);
         } else {
-            try self.saveSnapshot(.{ .metadata = staged.metadata, .data = staged.payload });
+            try self.saveSnapshot(.{ .metadata = staged.metadata, .data = staged.buffer.items });
             staged.committed = true;
         }
     }
@@ -135,9 +199,18 @@ pub const StagedSnapshot = struct {
     /// BLAKE3 digest and length of the snapshot data.
     digest: [32]u8 = .{0} ** 32,
     size: u64 = 0,
-    /// Owned. What it holds is the storage's: `FileStorage` keeps the staged
-    /// file's name; the generic fallback keeps the data.
+    /// Owned. The storage's: `FileStorage` keeps the staged files' base name.
     payload: []u8 = &.{},
+    /// The fallback's data (storages without staging).
+    buffer: std.ArrayList(u8) = .empty,
+    /// `FileStorage`: the staged data file, open while pieces arrive.
+    file: ?std.Io.File = null,
+    /// Digest of the pieces so far.
+    hasher: Blake3 = undefined,
+    /// `finish` was called: `digest` and `size` are final.
+    finished: bool = false,
+    /// Data (and the storage's copy of the metadata) are durable.
+    synced: bool = false,
     /// The storage that staged it (null: the generic fallback). A staged
     /// snapshot commits only on the storage that staged it.
     owner: ?*anyopaque,
@@ -158,8 +231,29 @@ pub const StagedSnapshot = struct {
                 .is_joint = meta.config.is_joint,
             } },
             .owner = owner,
+            .hasher = Blake3.init(.{}),
             .allocator = allocator,
         };
+    }
+
+    /// Account for a piece written (storage implementations call this).
+    pub fn noteAppended(self: *StagedSnapshot, bytes: []const u8) void {
+        self.hasher.update(bytes);
+        self.size += bytes.len;
+    }
+
+    /// No more pieces: the digest of all of them.
+    pub fn finish(self: *StagedSnapshot) [32]u8 {
+        if (!self.finished) {
+            self.hasher.final(&self.digest);
+            self.finished = true;
+        }
+        return self.digest;
+    }
+
+    /// The fallback's data (empty for a storage that stages to disk).
+    pub fn data(self: *const StagedSnapshot) []const u8 {
+        return self.buffer.items;
     }
 
     /// Free the memory only; anything staged on the storage stays (as after
@@ -168,15 +262,19 @@ pub const StagedSnapshot = struct {
         self.allocator.free(self.metadata.config.voters);
         self.allocator.free(self.metadata.config.voters_outgoing);
         self.allocator.free(self.payload);
+        self.buffer.deinit(self.allocator);
+        if (self.file) |f| f.close(std.Io.Threaded.global_single_threaded.io());
         self.* = undefined;
     }
 };
 
-fn blake3(data: []const u8) [32]u8 {
-    // fips-exempt: non-security — snapshot-data integrity digest.
-    var d: [32]u8 = undefined;
-    std.crypto.hash.Blake3.hash(data, &d, .{});
-    return d;
+// fips-exempt: non-security — snapshot-data integrity digest.
+const Blake3 = std.crypto.hash.Blake3;
+
+/// Free metadata from `Storage.loadSnapshotMetadata`.
+pub fn freeSnapshotMetadata(allocator: std.mem.Allocator, meta: rpc.SnapshotMetadata) void {
+    if (meta.config.voters.len > 0) allocator.free(meta.config.voters);
+    if (meta.config.voters_outgoing.len > 0) allocator.free(meta.config.voters_outgoing);
 }
 
 /// Free a Snapshot returned by Storage.loadSnapshot().

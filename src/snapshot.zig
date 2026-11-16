@@ -7,6 +7,7 @@ const rpc = @import("rpc.zig");
 const membership = @import("membership.zig");
 const trans = @import("transport.zig");
 const ready = @import("ready.zig");
+const stg = @import("storage.zig");
 
 const zero_checksum: [32]u8 = .{0} ** 32;
 
@@ -27,6 +28,10 @@ const PendingSnapshot = struct {
     config_voters: std.ArrayList(u64),
     config_voters_outgoing: std.ArrayList(u64),
     config_is_joint: bool,
+    /// Staged receive (SONNY-6666): the chunks go to `staged` on `sink`
+    /// instead of `data`. Heap-allocated so the Ready can hand it out.
+    staged: ?*stg.StagedSnapshot = null,
+    sink: ?stg.Storage = null,
 
     fn deinitConfig(self: *PendingSnapshot, allocator: std.mem.Allocator) void {
         self.config_voters.deinit(allocator);
@@ -61,11 +66,7 @@ pub const SnapshotState = struct {
     }
 
     pub fn deinit(self: *SnapshotState) void {
-        if (self.pending_snapshot) |*pending| {
-            pending.data.deinit(self.allocator);
-            pending.deinitConfig(self.allocator);
-            self.pending_snapshot = null;
-        }
+        self.clearPending();
     }
 
     /// Check if log has grown enough above snapshot to trigger.
@@ -174,6 +175,26 @@ pub const SnapshotState = struct {
     /// Returns null if more chunks expected.
     /// Returns error on CRC mismatch or out-of-order chunk.
     pub fn receiveChunk(self: *SnapshotState, msg: rpc.InstallSnapshot) !?rpc.Snapshot {
+        const got = (try self.receiveChunkInto(msg, null)) orelse return null;
+        return got.snapshot;
+    }
+
+    /// `receiveChunk` that writes each chunk to a snapshot staged on `sink`
+    /// as it arrives instead of assembling the snapshot in memory
+    /// (SONNY-6666). Returns the finished, digest-checked staged snapshot
+    /// (allocated with this state's allocator; the caller owns it: release
+    /// it on `sink` and destroy it) on the last chunk.
+    pub fn receiveChunkStaged(self: *SnapshotState, msg: rpc.InstallSnapshot, sink: stg.Storage) !?*stg.StagedSnapshot {
+        const got = (try self.receiveChunkInto(msg, sink)) orelse return null;
+        return got.staged;
+    }
+
+    const Received = union(enum) {
+        snapshot: rpc.Snapshot,
+        staged: *stg.StagedSnapshot,
+    };
+
+    fn receiveChunkInto(self: *SnapshotState, msg: rpc.InstallSnapshot, sink: ?stg.Storage) !?Received {
         if (msg.offset == 0) {
             // Reject snapshots that would move us backwards.
             if (msg.last_included_index <= self.snapshot_index) {
@@ -195,11 +216,7 @@ pub const SnapshotState = struct {
             // Null out BEFORE the fallible validateSnapshotConfig() call so
             // that a validation failure does not leave freed ArrayLists
             // reachable via self.pending_snapshot (SEC-0107).
-            if (self.pending_snapshot) |*pending| {
-                pending.data.deinit(self.allocator);
-                pending.deinitConfig(self.allocator);
-                self.pending_snapshot = null;
-            }
+            self.clearPending();
 
             // Validate incoming config (SEC-0043): reject empty voter sets and duplicates.
             try validateSnapshotConfig(msg.config);
@@ -213,6 +230,18 @@ pub const SnapshotState = struct {
             errdefer config_voters_outgoing.deinit(self.allocator);
             try config_voters_outgoing.appendSlice(self.allocator, msg.config.voters_outgoing);
 
+            var staged: ?*stg.StagedSnapshot = null;
+            if (sink) |st| {
+                const ptr = try self.allocator.create(stg.StagedSnapshot);
+                errdefer self.allocator.destroy(ptr);
+                ptr.* = try st.beginStagedSnapshot(self.allocator, .{
+                    .index = msg.last_included_index,
+                    .term = msg.last_included_term,
+                    .config = msg.config,
+                });
+                staged = ptr;
+            }
+
             self.pending_snapshot = .{
                 .data = .empty,
                 .last_included_index = msg.last_included_index,
@@ -221,6 +250,8 @@ pub const SnapshotState = struct {
                 .config_voters = config_voters,
                 .config_voters_outgoing = config_voters_outgoing,
                 .config_is_joint = msg.config.is_joint,
+                .staged = staged,
+                .sink = sink,
             };
         }
 
@@ -240,7 +271,7 @@ pub const SnapshotState = struct {
 
         // Enforce max_snapshot_size BEFORE allocation (SEC-0063). 0 = unlimited.
         if (self.max_snapshot_size > 0) {
-            const new_size = std.math.add(u64, pending.data.items.len, msg.data.len) catch {
+            const new_size = std.math.add(u64, pending.expected_offset, msg.data.len) catch {
                 self.clearPending();
                 return SnapshotError.SnapshotTooLarge;
             };
@@ -250,11 +281,34 @@ pub const SnapshotState = struct {
             }
         }
 
-        pending.data.appendSlice(self.allocator, msg.data) catch |err| {
+        if (pending.staged) |staged| {
+            // One chunk's write; no sync (SONNY-6666).
+            pending.sink.?.appendStagedSnapshot(staged, msg.data) catch |err| {
+                self.clearPending();
+                return err;
+            };
+        } else pending.data.appendSlice(self.allocator, msg.data) catch |err| {
             // On OOM, clean up pending state to prevent leak (SEC-0096).
             self.clearPending();
             return err;
         };
+
+        if (msg.done and pending.staged != null) {
+            const staged = pending.staged.?;
+            // Hashed chunk by chunk as it was written.
+            const digest = staged.finish();
+            if (!std.mem.eql(u8, &digest, &msg.checksum)) {
+                self.clearPending();
+                return SnapshotError.ChecksumMismatch;
+            }
+            pending.staged = null;
+            pending.data.deinit(self.allocator);
+            pending.deinitConfig(self.allocator);
+            self.snapshot_index = pending.last_included_index;
+            self.snapshot_term = pending.last_included_term;
+            self.pending_snapshot = null;
+            return .{ .staged = staged };
+        }
 
         if (msg.done) {
             const assembled = pending.data.items;
@@ -294,7 +348,7 @@ pub const SnapshotState = struct {
             self.snapshot_term = pending.last_included_term;
             self.pending_snapshot = null;
 
-            return snapshot;
+            return .{ .snapshot = snapshot };
         }
 
         // Checked overflow on expected_offset accumulation (SEC-0050).
@@ -319,6 +373,10 @@ pub const SnapshotState = struct {
         if (self.pending_snapshot) |*pending| {
             pending.data.deinit(self.allocator);
             pending.deinitConfig(self.allocator);
+            if (pending.staged) |staged| {
+                pending.sink.?.releaseStagedSnapshot(staged);
+                self.allocator.destroy(staged);
+            }
             self.pending_snapshot = null;
         }
     }
