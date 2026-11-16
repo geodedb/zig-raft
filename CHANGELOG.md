@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-11-15
+
+### Fixed
+
+- `InProcessTransport` queued an InstallSnapshot with the leader's chunk
+  data and configuration slices, which the leader frees as soon as `send`
+  returns: the receiver read freed memory. It now copies them, and
+  `freeMessage` frees them (SONNY-6636).
+- A refused InstallSnapshot was re-sent on every heartbeat round. It now
+  stays in flight and each consecutive refusal doubles the wait before the
+  next send (`PeerProgress.snapshot_refusals`, `snapshotResendTicks`), from
+  16 rounds up to `SNAPSHOT_RESEND_MAX_TICKS` (256); an install resets it.
+  A snapshot lost without an answer is still re-sent after
+  `SNAPSHOT_RESEND_TICKS` (SONNY-6636).
+
 ## [0.2.2] - 2026-11-15
 
 ### Fixed
