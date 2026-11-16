@@ -10,6 +10,7 @@ const std = @import("std");
 const rpc = @import("rpc.zig");
 const node_mod = @import("node.zig");
 const trans = @import("transport.zig");
+const ready_mod = @import("ready.zig");
 
 const RaftNode = node_mod.RaftNode;
 
@@ -132,6 +133,13 @@ pub const Cluster = struct {
     router: *Router,
     /// Indexed by node id (1..MAX_NODES); null while a node is down.
     nodes: [MAX_NODES + 1]?*RaftNode = .{null} ** (MAX_NODES + 1),
+    /// Snapshot sends Ready handed over (`Config.stream_snapshots`), copied
+    /// out before advance as a consumer must.
+    sends: std.ArrayList(ready_mod.SnapshotSend) = .empty,
+
+    pub fn deinit(self: *Cluster) void {
+        self.sends.deinit(self.router.allocator);
+    }
 
     pub fn node(self: *Cluster, id: u64) *RaftNode {
         return self.nodes[id].?;
@@ -141,6 +149,7 @@ pub const Cluster = struct {
     /// queued, then apply.
     pub fn flush(self: *Cluster, n: *RaftNode) !void {
         const rd = try n.ready();
+        try self.sends.appendSlice(self.router.allocator, rd.snapshot_sends);
         try n.advancePersist();
         for (rd.messages) |out| self.router.enqueue(n.id, out.to, out.msg);
         try n.advanceApply();

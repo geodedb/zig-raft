@@ -92,6 +92,7 @@ const Fixture = struct {
             if (self.cluster.nodes[id] != null) self.nodes[id].deinit();
             self.stores[id].deinit();
         }
+        self.cluster.deinit();
         self.router.deinit();
     }
 

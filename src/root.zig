@@ -74,4 +74,5 @@ test {
     _ = @import("sonny6592_test.zig");
     _ = @import("sonny6611_test.zig");
     _ = @import("sonny6652_test.zig");
+    _ = @import("sonny6653_test.zig");
 }
