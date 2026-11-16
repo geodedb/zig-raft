@@ -45,6 +45,32 @@ pub const ConfigError = error{
     SelfInPeers,
 };
 
+/// From `RaftNode.snapshotPoint`: the index, term and (owned) config a
+/// snapshot taken at the applied index carries (SONNY-6653).
+pub const SnapshotPoint = struct {
+    index: u64,
+    term: u64,
+    voters: []u64,
+    voters_outgoing: []u64,
+    is_joint: bool,
+    allocator: std.mem.Allocator,
+
+    /// Borrows this point's config.
+    pub fn metadata(self: *const SnapshotPoint) rpc.SnapshotMetadata {
+        return .{ .index = self.index, .term = self.term, .config = .{
+            .voters = self.voters,
+            .voters_outgoing = self.voters_outgoing,
+            .is_joint = self.is_joint,
+        } };
+    }
+
+    pub fn deinit(self: *SnapshotPoint) void {
+        self.allocator.free(self.voters);
+        self.allocator.free(self.voters_outgoing);
+        self.* = undefined;
+    }
+};
+
 pub const Config = struct {
     id: u64,
     peers: []const u64,
@@ -67,6 +93,13 @@ pub const Config = struct {
     /// 0 disables it (pre-it.2 behaviour: a candidate re-elects forever).
     candidate_demote_threshold: u32 = 4,
     rng_seed: ?u64 = null,
+    /// Leave InstallSnapshot transfers to the consumer (SONNY-6653). When a
+    /// peer needs a snapshot the leader does not read it from storage inside
+    /// `tick()` / `step()`; it puts a request in `Ready.snapshot_sends`, and
+    /// the consumer streams the snapshot with `snapshot.streamSnapshot` after
+    /// releasing its node lock. Off by default: the leader loads the whole
+    /// snapshot and sends it from inside the call, as before.
+    stream_snapshots: bool = false,
 
     pub fn validate(self: Config) ConfigError!void {
         if (self.id == 0) return ConfigError.InvalidId;
@@ -692,6 +725,55 @@ pub const RaftNode = struct {
         }
     }
 
+    /// Where a snapshot of the state machine taken now must stand: the
+    /// applied index, its term and the current configuration (SONNY-6653).
+    /// Call under the node lock, then build the snapshot of the state at
+    /// that index, stage it with `Storage.stageSnapshot` (off the lock) and
+    /// commit it with `commitSnapshot` (under the lock).
+    pub fn snapshotPoint(self: *RaftNode) !SnapshotPoint {
+        const index = self.log.applied;
+        const term = self.log.term(index) catch 0;
+        const cfg = self.membership_state.config();
+        const voters = try self.allocator.dupe(u64, cfg.voters);
+        errdefer self.allocator.free(voters);
+        const outgoing = try self.allocator.dupe(u64, cfg.voters_outgoing);
+        return .{
+            .index = index,
+            .term = term,
+            .voters = voters,
+            .voters_outgoing = outgoing,
+            .is_joint = cfg.is_joint,
+            .allocator = self.allocator,
+        };
+    }
+
+    /// Commit a snapshot staged off the lock (SONNY-6653): the staged
+    /// counterpart of `reportSnapshot`. Call under the node lock. With
+    /// `FileStorage` this does only small writes (metadata, renames,
+    /// directory syncs) and the log compaction, whatever the snapshot size.
+    ///
+    /// error.SnapshotOutOfDate: the log is already compacted to or past the
+    /// staged index (a newer snapshot was committed or installed meanwhile);
+    /// error.SnapshotNotApplied: the index is past the applied index;
+    /// error.SnapshotTermMismatch: the log's term at that index differs.
+    /// In each case nothing changed; release the staged snapshot.
+    pub fn commitSnapshot(self: *RaftNode, staged: *stg.StagedSnapshot) !void {
+        const index = staged.metadata.index;
+        if (index <= self.log.snapshot_index) return error.SnapshotOutOfDate;
+        if (index > self.log.applied) return error.SnapshotNotApplied;
+        const term = self.log.term(index) catch return error.SnapshotOutOfDate;
+        if (term != staged.metadata.term) return error.SnapshotTermMismatch;
+
+        try self.storage.commitStagedSnapshot(staged);
+        self.snapshot_state.snapshot_index = index;
+        self.snapshot_state.snapshot_term = term;
+        try self.log.compact(index);
+    }
+
+    /// Write the snapshot and compact the log in one call, under the node
+    /// lock. The data write (and with `FileStorage` its fsync) happens
+    /// inside: for large snapshots use `snapshotPoint`,
+    /// `Storage.stageSnapshot` and `commitSnapshot` (SONNY-6653).
     pub fn reportSnapshot(self: *RaftNode, data: []const u8) !void {
         const last_applied = self.log.applied;
         const applied_term = self.log.term(last_applied) catch 0;
@@ -1569,6 +1651,13 @@ pub const RaftNode = struct {
             // Retry interval elapsed — fall through and re-send the snapshot.
         }
 
+        if (self.config.stream_snapshots) {
+            self.requestSnapshotSend(peer, progress) catch {
+                self.sendMsg(peer, emptyHeartbeat(self.current_term, self.id, self.log.committed));
+            };
+            return;
+        }
+
         self.sendSnapshotTo(peer, progress) catch {
             // No persisted snapshot available (or load/build failure): keep the
             // peer alive with a heartbeat. The compaction gap persists, so the
@@ -1605,6 +1694,28 @@ pub const RaftNode = struct {
         }
 
         progress.pending_snapshot_index = loaded.metadata.index;
+        progress.pending_snapshot_ticks = 0;
+        self.perf_stats.snapshots_sent += 1;
+    }
+
+    /// `Config.stream_snapshots`: hand the transfer to the consumer in the
+    /// next Ready instead of reading the snapshot here (SONNY-6653). The
+    /// snapshot is the one at the log's snapshot point, which the storage
+    /// holds (reportSnapshot / commitSnapshot / an installed snapshot persist
+    /// it before or as the log moves there).
+    fn requestSnapshotSend(self: *RaftNode, peer: u64, progress: *repl.PeerProgress) !void {
+        const index = self.log.snapshot_index;
+        if (index == 0) return error.NoSnapshot;
+        const start = if (progress.pending_snapshot_index == index) progress.snapshot_resume_offset else 0;
+        try self.ready_state.addSnapshotSend(.{
+            .to = peer,
+            .term = self.current_term,
+            .leader_id = self.id,
+            .index = index,
+            .offset = start,
+            .chunk_size = self.config.snapshot_chunk_size,
+        });
+        progress.pending_snapshot_index = index;
         progress.pending_snapshot_ticks = 0;
         self.perf_stats.snapshots_sent += 1;
     }

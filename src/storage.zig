@@ -32,6 +32,15 @@ pub const Storage = struct {
         saveSnapshot: *const fn (*anyopaque, rpc.Snapshot) anyerror!void,
         loadSnapshot: *const fn (*anyopaque) anyerror!?rpc.Snapshot,
         compact: *const fn (*anyopaque, index: u64) anyerror!void,
+        /// Optional staged snapshot save (SONNY-6653); see `stageSnapshot`.
+        /// A storage that leaves these null gets the generic fallback: the
+        /// data is copied when staged and saved with `saveSnapshot` when
+        /// committed.
+        stageSnapshot: ?*const fn (*anyopaque, rpc.Snapshot) anyerror!StagedSnapshot = null,
+        commitStagedSnapshot: ?*const fn (*anyopaque, *StagedSnapshot) anyerror!void = null,
+        /// Remove what an uncommitted staged snapshot left behind (not its
+        /// memory: `releaseStagedSnapshot` frees that).
+        discardStagedSnapshot: ?*const fn (*anyopaque, *StagedSnapshot) void = null,
     };
 
     pub fn saveHardState(self: Storage, hs: state.HardState) anyerror!void {
@@ -72,7 +81,103 @@ pub const Storage = struct {
     pub fn compact(self: Storage, index: u64) anyerror!void {
         return self.vtable.compact(self.ptr, index);
     }
+
+    /// Stage a snapshot for a later `commitStagedSnapshot` (SONNY-6653):
+    /// the expensive part of saving it (writing and syncing the data).
+    /// Storages that implement it (`FileStorage`) allow this call WITHOUT
+    /// the lock the consumer holds around the RaftNode, concurrently with
+    /// every other call; the generic fallback (copy the data) does too. The
+    /// staged snapshot owns copies of `snap`'s config and is released with
+    /// `releaseStagedSnapshot` whether or not it was committed.
+    pub fn stageSnapshot(self: Storage, allocator: std.mem.Allocator, snap: rpc.Snapshot) anyerror!StagedSnapshot {
+        if (self.vtable.stageSnapshot) |f| return f(self.ptr, snap);
+        var staged = try StagedSnapshot.initMetadata(allocator, null, snap.metadata);
+        errdefer staged.deinit();
+        staged.payload = try allocator.dupe(u8, snap.data);
+        staged.size = snap.data.len;
+        staged.digest = blake3(snap.data);
+        return staged;
+    }
+
+    /// Make a staged snapshot the storage's snapshot, with the same effect
+    /// on the log as `saveSnapshot` (SONNY-6653). Call it under the node
+    /// lock, as `saveSnapshot`. `FileStorage` does only small writes here
+    /// (the snapshot metadata, two renames, directory syncs) plus the log
+    /// compaction. `RaftNode.commitSnapshot` calls this and compacts the
+    /// in-memory log; call it directly only for a storage outside a node.
+    pub fn commitStagedSnapshot(self: Storage, staged: *StagedSnapshot) anyerror!void {
+        if (staged.committed) return error.SnapshotAlreadyCommitted;
+        if (staged.owner != (if (self.vtable.stageSnapshot != null) self.ptr else null))
+            return error.StagedSnapshotForeign;
+        if (self.vtable.commitStagedSnapshot) |f| {
+            try f(self.ptr, staged);
+        } else {
+            try self.saveSnapshot(.{ .metadata = staged.metadata, .data = staged.payload });
+            staged.committed = true;
+        }
+    }
+
+    /// Release a staged snapshot: remove what it left on the storage if it
+    /// was not committed, and free it. Safe without the node lock.
+    pub fn releaseStagedSnapshot(self: Storage, staged: *StagedSnapshot) void {
+        if (!staged.committed and staged.owner != null) {
+            if (self.vtable.discardStagedSnapshot) |f| f(self.ptr, staged);
+        }
+        staged.deinit();
+    }
 };
+
+/// A snapshot written by `Storage.stageSnapshot` and not yet (or already)
+/// committed (SONNY-6653).
+pub const StagedSnapshot = struct {
+    /// Index, term and config of the snapshot; the config slices are owned.
+    metadata: rpc.SnapshotMetadata,
+    /// BLAKE3 digest and length of the snapshot data.
+    digest: [32]u8 = .{0} ** 32,
+    size: u64 = 0,
+    /// Owned. What it holds is the storage's: `FileStorage` keeps the staged
+    /// file's name; the generic fallback keeps the data.
+    payload: []u8 = &.{},
+    /// The storage that staged it (null: the generic fallback). A staged
+    /// snapshot commits only on the storage that staged it.
+    owner: ?*anyopaque,
+    /// Set once the commit passed its commit point.
+    committed: bool = false,
+    allocator: std.mem.Allocator,
+
+    /// A staged snapshot with an owned copy of `meta`'s config and nothing
+    /// staged yet (for storage implementations).
+    pub fn initMetadata(allocator: std.mem.Allocator, owner: ?*anyopaque, meta: rpc.SnapshotMetadata) !StagedSnapshot {
+        const voters = try allocator.dupe(u64, meta.config.voters);
+        errdefer allocator.free(voters);
+        const outgoing = try allocator.dupe(u64, meta.config.voters_outgoing);
+        return .{
+            .metadata = .{ .index = meta.index, .term = meta.term, .config = .{
+                .voters = voters,
+                .voters_outgoing = outgoing,
+                .is_joint = meta.config.is_joint,
+            } },
+            .owner = owner,
+            .allocator = allocator,
+        };
+    }
+
+    /// Free the memory only; anything staged on the storage stays (as after
+    /// a crash). Use `Storage.releaseStagedSnapshot` normally.
+    pub fn deinit(self: *StagedSnapshot) void {
+        self.allocator.free(self.metadata.config.voters);
+        self.allocator.free(self.metadata.config.voters_outgoing);
+        self.allocator.free(self.payload);
+        self.* = undefined;
+    }
+};
+
+fn blake3(data: []const u8) [32]u8 {
+    // fips-exempt: non-security — snapshot-data integrity digest.
+    var d: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(data, &d, .{});
+    return d;
+}
 
 /// Free a Snapshot returned by Storage.loadSnapshot().
 /// Both InMemoryStorage and FileStorage return heap-allocated copies

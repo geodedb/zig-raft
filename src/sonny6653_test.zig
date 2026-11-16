@@ -25,9 +25,14 @@ const FileStorage = fstg.FileStorage;
 const alloc = std.testing.allocator;
 
 /// The lock budget a commit or a streaming leader's tick must stay under,
-/// whatever the snapshot size. Geode's whole tick budget is 250 ms; a
-/// 64 MiB write + fsync blew through it.
-const LOCK_BUDGET_NS: u64 = 100 * std.time.ns_per_ms;
+/// whatever the snapshot size: geode's whole tick budget. The commit is a
+/// few renames and directory syncs (tens of ms on a slow disk); a 64 MiB
+/// write + fsync under the lock took 175 ms (ReleaseFast) to 1.8 s (Debug)
+/// on the same disk.
+const LOCK_BUDGET_NS: u64 = 250 * std.time.ns_per_ms;
+/// The fastest of several commits must also stay well below it, so one slow
+/// fsync on a busy machine does not hide a commit that scales with the data.
+const LOCK_TYPICAL_NS: u64 = 100 * std.time.ns_per_ms;
 
 const BIG: usize = 64 * 1024 * 1024;
 
@@ -121,23 +126,42 @@ test "SONNY-6653: committing a staged 64 MiB snapshot holds the node lock briefl
 
     const data = try bigData();
     defer alloc.free(data);
-
-    // Under the lock: where the snapshot is taken.
-    var point = try n.snapshotPoint();
-    defer point.deinit();
-    try std.testing.expect(point.index >= 8);
-
-    // Off the lock: write and fsync the 64 MiB.
     const storage = store.fs.storage();
-    var staged = try storage.stageSnapshot(alloc, .{ .metadata = point.metadata(), .data = data });
-    defer storage.releaseStagedSnapshot(&staged);
 
-    // Under the lock: the commit.
-    const t0 = nowNs();
-    try n.commitSnapshot(&staged);
-    const held = nowNs() - t0;
-    std.log.info("SONNY-6653: commit of a staged 64 MiB snapshot held the lock {d} us", .{held / 1000});
-    try std.testing.expect(held < LOCK_BUDGET_NS);
+    var fastest: u64 = std.math.maxInt(u64);
+    var slowest: u64 = 0;
+    var point: node_mod.SnapshotPoint = undefined;
+    var round: u8 = 0;
+    while (round < 3) : (round += 1) {
+        if (round > 0) {
+            try n.propose("more");
+            _ = try n.ready();
+            try n.advance();
+            _ = try n.ready();
+            try n.advance();
+            point.deinit();
+        }
+        data[0] = round;
+
+        // Under the lock: where the snapshot is taken.
+        point = try n.snapshotPoint();
+        try std.testing.expect(point.index >= 8);
+
+        // Off the lock: write and fsync the 64 MiB.
+        var staged = try storage.stageSnapshot(alloc, .{ .metadata = point.metadata(), .data = data });
+        defer storage.releaseStagedSnapshot(&staged);
+
+        // Under the lock: the commit.
+        const t0 = nowNs();
+        try n.commitSnapshot(&staged);
+        const held = nowNs() - t0;
+        std.log.info("SONNY-6653: commit of a staged 64 MiB snapshot held the lock {d} us", .{held / 1000});
+        fastest = @min(fastest, held);
+        slowest = @max(slowest, held);
+    }
+    defer point.deinit();
+    try std.testing.expect(slowest < LOCK_BUDGET_NS);
+    try std.testing.expect(fastest < LOCK_TYPICAL_NS);
 
     try std.testing.expectEqual(point.index, n.log.snapshot_index);
     n.deinit();
@@ -243,7 +267,8 @@ test "SONNY-6653: a crash between stage and commit leaves the previous snapshot 
     try store.init();
     defer store.deinit();
     var staged = try previousAndStaged(&store);
-    try std.testing.expectEqual(@as(usize, 1), try store.countFiles("snapshot.stage."));
+    // Its data and its metadata.
+    try std.testing.expectEqual(@as(usize, 2), try store.countFiles("snapshot.stage."));
     // The process dies: the staged file stays on disk, nothing is committed.
     staged.deinit();
     try expectSnapshot(&store, 5, "snapshot-A");
@@ -357,7 +382,7 @@ test "SONNY-6653: a streaming leader's tick does no snapshot I/O; the consumer s
     try fx.cluster.flush(leader);
     const held = nowNs() - t0;
     std.log.info("SONNY-6653: streaming leader tick held the lock {d} us", .{held / 1000});
-    try std.testing.expect(held < LOCK_BUDGET_NS);
+    try std.testing.expect(held < LOCK_TYPICAL_NS);
     try std.testing.expectEqual(@as(usize, 1), fx.cluster.sends.items.len);
     const req = fx.cluster.sends.items[0];
     try std.testing.expectEqual(@as(u64, 2), req.to);

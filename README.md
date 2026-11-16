@@ -82,6 +82,58 @@ copy its entries with `raft.dupeEntries` (data included) and free them with
 `raft.freeEntries`. `Storage.entries` and `RaftLog.slice` hand out entries
 whose slice and data the caller owns (`raft.freeEntries`).
 
+## Large snapshots without holding the node lock
+
+A consumer that serialises calls into `RaftNode` with a lock holds it
+through every storage call the node makes. Two of those used to scale with
+the snapshot size: `reportSnapshot` (and `FileStorage.saveSnapshotImpl`)
+wrote and fsynced the whole snapshot, and a leader read its whole snapshot
+back inside `tick()` to send it to a lagging follower. Both still work as
+before. For large snapshots, use the staged and streamed API instead
+(0.2.5, SONNY-6653):
+
+```zig
+// Taking a snapshot. Under the lock: where it stands.
+var point = try node.snapshotPoint(); // applied index, its term, config
+defer point.deinit();
+// Off the lock: build the state machine's snapshot at point.index, then
+// write and fsync it. FileStorage.stageSnapshot is safe without the lock.
+var staged = try storage.stageSnapshot(allocator, .{ .metadata = point.metadata(), .data = bytes });
+defer storage.releaseStagedSnapshot(&staged); // safe without the lock
+// Under the lock: renames, directory syncs and the log compaction only.
+try node.commitSnapshot(&staged); // error.SnapshotOutOfDate if a newer one landed
+```
+
+```zig
+// Sending one. Config{ .stream_snapshots = true }: tick()/step() no longer
+// read the snapshot; the Ready asks the consumer to send it.
+const rd = try node.ready(); // under the lock
+const sends = try allocator.dupe(raft.SnapshotSend, rd.snapshot_sends); // released by advanceApply()
+// ... advancePersist(), send rd.messages, advanceApply(), unlock ...
+for (sends) |req| {
+    var reader = (try file_storage.openSnapshotReader()) orelse continue; // no lock needed
+    defer reader.close();
+    raft.streamSnapshot(allocator, &reader, req, transport) catch {}; // chunk by chunk
+}
+```
+
+`streamSnapshot` reads one chunk at a time, hashes the whole snapshot as it
+goes, and sends the last chunk only if the data matches the digest committed
+with it. The `Transport` it sends through must be safe to call from that
+thread while the node uses it. If the stream fails, the leader re-sends
+after its retry interval. A storage without its own staged API gets a
+fallback (the data is copied when staged and saved with `saveSnapshot` when
+committed); `raft.MemorySnapshotReader` streams a snapshot loaded into
+memory.
+
+The commit is crash-safe: the data and metadata are synced when staged, and
+renaming the metadata into place is the commit point. A crash before it
+leaves the previous snapshot; a crash after it is completed when
+`FileStorage` next opens. Leftover staged files are removed then.
+
+Not covered yet: a follower still writes an installed snapshot inside
+`advancePersist()`, and assembles it in memory while receiving it.
+
 ## Thread-pool integration
 
 `RaftNode.tick` and `RaftNode.sendHeartbeats` accept an optional

@@ -7,7 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Snapshot I/O off the consumer's node lock (SONNY-6653). Writing a
+  snapshot (`reportSnapshot`, `FileStorage.saveSnapshotImpl`) and a
+  leader's send (`tick()` read the whole snapshot back) ran inside calls a
+  consumer makes under its lock: 64 MiB held it 175 ms (ReleaseFast) to
+  1.8 s (Debug). New, alongside the unchanged old API:
+  - `RaftNode.snapshotPoint()` (under the lock), `Storage.stageSnapshot()`
+    (off the lock: writes and syncs data and metadata),
+    `RaftNode.commitSnapshot()` (under the lock: renames, directory syncs
+    and log compaction, about 50 ms whatever the size on the same disk),
+    `Storage.releaseStagedSnapshot()`, `StagedSnapshot`. Optional
+    `Storage.VTable` entries `stageSnapshot`, `commitStagedSnapshot`,
+    `discardStagedSnapshot` (default null: a copying fallback).
+  - `Config.stream_snapshots`: the leader puts InstallSnapshot transfers
+    in `Ready.snapshot_sends` (`SnapshotSend`) instead of reading the
+    snapshot itself; the consumer streams them with `streamSnapshot()` from
+    `FileStorage.openSnapshotReader()` (no lock) or `MemorySnapshotReader`,
+    chunk by chunk, checking the data against its committed digest before
+    the last chunk.
+
 ### Fixed
+
+- `FileStorage` renamed a new snapshot's metadata before its data; a crash
+  between the two left metadata whose data was gone (and recovery deleted
+  the new data). Renaming the metadata is now the commit point, after the
+  data is durable under a name derived from its digest; a crash after it
+  is completed on the next open, and staged leftovers are removed
+  (SONNY-6653).
 
 - A follower that already held a re-sent snapshot (same or newer index,
   e.g. after its ack was lost or after a restart) answered it as stale

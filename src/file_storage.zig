@@ -15,6 +15,9 @@
 //!   entries.wal   -- write-ahead log of entry records (managed by wal library)
 //!   snapshot.meta -- variable: [index: u64 LE][term: u64 LE][data_blake3: 32 bytes][config_data...][crc32: u32 LE]
 //!   snapshot.data -- raw snapshot bytes
+//!   snapshot.stage.<n>.data     -- a staged snapshot's data (stageSnapshot)
+//!   snapshot.stage.<n>.meta     -- its metadata, ready to be renamed in
+//!   snapshot.commit.<blake3hex> -- staged data inside a commit
 //! ```
 //!
 //! ## WAL payload format
@@ -27,7 +30,17 @@
 //!
 //! ## Crash safety
 //!
-//! - Hard state and snapshots: write to temp file, sync, rename.
+//! - Hard state: write to temp file, sync, rename.
+//! - Snapshots (SONNY-6653): `stageSnapshot` writes and syncs the data and
+//!   the metadata to `snapshot.stage.<n>.data` / `.meta` (no lock needed).
+//!   `commitStagedSnapshot` renames the data to `snapshot.commit.<digest>`,
+//!   syncs the directory, and renames the metadata to `snapshot.meta`:
+//!   that rename is the commit point. It then renames the data to
+//!   `snapshot.data`. A crash before the commit point leaves the previous
+//!   snapshot; after it, recovery finds `snapshot.commit.<digest of the
+//!   meta>` and finishes the rename. Recovery removes every other staged
+//!   or commit file. (Before, the meta was renamed before the data, and a
+//!   crash between the two left a meta whose data was gone.)
 //! - WAL: handled by the wal library (CRC32, fdatasync, torn write recovery).
 //!   Only a torn tail is truncated on open; a damaged record with valid ones
 //!   after it, or a WAL in the other key mode, fails `init` with
@@ -39,6 +52,7 @@
 //!   the snapshot index.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const wal_mod = @import("wal");
 const state = @import("state.zig");
 const rpc = @import("rpc.zig");
@@ -65,8 +79,35 @@ pub const FileStorage = struct {
     hard_state: state.HardState,
     allocator: std.mem.Allocator,
     max_snapshot_size: u64 = 256 * 1024 * 1024,
+    /// Numbers staged snapshot files; atomic because staging runs without
+    /// the node lock (SONNY-6653).
+    stage_seq: std.atomic.Value(u64) = .init(0),
+    /// Fault injection for the crash tests: commitStagedSnapshot returns
+    /// error.SimulatedCrash at that step, leaving the files as a crash
+    /// would. Honoured only in test builds.
+    crash_at: CrashPoint = .none,
 
     pub const DirectoryAlreadyLocked = error.WouldBlock;
+
+    pub const CrashPoint = enum { none, before_meta_rename, after_meta_rename };
+
+    const stage_prefix = "snapshot.stage.";
+    const commit_prefix = "snapshot.commit.";
+    const StageName = [stage_prefix.len + 32]u8;
+
+    /// `<payload>.data` / `<payload>.meta` of a staged snapshot.
+    fn stageFile(buf: *StageName, base: []const u8, comptime ext: []const u8) []const u8 {
+        return std.fmt.bufPrint(buf, "{s}" ++ ext, .{base}) catch unreachable;
+    }
+    const CommitName = [commit_prefix.len + 64]u8;
+
+    fn commitName(digest: [32]u8) CommitName {
+        var name: CommitName = undefined;
+        @memcpy(name[0..commit_prefix.len], commit_prefix);
+        const hex = std.fmt.bytesToHex(digest, .lower);
+        @memcpy(name[commit_prefix.len..], &hex);
+        return name;
+    }
 
     /// In-memory index entry for fast term lookups.
     const IndexEntry = struct {
@@ -136,6 +177,11 @@ pub const FileStorage = struct {
             }
         }
 
+        // Finish a commit that crashed after its commit point, then drop
+        // what uncommitted stages and commits left (SONNY-6653).
+        if (fs.snapshot_index != 0) try fs.rollForwardCommit(fs.snapshot_data_digest);
+        try fs.removeStagedFiles();
+
         dir.deleteFile(std.Io.Threaded.global_single_threaded.io(), "snapshot.data.tmp") catch {};
         dir.deleteFile(std.Io.Threaded.global_single_threaded.io(), "snapshot.meta.tmp") catch {};
 
@@ -171,6 +217,9 @@ pub const FileStorage = struct {
         .saveSnapshot = typeErasedSaveSnapshot,
         .loadSnapshot = typeErasedLoadSnapshot,
         .compact = typeErasedCompact,
+        .stageSnapshot = typeErasedStageSnapshot,
+        .commitStagedSnapshot = typeErasedCommitStagedSnapshot,
+        .discardStagedSnapshot = typeErasedDiscardStagedSnapshot,
     };
 
     // ========================================================================
@@ -327,64 +376,170 @@ pub const FileStorage = struct {
         return self.index.items[self.index.items.len - 1].raft_index;
     }
 
+    /// Stage and commit `snap` in one call, under the caller's lock (the
+    /// pre-0.2.5 behaviour). Use `stageSnapshot` off the lock and
+    /// `commitStagedSnapshot` under it to keep the data write out of the
+    /// lock (SONNY-6653).
     pub fn saveSnapshotImpl(self: *FileStorage, snap: rpc.Snapshot) !void {
-        const prev_snapshot_index = self.snapshot_index;
+        var staged = try self.stageSnapshot(snap);
+        defer self.releaseStagedSnapshot(&staged);
+        try self.commitStagedSnapshot(&staged);
+    }
+
+    /// Write and sync `snap`'s data to a staged file for a later
+    /// `commitStagedSnapshot` (SONNY-6653). Touches nothing the other
+    /// methods use: safe WITHOUT the node lock and concurrently with any
+    /// other call, if `allocator` is thread-safe. Release the result with
+    /// `releaseStagedSnapshot` (or `Storage.releaseStagedSnapshot`).
+    pub fn stageSnapshot(self: *FileStorage, snap: rpc.Snapshot) !stg.StagedSnapshot {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var staged = try stg.StagedSnapshot.initMetadata(self.allocator, @ptrCast(self), snap.metadata);
+        errdefer staged.deinit();
+
+        var base_buf: [stage_prefix.len + 20]u8 = undefined;
+        const base = std.fmt.bufPrint(&base_buf, stage_prefix ++ "{d}", .{self.stage_seq.fetchAdd(1, .monotonic)}) catch unreachable;
+        staged.payload = try self.allocator.dupe(u8, base);
+        var data_buf: StageName = undefined;
+        const name = stageFile(&data_buf, base, ".data");
+        var meta_buf: StageName = undefined;
+        const meta_name = stageFile(&meta_buf, base, ".meta");
+
         // fips-exempt: non-security — snapshot-data integrity digest on disk.
-        const Blake3 = std.crypto.hash.Blake3;
-        var hasher = Blake3.init(.{});
-        hasher.update(snap.data);
-        var data_digest: [32]u8 = undefined;
-        hasher.final(&data_digest);
+        std.crypto.hash.Blake3.hash(snap.data, &staged.digest, .{});
+        staged.size = snap.data.len;
 
         {
-            var tmp = try self.dir.createFile(std.Io.Threaded.global_single_threaded.io(), "snapshot.data.tmp", .{});
+            var tmp = try self.dir.createFile(io, name, .{ .exclusive = true });
             errdefer {
-                tmp.close(std.Io.Threaded.global_single_threaded.io());
-                self.dir.deleteFile(std.Io.Threaded.global_single_threaded.io(), "snapshot.data.tmp") catch {};
+                tmp.close(io);
+                self.dir.deleteFile(io, name) catch {};
             }
-            try tmp.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), snap.data);
-            try tmp.sync(std.Io.Threaded.global_single_threaded.io());
-            tmp.close(std.Io.Threaded.global_single_threaded.io());
+            try tmp.writeStreamingAll(io, snap.data);
+            try tmp.sync(io);
+            tmp.close(io);
         }
+        errdefer self.dir.deleteFile(io, name) catch {};
+        // The metadata too, so the commit writes nothing but renames.
+        try self.writeSnapshotMetaFile(meta_name, snap.metadata.index, snap.metadata.term, staged.digest, snap.metadata.config);
+        return staged;
+    }
 
-        {
-            const meta_buf = try serializeSnapshotMeta(self.allocator, snap.metadata.index, snap.metadata.term, data_digest, snap.metadata.config);
-            defer self.allocator.free(meta_buf);
+    /// Make a staged snapshot this storage's snapshot (SONNY-6653). Call
+    /// under the node lock, like the other mutating methods. The data was
+    /// and its metadata were written and synced by `stageSnapshot`; this
+    /// does three renames and two directory syncs, and drops the
+    /// log entries the snapshot covers (as `saveSnapshotImpl`). Renaming
+    /// the metadata into place is the commit point: a failure or crash
+    /// before it leaves the previous snapshot; after it the new one stands
+    /// (`init` finishes an interrupted data rename).
+    pub fn commitStagedSnapshot(self: *FileStorage, staged: *stg.StagedSnapshot) !void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        if (staged.committed) return error.SnapshotAlreadyCommitted;
+        if (staged.owner != @as(?*anyopaque, @ptrCast(self))) return error.StagedSnapshotForeign;
 
-            var tmp = try self.dir.createFile(std.Io.Threaded.global_single_threaded.io(), "snapshot.meta.tmp", .{});
-            errdefer {
-                tmp.close(std.Io.Threaded.global_single_threaded.io());
-                self.dir.deleteFile(std.Io.Threaded.global_single_threaded.io(), "snapshot.meta.tmp") catch {};
-            }
-            try tmp.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), meta_buf);
-            try tmp.sync(std.Io.Threaded.global_single_threaded.io());
-            tmp.close(std.Io.Threaded.global_single_threaded.io());
-        }
+        const prev_snapshot_index = self.snapshot_index;
+        const cfg = staged.metadata.config;
+        // Set at the commit point (and by a simulated crash): from there on
+        // nothing is undone.
+        var keep = false;
 
-        try self.dir.rename("snapshot.meta.tmp", self.dir, "snapshot.meta", std.Io.Threaded.global_single_threaded.io());
-        try self.dir.rename("snapshot.data.tmp", self.dir, "snapshot.data", std.Io.Threaded.global_single_threaded.io());
-        try self.syncDir();
-
-        self.snapshot_index = snap.metadata.index;
-        self.snapshot_term = snap.metadata.term;
-        self.snapshot_data_digest = data_digest;
-
+        // Everything that can fail for want of memory, before the commit
+        // point.
         var new_voters: std.ArrayList(u64) = .empty;
-        try new_voters.appendSlice(self.allocator, snap.metadata.config.voters);
-        errdefer new_voters.deinit(self.allocator);
-
+        errdefer if (!keep) new_voters.deinit(self.allocator);
+        try new_voters.appendSlice(self.allocator, cfg.voters);
         var new_outgoing: std.ArrayList(u64) = .empty;
-        try new_outgoing.appendSlice(self.allocator, snap.metadata.config.voters_outgoing);
+        errdefer if (!keep) new_outgoing.deinit(self.allocator);
+        try new_outgoing.appendSlice(self.allocator, cfg.voters_outgoing);
 
+        // The staged data takes the name recovery derives from the digest.
+        var data_buf: StageName = undefined;
+        const data_name = stageFile(&data_buf, staged.payload, ".data");
+        var meta_buf: StageName = undefined;
+        const meta_name = stageFile(&meta_buf, staged.payload, ".meta");
+        const commit_name = commitName(staged.digest);
+        try self.dir.rename(data_name, self.dir, &commit_name, io);
+        errdefer if (!keep) self.dir.rename(&commit_name, self.dir, data_name, io) catch {};
+        // The data's new name must be durable before the meta points at it.
+        try self.syncDir();
+        if (builtin.is_test and self.crash_at == .before_meta_rename) {
+            keep = true;
+            new_voters.deinit(self.allocator);
+            new_outgoing.deinit(self.allocator);
+            return error.SimulatedCrash;
+        }
+
+        try self.dir.rename(meta_name, self.dir, "snapshot.meta", io);
+        // Committed.
+        keep = true;
+        staged.committed = true;
+        self.snapshot_index = staged.metadata.index;
+        self.snapshot_term = staged.metadata.term;
+        self.snapshot_data_digest = staged.digest;
         self.snapshot_config_voters.deinit(self.allocator);
         self.snapshot_config_voters = new_voters;
         self.snapshot_config_voters_outgoing.deinit(self.allocator);
         self.snapshot_config_voters_outgoing = new_outgoing;
-        self.snapshot_config_is_joint = snap.metadata.config.is_joint;
+        self.snapshot_config_is_joint = cfg.is_joint;
+        if (builtin.is_test and self.crash_at == .after_meta_rename) return error.SimulatedCrash;
 
-        if (snap.metadata.index > prev_snapshot_index) {
-            try self.discardCoveredBy(snap.metadata.index, snap.metadata.term);
+        try self.dir.rename(&commit_name, self.dir, "snapshot.data", io);
+        try self.syncDir();
+
+        if (staged.metadata.index > prev_snapshot_index) {
+            try self.discardCoveredBy(staged.metadata.index, staged.metadata.term);
         }
+    }
+
+    /// Delete an uncommitted staged snapshot's file and free it. Safe
+    /// without the node lock.
+    pub fn releaseStagedSnapshot(self: *FileStorage, staged: *stg.StagedSnapshot) void {
+        if (!staged.committed and staged.owner == @as(?*anyopaque, @ptrCast(self))) self.discardStaged(staged);
+        staged.deinit();
+    }
+
+    fn discardStaged(self: *FileStorage, staged: *stg.StagedSnapshot) void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var buf: StageName = undefined;
+        self.dir.deleteFile(io, stageFile(&buf, staged.payload, ".data")) catch {};
+        self.dir.deleteFile(io, stageFile(&buf, staged.payload, ".meta")) catch {};
+    }
+
+    /// After a crash past a commit's commit point, the meta names data
+    /// (by digest) still at its commit name: move it into place.
+    fn rollForwardCommit(self: *FileStorage, digest: [32]u8) !void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const name = commitName(digest);
+        self.dir.rename(&name, self.dir, "snapshot.data", io) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        std.log.warn("raft: FileStorage: finished an interrupted snapshot commit at index {d}", .{self.snapshot_index});
+        try self.syncDir();
+    }
+
+    /// Remove the files of uncommitted stages and commits (at init, when
+    /// nothing else uses the directory).
+    fn removeStagedFiles(self: *FileStorage) !void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var it_dir = try self.dir.openDir(io, ".", .{ .iterate = true });
+        defer it_dir.close(io);
+        var names: std.ArrayList([]u8) = .empty;
+        defer {
+            for (names.items) |n| self.allocator.free(n);
+            names.deinit(self.allocator);
+        }
+        var it = it_dir.iterate();
+        while (try it.next(io)) |entry| {
+            if (!std.mem.startsWith(u8, entry.name, stage_prefix) and
+                !std.mem.startsWith(u8, entry.name, commit_prefix)) continue;
+            const copy = try self.allocator.dupe(u8, entry.name);
+            names.append(self.allocator, copy) catch |err| {
+                self.allocator.free(copy);
+                return err;
+            };
+        }
+        for (names.items) |n| self.dir.deleteFile(io, n) catch {};
     }
 
     /// Drop the log entries a snapshot at `snap_index` / `snap_term` (already
@@ -428,6 +583,11 @@ pub const FileStorage = struct {
     pub fn loadSnapshotImpl(self: *FileStorage) !?rpc.Snapshot {
         var meta = self.readSnapshotMeta() catch |err| {
             if (err == error.FileNotFound) return null;
+            return err;
+        };
+        // A commit that failed after its commit point (SONNY-6653).
+        if (meta.data_digest) |d| self.rollForwardCommit(d) catch |err| {
+            meta.freeConfig(self.allocator);
             return err;
         };
 
@@ -578,20 +738,80 @@ pub const FileStorage = struct {
     }
 
     fn writeSnapshotMeta(self: *FileStorage, snap_index: u64, snap_term: u64, data_digest: [32]u8, cfg: rpc.ClusterConfig) !void {
+        try self.writeSnapshotMetaFile("snapshot.meta.tmp", snap_index, snap_term, data_digest, cfg);
+        try self.dir.rename("snapshot.meta.tmp", self.dir, "snapshot.meta", std.Io.Threaded.global_single_threaded.io());
+        try self.syncDir();
+    }
+
+    /// Write and sync snapshot metadata to `name` (not yet in place).
+    fn writeSnapshotMetaFile(self: *FileStorage, name: []const u8, snap_index: u64, snap_term: u64, data_digest: [32]u8, cfg: rpc.ClusterConfig) !void {
         const meta_buf = try serializeSnapshotMeta(self.allocator, snap_index, snap_term, data_digest, cfg);
         defer self.allocator.free(meta_buf);
 
-        var tmp = try self.dir.createFile(std.Io.Threaded.global_single_threaded.io(), "snapshot.meta.tmp", .{});
+        var tmp = try self.dir.createFile(std.Io.Threaded.global_single_threaded.io(), name, .{});
         errdefer {
             tmp.close(std.Io.Threaded.global_single_threaded.io());
-            self.dir.deleteFile(std.Io.Threaded.global_single_threaded.io(), "snapshot.meta.tmp") catch {};
+            self.dir.deleteFile(std.Io.Threaded.global_single_threaded.io(), name) catch {};
         }
         try tmp.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), meta_buf);
         try tmp.sync(std.Io.Threaded.global_single_threaded.io());
         tmp.close(std.Io.Threaded.global_single_threaded.io());
-        try self.dir.rename("snapshot.meta.tmp", self.dir, "snapshot.meta", std.Io.Threaded.global_single_threaded.io());
-        try self.syncDir();
     }
+
+    /// Open the committed snapshot for reading WITHOUT the node lock
+    /// (SONNY-6653): a leader streams it to a follower with
+    /// `snapshot.streamSnapshot`. Reads only the metadata and opens the
+    /// data file; null when there is no snapshot. A commit that replaces
+    /// the snapshot while it is open does not disturb the open file (it is
+    /// replaced by rename, never rewritten), but the metadata and the data
+    /// may then come from different snapshots: `streamSnapshot` checks the
+    /// data against the metadata's digest before it sends the last chunk.
+    pub fn openSnapshotReader(self: *FileStorage) !?SnapshotReader {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var meta = self.readSnapshotMeta() catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer meta.freeConfig(self.allocator);
+        const cfg = meta.config orelse rpc.ClusterConfig{ .voters = &.{}, .voters_outgoing = &.{}, .is_joint = false };
+        var owned = try stg.StagedSnapshot.initMetadata(self.allocator, null, .{ .index = meta.index, .term = meta.term, .config = cfg });
+        errdefer owned.deinit();
+        const file = self.dir.openFile(io, "snapshot.data", .{}) catch |err| switch (err) {
+            error.FileNotFound => return error.SnapshotChanged,
+            else => return err,
+        };
+        errdefer file.close(io);
+        return .{
+            .file = file,
+            .metadata = owned.metadata,
+            .expected_digest = meta.data_digest,
+            .size = try file.length(io),
+            .allocator = self.allocator,
+        };
+    }
+
+    /// The committed snapshot, open for streaming (`openSnapshotReader`).
+    pub const SnapshotReader = struct {
+        file: std.Io.File,
+        /// Owned config slices.
+        metadata: rpc.SnapshotMetadata,
+        /// From the metadata (null for a pre-digest metadata file).
+        expected_digest: ?[32]u8,
+        size: u64,
+        allocator: std.mem.Allocator,
+
+        /// Read `buf.len` bytes at `offset` (fewer only at the end).
+        pub fn readAt(self: *SnapshotReader, buf: []u8, offset: u64) !usize {
+            return self.file.readPositionalAll(std.Io.Threaded.global_single_threaded.io(), buf, offset);
+        }
+
+        pub fn close(self: *SnapshotReader) void {
+            self.file.close(std.Io.Threaded.global_single_threaded.io());
+            self.allocator.free(self.metadata.config.voters);
+            self.allocator.free(self.metadata.config.voters_outgoing);
+            self.* = undefined;
+        }
+    };
 
     pub fn loadHardState(self: *FileStorage) state.HardState {
         return self.hard_state;
@@ -893,6 +1113,21 @@ pub const FileStorage = struct {
     fn typeErasedCompact(ptr: *anyopaque, index: u64) anyerror!void {
         const self: *FileStorage = @ptrCast(@alignCast(ptr));
         return self.compactImpl(index);
+    }
+
+    fn typeErasedStageSnapshot(ptr: *anyopaque, snap: rpc.Snapshot) anyerror!stg.StagedSnapshot {
+        const self: *FileStorage = @ptrCast(@alignCast(ptr));
+        return self.stageSnapshot(snap);
+    }
+
+    fn typeErasedCommitStagedSnapshot(ptr: *anyopaque, staged: *stg.StagedSnapshot) anyerror!void {
+        const self: *FileStorage = @ptrCast(@alignCast(ptr));
+        return self.commitStagedSnapshot(staged);
+    }
+
+    fn typeErasedDiscardStagedSnapshot(ptr: *anyopaque, staged: *stg.StagedSnapshot) void {
+        const self: *FileStorage = @ptrCast(@alignCast(ptr));
+        self.discardStaged(staged);
     }
 };
 
