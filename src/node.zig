@@ -30,6 +30,11 @@ pub const MAX_STACK_PEERS: usize = 16;
 /// snapshot or a follower that acked then crashed (SEC-0144).
 pub const SNAPSHOT_RESEND_TICKS: u32 = 8;
 
+/// The longest wait, in heartbeat rounds, before a refused InstallSnapshot is
+/// sent again: refusals double the wait from `SNAPSHOT_RESEND_TICKS` up to
+/// this (SONNY-6636).
+pub const SNAPSHOT_RESEND_MAX_TICKS: u32 = 256;
+
 pub const ConfigError = error{
     InvalidId,
     InvalidElectionTick,
@@ -1301,13 +1306,16 @@ pub const RaftNode = struct {
             _ = progress.maybeUpdate(self.log.snapshot_index);
             progress.pending_snapshot_index = 0;
             progress.pending_snapshot_ticks = 0;
+            progress.snapshot_refusals = 0;
             self.maybeCommit();
-        } else {
-            // Snapshot rejected (e.g. stale/validation failure on the follower).
-            // Clear the in-flight marker so the driver can re-escalate on the
-            // next heartbeat round rather than waiting out the retry interval
-            // against a snapshot the follower refused (SEC-0144).
-            progress.pending_snapshot_index = 0;
+        } else if (progress.pending_snapshot_index != 0) {
+            // Snapshot refused (a digest the follower cannot match, a state
+            // machine that cannot take it). Sending it again at once is
+            // refused the same way: it stays in flight and the next send
+            // waits twice as long as the last, up to
+            // SNAPSHOT_RESEND_MAX_TICKS (SONNY-6636; it was re-sent every
+            // heartbeat round, SEC-0144).
+            progress.snapshot_refusals +|= 1;
             progress.pending_snapshot_ticks = 0;
         }
     }
@@ -1503,7 +1511,7 @@ pub const RaftNode = struct {
         // A snapshot is already in flight — throttle re-sends.
         if (progress.pending_snapshot_index != 0) {
             progress.pending_snapshot_ticks +|= 1;
-            if (progress.pending_snapshot_ticks < SNAPSHOT_RESEND_TICKS) {
+            if (progress.pending_snapshot_ticks < progress.snapshotResendTicks(SNAPSHOT_RESEND_TICKS, SNAPSHOT_RESEND_MAX_TICKS)) {
                 self.sendMsg(peer, emptyHeartbeat(self.current_term, self.id, self.log.committed));
                 return;
             }
@@ -2161,13 +2169,61 @@ test "handleInstallSnapshotResponse clears pending on success and failure (SEC-0
     try std.testing.expectEqual(@as(u32, 0), progress.pending_snapshot_ticks);
     try std.testing.expect(progress.next_index > node.log.snapshot_index);
 
-    // Re-arm pending, then a failure ack must also clear it so the driver retries.
+    // Re-arm pending, then a failure ack keeps it in flight and backs off
+    // (SONNY-6636): the follower refused this snapshot, and sending it again
+    // at once would be refused the same way.
     progress.next_index = node.log.snapshot_index;
     node.escalateOrHeartbeat(rs, 2);
     try std.testing.expect(progress.pending_snapshot_index != 0);
     try node.handleInstallSnapshotResponse(2, .{ .term = node.current_term, .success = false });
-    try std.testing.expectEqual(@as(u64, 0), progress.pending_snapshot_index);
+    try std.testing.expect(progress.pending_snapshot_index != 0);
     try std.testing.expectEqual(@as(u32, 0), progress.pending_snapshot_ticks);
+    try std.testing.expectEqual(@as(u32, 1), progress.snapshot_refusals);
+}
+
+test "a refused InstallSnapshot is re-sent with exponential backoff, reset by an install (SONNY-6636)" {
+    var mem_store = stg.InMemoryStorage.init(std.testing.allocator);
+    defer mem_store.deinit();
+
+    var node = try RaftNode.init(std.testing.allocator, .{
+        .id = 1,
+        .peers = &.{},
+        .election_tick = 5,
+        .rng_seed = 42,
+        .pre_vote = false,
+    }, mem_store.storage());
+    defer node.deinit();
+
+    var capture = CapturingTransport{};
+    node.setTransport(capture.transport());
+    try makeCompactedLeader(&node, 2);
+
+    var rs = &(node.replication_state.?);
+    const progress = rs.peers.getPtr(2).?;
+    progress.next_index = node.log.snapshot_index;
+
+    // The follower refuses every snapshot (a digest it cannot match, a store
+    // that cannot take it). Before, the leader re-sent it every round.
+    var answered: u32 = 0;
+    var round: u32 = 0;
+    while (round < 200) : (round += 1) {
+        node.escalateOrHeartbeat(rs, 2);
+        while (answered < capture.install_snapshot_count) : (answered += 1) {
+            try node.handleInstallSnapshotResponse(2, .{ .term = node.current_term, .success = false });
+        }
+    }
+    // Sent at rounds 0, 16, 48, 112 (waits 16, 32, 64, then 128).
+    try std.testing.expectEqual(@as(u32, 4), capture.install_snapshot_count);
+    try std.testing.expectEqual(@as(u32, 4), progress.snapshot_refusals);
+
+    // The wait is capped.
+    progress.snapshot_refusals = 30;
+    try std.testing.expectEqual(SNAPSHOT_RESEND_MAX_TICKS, progress.snapshotResendTicks(SNAPSHOT_RESEND_TICKS, SNAPSHOT_RESEND_MAX_TICKS));
+
+    // An install resets it.
+    try node.handleInstallSnapshotResponse(2, .{ .term = node.current_term, .success = true });
+    try std.testing.expectEqual(@as(u32, 0), progress.snapshot_refusals);
+    try std.testing.expectEqual(@as(u64, 0), progress.pending_snapshot_index);
 }
 
 test "a node outside its own voter set does not start elections" {

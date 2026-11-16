@@ -22,6 +22,21 @@ pub const PeerProgress = struct {
     /// Used to bound the re-send retry interval while `pending_snapshot_index`
     /// is non-zero, so a lost InstallSnapshot eventually retries (SEC-0144).
     pending_snapshot_ticks: u32 = 0,
+    /// Consecutive InstallSnapshot refusals from this peer (SONNY-6636). Each
+    /// doubles the wait before the snapshot is sent again (a refusal is
+    /// usually not transient: a digest the follower cannot match, a store
+    /// that cannot take it); an install resets it.
+    snapshot_refusals: u32 = 0,
+
+    /// Heartbeat rounds to wait before re-sending the in-flight snapshot:
+    /// `base` while it was not refused, then `base << refusals`, at most
+    /// `max` (SONNY-6636).
+    pub fn snapshotResendTicks(self: *const PeerProgress, base: u32, max: u32) u32 {
+        if (self.snapshot_refusals == 0) return base;
+        const shift: u5 = @intCast(@min(self.snapshot_refusals, 16));
+        const wait = @as(u64, base) << shift;
+        return @intCast(@min(wait, @as(u64, max)));
+    }
 
     /// True when the entries this peer still needs have been compacted away
     /// (next_index <= snapshot_index), so AppendEntries can never catch it up

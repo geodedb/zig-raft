@@ -89,8 +89,9 @@ pub const InProcessTransport = struct {
     fn sendImpl(ptr: *anyopaque, to: u64, msg: rpc.Message) void {
         const self: *InProcessTransport = @ptrCast(@alignCast(ptr));
         const inbox = self.inboxes.getPtr(to) orelse return;
-        // Deep-copy AppendEntries entries, data included: the sender frees
-        // both once send returns (SEC-0140, SONNY-6592).
+        // Deep-copy AppendEntries entries, data included, and an
+        // InstallSnapshot's chunk data and configuration: the sender frees
+        // them once send returns (SEC-0140, SONNY-6592, SONNY-6636).
         var copied_msg = msg;
         switch (msg) {
             .append_entries => |ae| {
@@ -106,6 +107,23 @@ pub const InProcessTransport = struct {
                     } };
                 }
             },
+            .install_snapshot => |is| {
+                const data = self.allocator.dupe(u8, is.data) catch return;
+                const voters = self.allocator.dupe(u64, is.config.voters) catch {
+                    self.allocator.free(data);
+                    return;
+                };
+                const outgoing = self.allocator.dupe(u64, is.config.voters_outgoing) catch {
+                    self.allocator.free(data);
+                    self.allocator.free(voters);
+                    return;
+                };
+                var c = is;
+                c.data = data;
+                c.config.voters = voters;
+                c.config.voters_outgoing = outgoing;
+                copied_msg = .{ .install_snapshot = c };
+            },
             else => {},
         }
         inbox.append(self.allocator, copied_msg) catch freeMessage(self.allocator, copied_msg);
@@ -115,6 +133,11 @@ pub const InProcessTransport = struct {
     pub fn freeMessage(allocator: std.mem.Allocator, msg: rpc.Message) void {
         switch (msg) {
             .append_entries => |ae| rpc.freeEntries(allocator, ae.entries),
+            .install_snapshot => |is| {
+                allocator.free(is.data);
+                allocator.free(is.config.voters);
+                allocator.free(is.config.voters_outgoing);
+            },
             else => {},
         }
     }
@@ -245,4 +268,43 @@ test "pendingCount accuracy" {
     const msgs = try ipt.drain(1, std.testing.allocator);
     defer std.testing.allocator.free(msgs);
     try std.testing.expectEqual(@as(usize, 0), ipt.pendingCount(1));
+}
+
+test "InProcessTransport copies InstallSnapshot chunk data and configuration (SONNY-6636)" {
+    const a = std.testing.allocator;
+    var ipt = InProcessTransport.init(a);
+    defer ipt.deinit();
+    try ipt.register(2);
+
+    // The leader frees a chunk and its configuration as soon as send returns.
+    const data = try a.dupe(u8, "chunk-bytes");
+    const voters = try a.dupe(u64, &.{ 1, 2, 3 });
+    const outgoing = try a.dupe(u64, &.{1});
+    ipt.transport().send(2, .{ .install_snapshot = .{
+        .term = 1,
+        .leader_id = 1,
+        .last_included_index = 5,
+        .last_included_term = 1,
+        .offset = 0,
+        .data = data,
+        .done = true,
+        .checksum = .{7} ** 32,
+        .config = .{ .voters = voters, .voters_outgoing = outgoing, .is_joint = true },
+    } });
+    @memset(data, 0);
+    @memset(voters, 0);
+    @memset(outgoing, 0);
+    a.free(data);
+    a.free(voters);
+    a.free(outgoing);
+
+    const msgs = try ipt.drain(2, a);
+    defer a.free(msgs);
+    defer for (msgs) |m| InProcessTransport.freeMessage(a, m);
+    try std.testing.expectEqual(@as(usize, 1), msgs.len);
+    const is = msgs[0].install_snapshot;
+    try std.testing.expectEqualStrings("chunk-bytes", is.data);
+    try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, is.config.voters);
+    try std.testing.expectEqualSlices(u64, &.{1}, is.config.voters_outgoing);
+    try std.testing.expect(is.config.is_joint);
 }
