@@ -114,6 +114,22 @@ pub const SnapshotState = struct {
         pool: ?*tp.ThreadPool,
     ) ![]rpc.Message {
         _ = pool; // Reserved for future parallel hashing when Blake3 tree API available.
+        return self.buildInstallSnapshotMessagesFrom(snapshot, term, leader_id, 0);
+    }
+
+    /// `buildInstallSnapshotMessages` for the chunks from `start_offset` on:
+    /// resumes a transfer whose follower reported, after a chunk was lost,
+    /// that it expects `start_offset` next (SONNY-6652). An offset at or
+    /// past the end of the data builds the whole snapshot. The last chunk
+    /// still carries the digest of all of it, which the follower checks
+    /// against everything it assembled.
+    pub fn buildInstallSnapshotMessagesFrom(
+        self: *SnapshotState,
+        snapshot: rpc.Snapshot,
+        term: u64,
+        leader_id: u64,
+        start_offset: u64,
+    ) ![]rpc.Message {
         const data = snapshot.data;
 
         // Compute BLAKE3 digest of the full snapshot data.
@@ -123,10 +139,12 @@ pub const SnapshotState = struct {
         var digest: [32]u8 = undefined;
         hasher.final(&digest);
 
-        const num_chunks = if (data.len == 0) 1 else (data.len + self.chunk_size - 1) / self.chunk_size;
+        const start: usize = if (start_offset < data.len) @intCast(start_offset) else 0;
+        const remaining = data.len - start;
+        const num_chunks = if (remaining == 0) 1 else (remaining + self.chunk_size - 1) / self.chunk_size;
         const messages = try self.allocator.alloc(rpc.Message, num_chunks);
 
-        var offset: usize = 0;
+        var offset: usize = start;
         for (0..num_chunks) |i| {
             const end = @min(offset + self.chunk_size, data.len);
             const chunk_data = data[offset..end];
@@ -209,6 +227,14 @@ pub const SnapshotState = struct {
         if (msg.offset != pending.expected_offset) {
             return SnapshotError.UnexpectedOffset;
         }
+        // A later chunk must belong to the snapshot being assembled: one of
+        // another snapshot at the expected offset would splice two snapshots
+        // together (caught only by the final digest) (SONNY-6652).
+        if (msg.offset != 0 and (msg.last_included_index != pending.last_included_index or
+            msg.last_included_term != pending.last_included_term))
+        {
+            return SnapshotError.UnexpectedOffset;
+        }
 
         // Enforce max_snapshot_size BEFORE allocation (SEC-0063). 0 = unlimited.
         if (self.max_snapshot_size > 0) {
@@ -275,6 +301,15 @@ pub const SnapshotState = struct {
             return SnapshotError.SnapshotTooLarge;
         };
         return null;
+    }
+
+    /// The offset the next chunk of snapshot `index` / `term` must carry:
+    /// what a follower reports after a chunk was lost so the leader resumes
+    /// there (SONNY-6652). 0 when no such snapshot is being assembled.
+    pub fn resumeOffset(self: *const SnapshotState, index: u64, term: u64) u64 {
+        const pending = self.pending_snapshot orelse return 0;
+        if (pending.last_included_index != index or pending.last_included_term != term) return 0;
+        return pending.expected_offset;
     }
 
     /// Reset/clear any pending snapshot receive state.

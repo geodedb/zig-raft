@@ -1228,13 +1228,41 @@ pub const RaftNode = struct {
         self.becomeFollower(msg.term, msg.leader_id);
         self.election_state.resetElectionElapsed();
 
+        // Already holds this snapshot or a newer one (a re-send after a lost
+        // ack, or one that arrived after a restart): that is an install, not
+        // a refusal. Acknowledge it with the index held so the leader
+        // advances, instead of answering StaleSnapshot (which the leader
+        // counted as a refusal and backed off on) or installing it again
+        // (SONNY-6652). Answer the first and the last chunk only; the ones
+        // in between change nothing. The ack goes out after the next
+        // advancePersist(), so a snapshot held only in memory is durable
+        // first.
+        const held = @max(self.log.snapshot_index, self.snapshot_state.snapshot_index);
+        if (held > 0 and msg.last_included_index <= held) {
+            if (msg.offset == 0 or msg.done) {
+                self.sendAfterPersist(msg.leader_id, rpc.Message{ .install_snapshot_response = .{
+                    .term = self.current_term,
+                    .success = true,
+                    .last_index = held,
+                } });
+            }
+            observability.endRpcServerSpan(__obs_span, true, 0);
+            return;
+        }
+
         const result = self.snapshot_state.receiveChunk(msg) catch |err| {
             std.log.warn("InstallSnapshot from leader {d} failed: {s}", .{
                 msg.leader_id, @errorName(err),
             });
+            // A chunk out of order means one before it was lost in transit:
+            // tell the leader where to resume rather than refusing the
+            // snapshot (SONNY-6652).
+            const gap = err == snap.SnapshotError.UnexpectedOffset;
             self.sendAfterPersist(msg.leader_id, rpc.Message{ .install_snapshot_response = .{
                 .term = self.current_term,
                 .success = false,
+                .last_index = if (gap) msg.last_included_index else 0,
+                .next_offset = if (gap) self.snapshot_state.resumeOffset(msg.last_included_index, msg.last_included_term) else 0,
             } });
             return;
         };
@@ -1270,6 +1298,7 @@ pub const RaftNode = struct {
             self.sendAfterPersist(msg.leader_id, rpc.Message{ .install_snapshot_response = .{
                 .term = self.current_term,
                 .success = true,
+                .last_index = snapshot_val.metadata.index,
             } });
         }
         observability.endRpcServerSpan(__obs_span, true, 0);
@@ -1296,18 +1325,39 @@ pub const RaftNode = struct {
 
         // Update peer progress on successful snapshot install (SEC-0074).
         if (msg.success) {
-            // Use log.snapshot_index (persisted) rather than
-            // snapshot_state.snapshot_index which may have advanced since
+            // The follower reports the snapshot index it holds (SONNY-6652):
+            // the one sent, or a newer one it already had. Every snapshot
+            // holds only committed entries, which this leader's log holds
+            // too (Leader Completeness), so that index matches; it is capped
+            // at lastIndex all the same. A follower on raft <= 0.2.4 reports
+            // nothing: use log.snapshot_index (persisted) rather than
+            // snapshot_state.snapshot_index, which may have advanced since
             // the snapshot was sent (SEC-0113).
             //
             // maybeUpdate is forward-only, so a late/duplicate ack can never
             // regress next_index (SEC-0113); clearing pending lets the driver
             // resume normal AppendEntries replication for forward progress.
-            _ = progress.maybeUpdate(self.log.snapshot_index);
-            progress.pending_snapshot_index = 0;
-            progress.pending_snapshot_ticks = 0;
-            progress.snapshot_refusals = 0;
+            const acked = if (msg.last_index != 0) @min(msg.last_index, self.log.lastIndex()) else self.log.snapshot_index;
+            _ = progress.maybeUpdate(acked);
+            // An ack of an older snapshot than the one in flight leaves it
+            // in flight.
+            if (msg.last_index == 0 or msg.last_index >= progress.pending_snapshot_index) {
+                progress.pending_snapshot_index = 0;
+                progress.pending_snapshot_ticks = 0;
+                progress.snapshot_refusals = 0;
+                progress.snapshot_resume_offset = 0;
+            }
             self.maybeCommit();
+        } else if (progress.pending_snapshot_index != 0 and msg.last_index != 0 and
+            msg.last_index == progress.pending_snapshot_index)
+        {
+            // A chunk of the snapshot in flight was lost in transit and the
+            // follower could not place the ones after it. Not a refusal: no
+            // back-off, and the next send (on the normal retry interval)
+            // resumes at the offset the follower expects (SONNY-6652; before,
+            // each of those chunks counted as a refusal and the snapshot was
+            // sent again from offset 0).
+            progress.snapshot_resume_offset = msg.next_offset;
         } else if (progress.pending_snapshot_index != 0) {
             // Snapshot refused (a digest the follower cannot match, a state
             // machine that cannot take it). Sending it again at once is
@@ -1317,6 +1367,7 @@ pub const RaftNode = struct {
             // heartbeat round, SEC-0144).
             progress.snapshot_refusals +|= 1;
             progress.pending_snapshot_ticks = 0;
+            progress.snapshot_resume_offset = 0;
         }
     }
 
@@ -1538,11 +1589,14 @@ pub const RaftNode = struct {
         const loaded = (try self.storage.loadSnapshot()) orelse return error.NoSnapshot;
         defer stg.freeSnapshot(self.allocator, loaded);
 
-        const msgs = try self.snapshot_state.buildInstallSnapshotMessages(
+        // Resume a transfer of this same snapshot where the follower said it
+        // stopped (SONNY-6652); anything else is sent whole.
+        const start = if (progress.pending_snapshot_index == loaded.metadata.index) progress.snapshot_resume_offset else 0;
+        const msgs = try self.snapshot_state.buildInstallSnapshotMessagesFrom(
             loaded,
             self.current_term,
             self.id,
-            null, // Snapshots are rare; do not fan chunk-build across the pool.
+            start,
         );
         defer self.allocator.free(msgs);
 

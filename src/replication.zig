@@ -27,6 +27,10 @@ pub const PeerProgress = struct {
     /// usually not transient: a digest the follower cannot match, a store
     /// that cannot take it); an install resets it.
     snapshot_refusals: u32 = 0,
+    /// Where the next send of the in-flight snapshot starts: the offset the
+    /// follower reported it expects after a chunk was lost in transit. 0
+    /// sends it whole (SONNY-6652).
+    snapshot_resume_offset: u64 = 0,
 
     /// Heartbeat rounds to wait before re-sending the in-flight snapshot:
     /// `base` while it was not refused, then `base << refusals`, at most

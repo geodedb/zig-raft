@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A follower that already held a re-sent snapshot (same or newer index,
+  e.g. after its ack was lost or after a restart) answered it as stale
+  (`success = false`): the leader counted a refusal, kept the send in
+  flight and backed off, and a restarted follower installed it again. It
+  now acknowledges it with the index it holds, and the leader advances
+  (SONNY-6652).
+- One InstallSnapshot chunk lost in transit made the follower refuse every
+  chunk after it; each counted as a refusal (doubling the back-off) and the
+  next send started over at offset 0. The follower now reports the gap and
+  the offset it expects, the leader does not back off, and the next send
+  resumes there (`PeerProgress.snapshot_resume_offset`,
+  `SnapshotState.buildInstallSnapshotMessagesFrom`). A chunk of another
+  snapshot at the expected offset is refused instead of being spliced in.
+
+### Changed
+
+- `InstallSnapshotResponse` gains `last_index` and `next_offset` (both
+  default 0). A transport that serialises the response must carry them;
+  without them the leader behaves as with raft 0.2.4 (SONNY-6652).
+
 ## [0.2.4] - 2026-11-16
 
 ### Changed

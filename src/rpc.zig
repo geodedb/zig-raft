@@ -118,6 +118,15 @@ pub const InstallSnapshot = struct {
 pub const InstallSnapshotResponse = struct {
     term: u64,
     success: bool,
+    /// On success: the snapshot index the follower now holds (the one sent,
+    /// or a newer one it already had). On a failure that is a gap in the
+    /// chunk stream (a chunk lost in transit): the index of the snapshot the
+    /// chunk belonged to, with `next_offset`. 0 otherwise, and from
+    /// followers on raft <= 0.2.4 (SONNY-6652).
+    last_index: u64 = 0,
+    /// On a chunk-stream gap: the offset the follower expects next for
+    /// snapshot `last_index` (0: send it from the start) (SONNY-6652).
+    next_offset: u64 = 0,
 };
 
 pub const Message = union(enum) {

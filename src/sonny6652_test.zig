@@ -255,3 +255,83 @@ test "SONNY-6652: a lost chunk resumes from the follower's offset and is not a r
     defer stg.freeSnapshot(alloc, saved);
     try std.testing.expectEqualSlices(u8, &data, saved.data);
 }
+
+fn installChunk(index: u64, term: u64, offset: u64, data: []const u8, done: bool, whole: []const u8) rpc.Message {
+    var digest: [32]u8 = .{0} ** 32;
+    if (done) std.crypto.hash.Blake3.hash(whole, &digest, .{});
+    return .{ .install_snapshot = .{
+        .term = term,
+        .leader_id = 1,
+        .last_included_index = index,
+        .last_included_term = term,
+        .offset = offset,
+        .data = data,
+        .done = done,
+        .checksum = digest,
+        .config = .{ .voters = &.{ 1, 2, 3 }, .voters_outgoing = &.{}, .is_joint = false },
+    } };
+}
+
+/// The InstallSnapshotResponse the follower queued in its next Ready.
+fn takeResponse(n: *RaftNode) !rpc.InstallSnapshotResponse {
+    const rd = try n.ready();
+    try n.advancePersist();
+    var found: ?rpc.InstallSnapshotResponse = null;
+    for (rd.messages) |out| if (out.msg == .install_snapshot_response) {
+        found = out.msg.install_snapshot_response;
+    };
+    try n.advanceApply();
+    return found orelse error.NoResponse;
+}
+
+test "SONNY-6652: a follower holding a newer snapshot acks an older one with the index it holds" {
+    var store: Store = undefined;
+    try store.init();
+    defer store.deinit();
+    var n = try RaftNode.init(alloc, .{ .id = 2, .peers = &.{ 1, 3 } }, store.fs.storage());
+    defer n.deinit();
+
+    try n.step(1, installChunk(10, 2, 0, "ten", true, "ten"));
+    const installed = try takeResponse(&n);
+    try std.testing.expect(installed.success);
+    try std.testing.expectEqual(@as(u64, 10), installed.last_index);
+
+    try n.step(1, installChunk(8, 2, 0, "eight", true, "eight"));
+    const acked = try takeResponse(&n);
+    try std.testing.expect(acked.success);
+    try std.testing.expectEqual(@as(u64, 10), acked.last_index);
+    try std.testing.expectEqual(@as(u64, 1), n.stats().snapshots_installed);
+}
+
+test "SONNY-6652: a gap in the chunk stream reports where to resume; a foreign chunk does not splice in" {
+    var store: Store = undefined;
+    try store.init();
+    defer store.deinit();
+    var n = try RaftNode.init(alloc, .{ .id = 2, .peers = &.{ 1, 3 } }, store.fs.storage());
+    defer n.deinit();
+
+    const whole = "0123456789";
+    try n.step(1, installChunk(7, 2, 0, whole[0..4], false, whole));
+    try n.step(1, installChunk(7, 2, 8, whole[8..], true, whole)); // 4..8 lost
+    const gap = try takeResponse(&n);
+    try std.testing.expect(!gap.success);
+    try std.testing.expectEqual(@as(u64, 7), gap.last_index);
+    try std.testing.expectEqual(@as(u64, 4), gap.next_offset);
+
+    // A chunk of another snapshot at the expected offset is refused.
+    try n.step(1, installChunk(9, 2, 4, whole[4..8], false, whole));
+    const foreign = try takeResponse(&n);
+    try std.testing.expect(!foreign.success);
+    try std.testing.expectEqual(@as(u64, 9), foreign.last_index);
+    try std.testing.expectEqual(@as(u64, 0), foreign.next_offset);
+
+    // Resuming at 4 completes the snapshot.
+    try n.step(1, installChunk(7, 2, 4, whole[4..8], false, whole));
+    try n.step(1, installChunk(7, 2, 8, whole[8..], true, whole));
+    const done = try takeResponse(&n);
+    try std.testing.expect(done.success);
+    try std.testing.expectEqual(@as(u64, 7), done.last_index);
+    const saved = (try store.fs.storage().loadSnapshot()).?;
+    defer stg.freeSnapshot(alloc, saved);
+    try std.testing.expectEqualStrings(whole, saved.data);
+}
