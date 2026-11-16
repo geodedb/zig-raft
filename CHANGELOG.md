@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-11-16
+
 ### Added
 
 - Snapshot I/O off the consumer's node lock (SONNY-6653). Writing a
