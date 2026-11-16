@@ -47,6 +47,15 @@ pub const Ready = struct {
     /// (only with `Config.stream_snapshots`; empty otherwise). Released by
     /// `advanceApply()`.
     snapshot_sends: []const SnapshotSend = &.{},
+    /// A snapshot installed into a staged file (`Config.stage_received_snapshots`,
+    /// SONNY-6666). `snapshot` then carries its metadata, and its data only
+    /// for storages without staging (empty for `FileStorage`: read it with
+    /// `FileStorage.openSnapshotReader` after `advancePersist()`). Sync it
+    /// with `Storage.syncStagedSnapshot` WITHOUT the node lock before
+    /// `advancePersist()`, which then only commits it (renames); left
+    /// unsynced, `advancePersist()` syncs it under the lock. Valid until
+    /// `advanceApply()`.
+    staged_snapshot: ?*stg.StagedSnapshot = null,
 };
 
 pub const ReadyState = struct {
@@ -74,6 +83,11 @@ pub const ReadyState = struct {
     /// Snapshot sends for the next Ready / handed out by the current one
     /// (as `pending_messages` / `ready_messages`).
     pending_snapshot_sends: std.ArrayList(SnapshotSend) = .empty,
+    /// A staged installed snapshot for the next Ready / handed out by the
+    /// current one (SONNY-6666), released on `staged_sink`.
+    pending_staged: ?*stg.StagedSnapshot = null,
+    ready_staged: ?*stg.StagedSnapshot = null,
+    staged_sink: ?stg.Storage = null,
     ready_snapshot_sends: std.ArrayList(SnapshotSend) = .empty,
     allocator: std.mem.Allocator,
 
@@ -99,6 +113,32 @@ pub const ReadyState = struct {
         self.owned_committed.deinit(self.allocator);
         if (self.pending_snapshot) |snap| stg.freeSnapshot(self.allocator, snap);
         if (self.ready_snapshot) |snap| stg.freeSnapshot(self.allocator, snap);
+        self.releaseStaged(&self.pending_staged);
+        self.releaseStaged(&self.ready_staged);
+    }
+
+    fn releaseStaged(self: *ReadyState, slot: *?*stg.StagedSnapshot) void {
+        const staged = slot.* orelse return;
+        self.staged_sink.?.releaseStagedSnapshot(staged);
+        self.allocator.destroy(staged);
+        slot.* = null;
+    }
+
+    /// Set the staged snapshot to deliver in the next Ready (SONNY-6666),
+    /// taking ownership (allocated with this state's allocator, released on
+    /// `sink`). It replaces a pending snapshot, staged or not.
+    pub fn setStagedSnapshot(self: *ReadyState, staged: *stg.StagedSnapshot, sink: stg.Storage) void {
+        self.releaseStaged(&self.pending_staged);
+        if (self.pending_snapshot) |old| stg.freeSnapshot(self.allocator, old);
+        self.pending_snapshot = null;
+        self.staged_sink = sink;
+        self.pending_staged = staged;
+    }
+
+    /// A snapshot is waiting for the next Ready (installed after this
+    /// Ready was handed out).
+    pub fn hasPendingSnapshot(self: *const ReadyState) bool {
+        return self.pending_snapshot != null or self.pending_staged != null;
     }
 
     fn freeOwnedCommitted(self: *ReadyState) void {
@@ -146,6 +186,7 @@ pub const ReadyState = struct {
     /// and frees it at the `advance` after that Ready; a snapshot still
     /// pending is replaced (and freed) by a newer one.
     pub fn setSnapshot(self: *ReadyState, snapshot: rpc.Snapshot) void {
+        self.releaseStaged(&self.pending_staged);
         if (self.pending_snapshot) |old| stg.freeSnapshot(self.allocator, old);
         self.pending_snapshot = snapshot;
     }
@@ -171,14 +212,21 @@ pub const ReadyState = struct {
         // Likewise the snapshot (ready_snapshot is null: advance freed it).
         self.ready_snapshot = self.pending_snapshot;
         self.pending_snapshot = null;
+        self.ready_staged = self.pending_staged;
+        self.pending_staged = null;
+        const snapshot_view: ?rpc.Snapshot = if (self.ready_staged) |st|
+            .{ .metadata = st.metadata, .data = st.data() }
+        else
+            self.ready_snapshot;
 
         return .{
             .hard_state = hs,
-            .snapshot = self.ready_snapshot,
+            .snapshot = snapshot_view,
             .committed_entries = self.pending_committed_entries.items,
             .messages = self.ready_messages.items,
             .should_snapshot = self.pending_should_snapshot,
             .snapshot_sends = self.ready_snapshot_sends.items,
+            .staged_snapshot = self.ready_staged,
         };
     }
 
@@ -194,6 +242,7 @@ pub const ReadyState = struct {
         self.freeOwnedCommitted();
         if (self.ready_snapshot) |snap| stg.freeSnapshot(self.allocator, snap);
         self.ready_snapshot = null;
+        self.releaseStaged(&self.ready_staged);
         self.pending_should_snapshot = false;
     }
 
@@ -203,6 +252,7 @@ pub const ReadyState = struct {
         if (self.pending_snapshot_sends.items.len > 0) return true;
         if (self.pending_committed_entries.items.len > 0) return true;
         if (self.pending_snapshot != null) return true;
+        if (self.pending_staged != null) return true;
         if (self.pending_should_snapshot) return true;
         if (!current_hs.eql(self.prev_hard_state)) return true;
         return false;

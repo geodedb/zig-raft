@@ -100,6 +100,14 @@ pub const Config = struct {
     /// releasing its node lock. Off by default: the leader loads the whole
     /// snapshot and sends it from inside the call, as before.
     stream_snapshots: bool = false,
+    /// Write an incoming InstallSnapshot to a staged file chunk by chunk
+    /// instead of assembling it in memory (SONNY-6666). The Ready then
+    /// carries it as `staged_snapshot`: sync it off the node lock with
+    /// `Storage.syncStagedSnapshot`, and `advancePersist()` commits it with
+    /// renames. Off by default: snapshots are assembled in memory and
+    /// written whole inside `advancePersist()`, as before. With a storage
+    /// that cannot stage (InMemoryStorage) the chunks are kept in memory.
+    stage_received_snapshots: bool = false,
 
     pub fn validate(self: Config) ConfigError!void {
         if (self.id == 0) return ConfigError.InvalidId;
@@ -170,6 +178,12 @@ pub const RaftNode = struct {
     replication_state: ?repl.ReplicationState,
     membership_state: mem.MembershipState,
     snapshot_state: snap.SnapshotState,
+    /// The commit index the outstanding Ready delivered entries up to: what
+    /// advanceApply marks applied (SONNY-6666). 0 when it delivered none.
+    ready_applied_hi: u64 = 0,
+    /// The last entry advancePersist wrote, for advanceApply's stableTo
+    /// (SONNY-6666).
+    persisted_through: ?struct { index: u64, term: u64 } = null,
     ready_state: rd.ReadyState,
     config: Config,
     transport: ?trans.Transport,
@@ -212,15 +226,18 @@ pub const RaftNode = struct {
     pub fn init(allocator: std.mem.Allocator, config: Config, storage_impl: stg.Storage) !RaftNode {
         try config.validate();
 
-        // Load snapshot ONCE for both RaftLog and MembershipState init (PERF-021).
-        const loaded_snap = try storage_impl.loadSnapshot();
+        // The snapshot's metadata only, ONCE for both RaftLog and
+        // MembershipState (PERF-021). Not its data: that read the whole
+        // snapshot at every start, and FileStorage refused one over its
+        // max_snapshot_size outright (SONNY-6666).
+        const loaded_snap = try storage_impl.loadSnapshotMetadata(allocator);
 
         // Extract snapshot index/term for RaftLog.
         var snap_idx: u64 = 0;
         var snap_trm: u64 = 0;
         if (loaded_snap) |s| {
-            snap_idx = s.metadata.index;
-            snap_trm = s.metadata.term;
+            snap_idx = s.index;
+            snap_trm = s.term;
         }
 
         var log_inst = try raft_log.RaftLog.init(allocator, storage_impl, snap_idx, snap_trm);
@@ -233,16 +250,16 @@ pub const RaftNode = struct {
         // Track whether snapshot is in joint consensus for pending_config_index (SEC-0123).
         var snap_pending_config_index: u64 = 0;
         if (loaded_snap) |snap_val| {
-            defer stg.freeSnapshot(allocator, snap_val);
-            if (snap_val.metadata.config.voters.len > 0) {
+            defer stg.freeSnapshotMetadata(allocator, snap_val);
+            if (snap_val.config.voters.len > 0) {
                 // Restore membership from snapshot config (SEC-0073).
-                membership_inst = try mem.MembershipState.init(allocator, snap_val.metadata.config.voters);
-                if (snap_val.metadata.config.is_joint and snap_val.metadata.config.voters_outgoing.len > 0) {
-                    try membership_inst.voters_outgoing.appendSlice(allocator, snap_val.metadata.config.voters_outgoing);
+                membership_inst = try mem.MembershipState.init(allocator, snap_val.config.voters);
+                if (snap_val.config.is_joint and snap_val.config.voters_outgoing.len > 0) {
+                    try membership_inst.voters_outgoing.appendSlice(allocator, snap_val.config.voters_outgoing);
                     membership_inst.is_joint = true;
                     // Joint consensus snapshot: set pending_config_index so a
                     // new leader can finalize the transition (SEC-0123).
-                    snap_pending_config_index = snap_val.metadata.index;
+                    snap_pending_config_index = snap_val.index;
                 }
             } else {
                 // Snapshot has no config — fall back to static peers.
@@ -608,20 +625,21 @@ pub const RaftNode = struct {
             const slice_lo = std.math.add(u64, self.log.applied, 1) catch return error.Overflow;
             const slice_hi = std.math.add(u64, self.log.committed, 1) catch return error.Overflow;
 
-            // Try zero-copy borrow first when range is entirely in unstable entries (PERF-003).
-            if (self.log.borrowUnstable(slice_lo, slice_hi)) |borrowed| {
-                try self.ready_state.addCommittedEntries(borrowed);
-            } else {
-                const entries = try self.log.slice(
-                    slice_lo,
-                    slice_hi,
-                );
-                // The Ready owns the slice and its data until advance(); it is
-                // freed here only if handing it over failed (SEC-0117,
-                // SONNY-6592).
-                errdefer rpc.freeEntries(self.allocator, entries);
-                try self.ready_state.addOwnedCommittedEntries(entries);
-            }
+            // Always a copy the Ready owns. Lending the unstable entries
+            // (PERF-003) left them to be freed under the consumer when
+            // another thread installed a snapshot between ready() and
+            // advance() (SONNY-6666).
+            const entries = try self.log.slice(
+                slice_lo,
+                slice_hi,
+            );
+            // The Ready owns the slice and its data until advance(); it is
+            // freed here only if handing it over failed (SEC-0117,
+            // SONNY-6592).
+            errdefer rpc.freeEntries(self.allocator, entries);
+            try self.ready_state.addOwnedCommittedEntries(entries);
+            // advanceApply marks applied exactly what this Ready delivers.
+            self.ready_applied_hi = self.log.committed;
         }
 
         // Check shouldSnapshot.
@@ -656,7 +674,12 @@ pub const RaftNode = struct {
         // this is the follower-side analogue. saveSnapshot advances the store's
         // snapshot_index so the subsequent appendEntries truncates the stale
         // tail correctly.
-        if (self.ready_state.ready_snapshot) |ready_snap| {
+        //
+        // A staged one (SONNY-6666) is committed: renames, after a sync the
+        // consumer did off the lock (or does here if it did not).
+        if (self.ready_state.ready_staged) |staged| {
+            try self.storage.commitStagedSnapshot(staged);
+        } else if (self.ready_state.ready_snapshot) |ready_snap| {
             try self.storage.saveSnapshot(ready_snap);
         }
 
@@ -665,10 +688,21 @@ pub const RaftNode = struct {
             try self.storage.saveHardState(hs);
         }
 
-        // Persist unstable entries to storage.
-        const unstable = self.log.unstableSlice();
-        if (unstable.len > 0) {
-            try self.storage.appendEntries(unstable);
+        // Persist unstable entries to storage, and remember how far:
+        // advanceApply marks only those stable (SONNY-6666). A snapshot
+        // installed after ready() (the node was stepped between ready() and
+        // here) restored the log past what storage holds; the entries after
+        // it wait for the next cycle, which persists that snapshot first.
+        // Written now, they landed behind the older snapshot and were dropped
+        // when the newer one was saved, while counted durable.
+        self.persisted_through = null;
+        if (!self.ready_state.hasPendingSnapshot()) {
+            const unstable = self.log.unstableSlice();
+            if (unstable.len > 0) {
+                try self.storage.appendEntries(unstable);
+                const last = unstable[unstable.len - 1];
+                self.persisted_through = .{ .index = last.index, .term = last.term };
+            }
         }
     }
 
@@ -705,19 +739,22 @@ pub const RaftNode = struct {
             }
         }
 
-        // Mark committed entries as applied.
-        if (self.log.committed > self.log.applied) {
+        // Mark applied what the Ready delivered, not everything committed
+        // by now: entries committed after ready() (the node stepped in
+        // between) go in the next Ready (SONNY-6666). A snapshot installed
+        // meanwhile may have moved applied past them already.
+        if (self.ready_applied_hi > self.log.applied) {
             self.perf_stats.entries_applied += self.ready_state.pending_committed_entries.items.len;
-            try self.log.appliedTo(self.log.committed);
+            try self.log.appliedTo(self.ready_applied_hi);
         }
+        self.ready_applied_hi = 0;
 
         // Advance ready state.
         self.ready_state.advance(hs);
 
-        // Stabilize log entries.
-        const unstable = self.log.unstableSlice();
-        if (unstable.len > 0) {
-            const last = unstable[unstable.len - 1];
+        // Stabilize the entries advancePersist wrote.
+        if (self.persisted_through) |last| {
+            self.persisted_through = null;
             try self.log.stableTo(last.index, last.term);
             // The leader's own entries now count toward commit; without
             // this a single-node cluster would wait for another tick.
@@ -1319,8 +1356,16 @@ pub const RaftNode = struct {
         // in between change nothing. The ack goes out after the next
         // advancePersist(), so a snapshot held only in memory is durable
         // first.
-        const held = @max(self.log.snapshot_index, self.snapshot_state.snapshot_index);
-        if (held > 0 and msg.last_included_index <= held) {
+        //
+        // Likewise a snapshot below this follower's commit index
+        // (SONNY-6666): every committed entry matches the leader's, so it
+        // holds that state already. Installing it moved commit and apply
+        // backwards and dropped the committed entries after it (Raft §7:
+        // retain the entries following it and reply). One exactly at the
+        // commit index moves nothing back and is still installed.
+        const snap_held = @max(self.log.snapshot_index, self.snapshot_state.snapshot_index);
+        const held = @max(snap_held, self.log.committed);
+        if ((snap_held > 0 and msg.last_included_index <= snap_held) or msg.last_included_index < self.log.committed) {
             if (msg.offset == 0 or msg.done) {
                 self.sendAfterPersist(msg.leader_id, rpc.Message{ .install_snapshot_response = .{
                     .term = self.current_term,
@@ -1328,6 +1373,12 @@ pub const RaftNode = struct {
                     .last_index = held,
                 } });
             }
+            observability.endRpcServerSpan(__obs_span, true, 0);
+            return;
+        }
+
+        if (self.config.stage_received_snapshots) {
+            try self.receiveStagedChunk(msg);
             observability.endRpcServerSpan(__obs_span, true, 0);
             return;
         }
@@ -1384,6 +1435,47 @@ pub const RaftNode = struct {
             } });
         }
         observability.endRpcServerSpan(__obs_span, true, 0);
+    }
+
+    fn refuseChunk(self: *RaftNode, msg: rpc.InstallSnapshot, err: anyerror) void {
+        std.log.warn("InstallSnapshot from leader {d} failed: {s}", .{
+            msg.leader_id, @errorName(err),
+        });
+        const gap = err == snap.SnapshotError.UnexpectedOffset;
+        self.sendAfterPersist(msg.leader_id, rpc.Message{ .install_snapshot_response = .{
+            .term = self.current_term,
+            .success = false,
+            .last_index = if (gap) msg.last_included_index else 0,
+            .next_offset = if (gap) self.snapshot_state.resumeOffset(msg.last_included_index, msg.last_included_term) else 0,
+        } });
+    }
+
+    /// `Config.stage_received_snapshots`: write the chunk to the staged
+    /// snapshot; on the last one, restore the log from its metadata and
+    /// hand the staged snapshot to the next Ready (SONNY-6666).
+    fn receiveStagedChunk(self: *RaftNode, msg: rpc.InstallSnapshot) !void {
+        const result = self.snapshot_state.receiveChunkStaged(msg, self.storage) catch |err| {
+            self.refuseChunk(msg, err);
+            return;
+        };
+        const staged = result orelse return;
+        errdefer {
+            self.storage.releaseStagedSnapshot(staged);
+            self.allocator.destroy(staged);
+        }
+        const meta = staged.metadata;
+        try self.log.restore(.{ .metadata = meta, .data = &.{} });
+        if (meta.config.voters.len > 0) {
+            try self.membership_state.applySnapshotConfig(meta.config);
+        }
+        self.pending_config_index = if (meta.config.is_joint) meta.index else 0;
+        self.ready_state.setStagedSnapshot(staged, self.storage);
+        self.perf_stats.snapshots_installed += 1;
+        self.sendAfterPersist(msg.leader_id, rpc.Message{ .install_snapshot_response = .{
+            .term = self.current_term,
+            .success = true,
+            .last_index = meta.index,
+        } });
     }
 
     fn handleInstallSnapshotResponse(self: *RaftNode, from: u64, msg: rpc.InstallSnapshotResponse) !void {

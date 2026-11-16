@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Follower snapshot installs off the consumer's node lock (SONNY-6666).
+  With `Config.stage_received_snapshots`, each InstallSnapshot chunk is
+  written to a staged file as it arrives (`SnapshotState.receiveChunkStaged`)
+  instead of being assembled in memory; the Ready carries the finished
+  snapshot as `staged_snapshot`, the consumer syncs it without the lock
+  (`Storage.syncStagedSnapshot`), and `advancePersist()` commits it with
+  renames. A 1 GiB install held the lock at most 45 ms (ReleaseFast) per
+  section and allocated at most 2 KiB at once; the in-memory path held it
+  1.7 s and allocated 1.06 GiB. New optional `Storage.VTable` entries
+  `beginStagedSnapshot`, `appendStagedSnapshot`, `syncStagedSnapshot` and
+  `loadSnapshotMetadata` (null: in-memory fallback / full load), and
+  `Storage.beginStagedSnapshot`, `appendStagedSnapshot`,
+  `syncStagedSnapshot`, `loadSnapshotMetadata`, `freeSnapshotMetadata`,
+  `StagedSnapshot.finish`. `FileStorage` stages chunk by chunk, and its
+  commit gains a crash point after the data rename; a crash at any step of
+  an install leaves the previous snapshot or the new one, whole.
+
+### Fixed
+
+- `RaftNode.init` loaded the whole snapshot to learn its index, term and
+  config, and failed on a `FileStorage` snapshot over `max_snapshot_size`
+  (256 MiB by default). It now reads the metadata only (SONNY-6666).
+- Stepping the node between `ready()` and `advancePersist()` (another
+  thread, while the consumer had released its lock) was unsafe
+  (SONNY-6666):
+  - `advanceApply()` marked applied everything committed by then, so
+    entries committed in between were never delivered. It now marks
+    applied what the Ready delivered.
+  - `ready()` lent out entries still in the unstable log; a snapshot
+    installed in between freed them under the consumer. The Ready now owns
+    copies (the PERF-003 zero-copy path is gone).
+  - Entries appended after a snapshot installed in between were written
+    behind the older snapshot and dropped when the newer one was saved,
+    while counted durable. They are now persisted in the next cycle, after
+    that snapshot, and `advanceApply()` marks stable only what
+    `advancePersist()` wrote.
+- A follower whose log had committed past a snapshot's index installed it
+  anyway, moving its commit and apply indexes backwards and dropping the
+  committed entries after it. It now acknowledges it with its commit index
+  (Raft §7) (SONNY-6666).
+
 ## [0.2.5] - 2026-11-16
 
 ### Added
